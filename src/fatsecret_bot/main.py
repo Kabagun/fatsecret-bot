@@ -13,6 +13,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     config = load_config()
     storage = Storage(config.db_path)
     sync_engine = RecipeSyncEngine(storage, config.device)
