@@ -1,5 +1,13 @@
 temp
 .idea
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+__pycache__/
+*.py[cod]
 *.iml
 *.log
 *.tmp
