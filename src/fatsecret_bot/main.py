@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 
 from .config import load_config
-from .fatsecret_client import FatSecretClient
 from .storage import Storage
 from .sync import RecipeSyncEngine
 from .telegram_bot import TelegramRecipeBot
@@ -16,14 +15,12 @@ def main() -> None:
     )
     config = load_config()
     storage = Storage(config.db_path)
-    clients = {
-        account.key: FatSecretClient(account, config.device)
-        for account in config.accounts
-    }
-    sync_engine = RecipeSyncEngine(storage, clients)
+    sync_engine = RecipeSyncEngine(storage, config.device)
     bot = TelegramRecipeBot(
         token=config.telegram_token,
         allowed_user_ids=config.allowed_user_ids,
+        default_market=config.default_market,
+        default_language=config.default_language,
         storage=storage,
         sync_engine=sync_engine,
     )

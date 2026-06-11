@@ -7,7 +7,7 @@ Telegram-бот для пары пользователей: показывает
 - Два Telegram-пользователя:
   - если `TELEGRAM_ALLOWED_USER_IDS` задан, пускаются только эти id;
   - если не задан, первые два пользователя, вызвавшие `/start`, регистрируются автоматически.
-- Два FatSecret аккаунта через переменные окружения.
+- Два FatSecret аккаунта добавляются через Telegram-кнопку `Аккаунты`; логин/пароль проверяются перед сохранением.
 - Импорт cookbook из обоих аккаунтов и merge по нормализованному названию рецепта.
 - Просмотр общего списка `/recipes`.
 - Обновление из FatSecret `/refresh`.
@@ -36,13 +36,9 @@ Copy-Item .env.example .env
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_ALLOWED_USER_IDS` или оставить пустым для авто-регистрации первых двух пользователей
-- `FATSECRET_ACCOUNT_1_USERNAME`
-- `FATSECRET_ACCOUNT_1_PASSWORD`
-- `FATSECRET_ACCOUNT_2_USERNAME`
-- `FATSECRET_ACCOUNT_2_PASSWORD`
 - при необходимости `FATSECRET_AUTHORIZATION` и `FATSECRET_C_DESC`
 
-`.env` и runtime SQLite лежат вне git.
+FatSecret логины/пароли вводятся в боте через `Аккаунты` и сохраняются в runtime SQLite. `.env` и runtime SQLite лежат вне git.
 
 ## Запуск
 
@@ -81,6 +77,7 @@ fatsecret-bot
 - `Рецепты`
 - `Обновить`
 - `Новый рецепт`
+- `Аккаунты`
 
 В списке рецептов есть пагинация, а в поиске продуктов каждый результат показывает КБЖУ в формате:
 

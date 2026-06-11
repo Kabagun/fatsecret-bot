@@ -6,7 +6,7 @@ import uuid
 from decimal import Decimal
 from pathlib import Path
 
-from .models import Ingredient, Recipe, RecipeSummary
+from .models import FatSecretAccountConfig, Ingredient, Recipe, RecipeSummary
 
 
 def normalize_title(title: str) -> str:
@@ -35,6 +35,18 @@ class Storage:
                 telegram_id INTEGER PRIMARY KEY,
                 display_name TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS fatsecret_accounts (
+                account_key TEXT PRIMARY KEY,
+                telegram_id INTEGER NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                market TEXT NOT NULL,
+                language TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS recipes (
@@ -85,6 +97,102 @@ class Storage:
             """
         )
         self._conn.commit()
+
+    def fatsecret_account_count(self) -> int:
+        """Return how many FatSecret accounts are connected to the bot."""
+        row = self._conn.execute("SELECT COUNT(*) AS c FROM fatsecret_accounts").fetchone()
+        return int(row["c"])
+
+    def list_fatsecret_accounts(self) -> list[FatSecretAccountConfig]:
+        """Return connected FatSecret accounts for runtime API clients."""
+        rows = self._conn.execute(
+            """
+            SELECT account_key, label, username, password, market, language
+            FROM fatsecret_accounts
+            ORDER BY label ASC, account_key ASC
+            """
+        ).fetchall()
+        return [
+            FatSecretAccountConfig(
+                key=row["account_key"],
+                label=row["label"],
+                username=row["username"],
+                password=row["password"],
+                market=row["market"],
+                language=row["language"],
+            )
+            for row in rows
+        ]
+
+    def get_fatsecret_account_by_telegram_id(self, telegram_id: int) -> FatSecretAccountConfig | None:
+        """Return the FatSecret account connected by a Telegram user, if any."""
+        row = self._conn.execute(
+            """
+            SELECT account_key, label, username, password, market, language
+            FROM fatsecret_accounts
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return FatSecretAccountConfig(
+            key=row["account_key"],
+            label=row["label"],
+            username=row["username"],
+            password=row["password"],
+            market=row["market"],
+            language=row["language"],
+        )
+
+    def upsert_fatsecret_account(
+        self,
+        telegram_id: int,
+        label: str,
+        username: str,
+        password: str,
+        market: str,
+        language: str,
+    ) -> str:
+        """Create or replace the FatSecret account owned by a Telegram user."""
+        existing = self._conn.execute(
+            "SELECT account_key FROM fatsecret_accounts WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        account_key = existing["account_key"] if existing else f"tg{telegram_id}"
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO fatsecret_accounts(
+                account_key, telegram_id, label, username, password, market,
+                language, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_key) DO UPDATE SET
+                label = excluded.label,
+                username = excluded.username,
+                password = excluded.password,
+                market = excluded.market,
+                language = excluded.language,
+                updated_at = excluded.updated_at
+            """,
+            (account_key, telegram_id, label, username, password, market, language, now, now),
+        )
+        self._conn.commit()
+        return account_key
+
+    def delete_fatsecret_account_for_user(self, telegram_id: int) -> bool:
+        """Delete a user's FatSecret account and stale remote recipe mappings."""
+        row = self._conn.execute(
+            "SELECT account_key FROM fatsecret_accounts WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        self._conn.execute("DELETE FROM account_recipes WHERE account_key = ?", (row["account_key"],))
+        self._conn.execute("DELETE FROM fatsecret_accounts WHERE telegram_id = ?", (telegram_id,))
+        self._conn.commit()
+        return True
 
     def registered_user_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS c FROM telegram_users").fetchone()

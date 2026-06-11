@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
 
 from .fatsecret_client import FatSecretClient, FatSecretError
-from .models import FoodSearchResult, Ingredient, Recipe
+from .models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
 from .storage import Storage
 
 
@@ -31,20 +30,42 @@ def _has_ingredient(remote_recipe: Recipe, ingredient: Ingredient) -> bool:
 
 
 class RecipeSyncEngine:
-    def __init__(self, storage: Storage, clients: dict[str, FatSecretClient]) -> None:
+    def __init__(self, storage: Storage, device: FatSecretDeviceConfig) -> None:
         self.storage = storage
-        self.clients = clients
+        self.device = device
 
     async def close(self) -> None:
-        await asyncio.gather(*(client.close() for client in self.clients.values()))
+        return None
+
+    def _build_clients(self) -> dict[str, FatSecretClient]:
+        accounts = self.storage.list_fatsecret_accounts()
+        if not accounts:
+            raise FatSecretError("Сначала подключи хотя бы один FatSecret аккаунт через кнопку «Аккаунты».")
+        return {account.key: FatSecretClient(account, self.device) for account in accounts}
+
+    async def _close_clients(self, clients: dict[str, FatSecretClient]) -> None:
+        for client in clients.values():
+            await client.close()
+
+    async def validate_account(self, account: FatSecretAccountConfig) -> None:
+        """Verify FatSecret credentials by performing a real mobile API login."""
+        client = FatSecretClient(account, self.device)
+        try:
+            await client.login()
+        finally:
+            await client.close()
 
     async def refresh_remote_recipes(self) -> int:
         imported = 0
-        for account_key, client in self.clients.items():
-            recipes = await client.cookbook()
-            for summary in recipes:
-                self.storage.import_remote_recipe(account_key, summary)
-                imported += 1
+        clients = self._build_clients()
+        try:
+            for account_key, client in clients.items():
+                recipes = await client.cookbook()
+                for summary in recipes:
+                    self.storage.import_remote_recipe(account_key, summary)
+                    imported += 1
+        finally:
+            await self._close_clients(clients)
         return imported
 
     async def hydrate_recipe_from_remote(self, recipe_id: str) -> Recipe | None:
@@ -54,46 +75,58 @@ class RecipeSyncEngine:
         if recipe.ingredients:
             return recipe
 
-        for account_key, remote_id in recipe.remote_ids.items():
-            client = self.clients.get(account_key)
-            if client is None:
-                continue
-            remote = await client.get_recipe(remote_id)
-            remote.ingredients = [
-                Ingredient(
-                    id=item.id,
+        clients = self._build_clients()
+        try:
+            for account_key, remote_id in recipe.remote_ids.items():
+                client = clients.get(account_key)
+                if client is None:
+                    continue
+                remote = await client.get_recipe(remote_id)
+                remote.ingredients = [
+                    Ingredient(
+                        id=item.id,
+                        recipe_id=recipe_id,
+                        food_id=item.food_id,
+                        title=item.title,
+                        portion_id=item.portion_id,
+                        amount=item.amount,
+                        portion_description=item.portion_description,
+                        remote_ingredient_id=item.remote_ingredient_id,
+                    )
+                    for item in remote.ingredients
+                ]
+                self.storage.update_recipe_from_remote(
                     recipe_id=recipe_id,
-                    food_id=item.food_id,
-                    title=item.title,
-                    portion_id=item.portion_id,
-                    amount=item.amount,
-                    portion_description=item.portion_description,
-                    remote_ingredient_id=item.remote_ingredient_id,
+                    title=remote.title or recipe.title,
+                    description=remote.description,
+                    portions=remote.portions,
+                    prep_time=remote.prep_time,
+                    cook_time=remote.cook_time,
                 )
-                for item in remote.ingredients
-            ]
-            self.storage.update_recipe_from_remote(
-                recipe_id=recipe_id,
-                title=remote.title or recipe.title,
-                description=remote.description,
-                portions=remote.portions,
-                prep_time=remote.prep_time,
-                cook_time=remote.cook_time,
-            )
-            self.storage.replace_ingredients(recipe_id, remote.ingredients)
-            return self.storage.get_recipe(recipe_id)
+                self.storage.replace_ingredients(recipe_id, remote.ingredients)
+                return self.storage.get_recipe(recipe_id)
+        finally:
+            await self._close_clients(clients)
         return recipe
 
     async def search_food(self, query: str, limit: int = 8) -> list[FoodSearchResult]:
-        first_client = next(iter(self.clients.values()))
-        autocomplete = await first_client.autocomplete_food(query)
-        if autocomplete:
-            return autocomplete[:limit]
-        return (await first_client.search_recipes(query))[:limit]
+        clients = self._build_clients()
+        try:
+            first_client = next(iter(clients.values()))
+            autocomplete = await first_client.autocomplete_food(query)
+            if autocomplete:
+                return autocomplete[:limit]
+            return (await first_client.search_recipes(query))[:limit]
+        finally:
+            await self._close_clients(clients)
 
     async def resolve_food(self, result: FoodSearchResult) -> FoodSearchResult:
-        first_client = next(iter(self.clients.values()))
-        return await first_client.resolve_food_detail(result)
+        clients = self._build_clients()
+        try:
+            first_client = next(iter(clients.values()))
+            return await first_client.resolve_food_detail(result)
+        finally:
+            await self._close_clients(clients)
 
     async def sync_recipe(self, recipe_id: str) -> list[AccountSyncResult]:
         recipe = self.storage.get_recipe(recipe_id)
@@ -101,19 +134,23 @@ class RecipeSyncEngine:
             raise FatSecretError(f"Unknown local recipe id: {recipe_id}")
 
         results: list[AccountSyncResult] = []
-        for account_key, client in self.clients.items():
-            try:
-                remote_id = recipe.remote_ids.get(account_key)
-                remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
-                await self._sync_ingredients(client, recipe, remote_id)
-                ok = await client.save_recipe_meta(recipe, remote_id)
-                if not ok:
-                    raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
-                self.storage.mark_synced(recipe.id, account_key, remote_id, recipe.version)
-                results.append(AccountSyncResult(account_key, remote_id, True, "ok"))
-            except Exception as exc:  # noqa: BLE001 - keep per-account sync isolated.
-                self.storage.record_sync(recipe.id, account_key, "error", str(exc))
-                results.append(AccountSyncResult(account_key, recipe.remote_ids.get(account_key), False, str(exc)))
+        clients = self._build_clients()
+        try:
+            for account_key, client in clients.items():
+                try:
+                    remote_id = recipe.remote_ids.get(account_key)
+                    remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
+                    await self._sync_ingredients(client, recipe, remote_id)
+                    ok = await client.save_recipe_meta(recipe, remote_id)
+                    if not ok:
+                        raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
+                    self.storage.mark_synced(recipe.id, account_key, remote_id, recipe.version)
+                    results.append(AccountSyncResult(account_key, remote_id, True, "ok"))
+                except Exception as exc:  # noqa: BLE001 - keep per-account sync isolated.
+                    self.storage.record_sync(recipe.id, account_key, "error", str(exc))
+                    results.append(AccountSyncResult(account_key, recipe.remote_ids.get(account_key), False, str(exc)))
+        finally:
+            await self._close_clients(clients)
         return results
 
     async def _ensure_remote_recipe(

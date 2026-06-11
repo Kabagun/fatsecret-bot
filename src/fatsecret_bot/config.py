@@ -6,7 +6,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .models import FatSecretAccountConfig, FatSecretDeviceConfig
+from .models import FatSecretDeviceConfig
 
 
 @dataclass(frozen=True)
@@ -14,7 +14,8 @@ class BotConfig:
     telegram_token: str
     allowed_user_ids: set[int]
     db_path: Path
-    accounts: tuple[FatSecretAccountConfig, FatSecretAccountConfig]
+    default_market: str
+    default_language: str
     device: FatSecretDeviceConfig
 
 
@@ -44,19 +45,6 @@ def _allowed_user_ids(value: str) -> set[int]:
     return ids
 
 
-def _account(index: int, default_market: str, default_language: str) -> FatSecretAccountConfig:
-    prefix = f"FATSECRET_ACCOUNT_{index}_"
-    key = _getenv(prefix + "KEY", f"account{index}")
-    return FatSecretAccountConfig(
-        key=key,
-        label=_getenv(prefix + "LABEL", key),
-        username=_required(prefix + "USERNAME"),
-        password=_required(prefix + "PASSWORD"),
-        market=_getenv(prefix + "MKT", default_market),
-        language=_getenv(prefix + "LANG", default_language),
-    )
-
-
 def load_config(env_file: str | Path = ".env") -> BotConfig:
     load_dotenv(env_file)
 
@@ -81,9 +69,7 @@ def load_config(env_file: str | Path = ".env") -> BotConfig:
         telegram_token=_required("TELEGRAM_BOT_TOKEN"),
         allowed_user_ids=_allowed_user_ids(_getenv("TELEGRAM_ALLOWED_USER_IDS")),
         db_path=db_path,
-        accounts=(
-            _account(1, default_market, default_language),
-            _account(2, default_market, default_language),
-        ),
+        default_market=default_market,
+        default_language=default_language,
         device=device,
     )

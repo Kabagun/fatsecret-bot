@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-from .models import FoodSearchResult, Recipe
+from .models import FatSecretAccountConfig, FoodSearchResult, Recipe
 from .storage import Storage
 from .sync import RecipeSyncEngine
 
@@ -26,7 +26,7 @@ RECIPES_PAGE_SIZE = 8
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Рецепты", "Обновить"],
-        ["Новый рецепт"],
+        ["Новый рецепт", "Аккаунты"],
     ],
     resize_keyboard=True,
 )
@@ -106,17 +106,22 @@ class TelegramRecipeBot:
         self,
         token: str,
         allowed_user_ids: set[int],
+        default_market: str,
+        default_language: str,
         storage: Storage,
         sync_engine: RecipeSyncEngine,
     ) -> None:
         self.token = token
         self.allowed_user_ids = allowed_user_ids
+        self.default_market = default_market
+        self.default_language = default_language
         self.storage = storage
         self.sync_engine = sync_engine
 
     def build(self) -> Application:
         app = Application.builder().token(self.token).build()
         app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("accounts", self.accounts))
         app.add_handler(CommandHandler("recipes", self.recipes))
         app.add_handler(CommandHandler("refresh", self.refresh))
         app.add_handler(CommandHandler("new", self.new_recipe))
@@ -146,8 +151,42 @@ class TelegramRecipeBot:
         if not await self._require_user(update):
             return
         await update.effective_message.reply_text(
-            "Готов. Используй кнопки ниже: рецепты, обновление из FatSecret и создание нового рецепта.",
+            "Готов. Сначала подключи FatSecret в «Аккаунты», затем обнови рецепты.",
             reply_markup=MAIN_KEYBOARD,
+        )
+
+    def _accounts_text(self) -> str:
+        accounts = self.storage.list_fatsecret_accounts()
+        if not accounts:
+            return "FatSecret аккаунты еще не подключены. Нужно подключить два аккаунта."
+        lines = [f"<b>Подключено FatSecret аккаунтов: {len(accounts)}/2</b>"]
+        for account in accounts:
+            lines.append(f"- {html.escape(account.label)}: {html.escape(account.username)}")
+        if len(accounts) < 2:
+            lines.append("\nПодключи второй аккаунт, чтобы синхронизация шла в обе стороны.")
+        return "\n".join(lines)
+
+    def _accounts_keyboard(self, telegram_id: int) -> InlineKeyboardMarkup:
+        buttons = [[InlineKeyboardButton("Подключить мой FatSecret", callback_data="account_add:0")]]
+        if self.storage.get_fatsecret_account_by_telegram_id(telegram_id):
+            buttons.append([InlineKeyboardButton("Удалить мой FatSecret", callback_data="account_remove:0")])
+        buttons.append([InlineKeyboardButton("К списку рецептов", callback_data="list:0")])
+        return InlineKeyboardMarkup(buttons)
+
+    async def accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_user(update):
+            return
+        await update.effective_message.reply_text(
+            self._accounts_text(),
+            reply_markup=self._accounts_keyboard(update.effective_user.id),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _edit_accounts(self, query, telegram_id: int) -> None:
+        await query.edit_message_text(
+            self._accounts_text(),
+            reply_markup=self._accounts_keyboard(telegram_id),
+            parse_mode=ParseMode.HTML,
         )
 
     async def refresh(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -229,6 +268,16 @@ class TelegramRecipeBot:
 
         if action == "open":
             await self._open_recipe(query, value)
+        elif action == "accounts":
+            await self._edit_accounts(query, update.effective_user.id)
+        elif action == "account_add":
+            await self._start_account_add(query, context, update.effective_user.id)
+        elif action == "account_remove":
+            removed = self.storage.delete_fatsecret_account_for_user(update.effective_user.id)
+            await query.edit_message_text(
+                "FatSecret аккаунт удален." if removed else "У тебя нет подключенного FatSecret аккаунта.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+            )
         elif action == "list":
             await self._edit_recipe_list(query, int(value or "0"))
         elif action == "refresh":
@@ -257,6 +306,15 @@ class TelegramRecipeBot:
             await self._sync_recipe_message(query, value)
         elif action == "food":
             await self._select_food(query, context, value)
+
+    async def _start_account_add(self, query, context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> None:
+        existing = self.storage.get_fatsecret_account_by_telegram_id(telegram_id)
+        if existing is None and self.storage.fatsecret_account_count() >= 2:
+            await query.edit_message_text("Уже подключены два FatSecret аккаунта. Сначала удали один из них.")
+            return
+        context.user_data.clear()
+        context.user_data["mode"] = "fatsecret_login"
+        await query.edit_message_text("Пришли логин или email от FatSecret. Сообщение я постараюсь удалить после чтения.")
 
     async def _edit_recipe_list(self, query, page: int) -> None:
         recipes = self.storage.list_recipes()
@@ -360,6 +418,9 @@ class TelegramRecipeBot:
         if mode is None and text == "Новый рецепт":
             await self.new_recipe(update, context)
             return
+        if mode is None and text == "Аккаунты":
+            await self.accounts(update, context)
+            return
         if mode == "new_recipe":
             await self._handle_new_recipe(update, context, text)
         elif mode == "edit_recipe":
@@ -368,11 +429,75 @@ class TelegramRecipeBot:
             await self._handle_ingredient_search(update, context, text)
         elif mode == "ingredient_amount":
             await self._handle_ingredient_amount(update, context, text)
+        elif mode == "fatsecret_login":
+            await self._handle_fatsecret_login(update, context, text)
+        elif mode == "fatsecret_password":
+            await self._handle_fatsecret_password(update, context, text)
         else:
             await update.effective_message.reply_text(
                 "Выбери действие кнопками ниже.",
                 reply_markup=MAIN_KEYBOARD,
             )
+
+    async def _delete_user_message(self, update: Update) -> None:
+        try:
+            await update.effective_message.delete()
+        except Exception:  # noqa: BLE001 - message deletion is best-effort only.
+            logger.debug("could not delete user message", exc_info=True)
+
+    async def _handle_fatsecret_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        await self._delete_user_message(update)
+        if not text:
+            await update.effective_chat.send_message("Логин пустой. Пришли логин или email от FatSecret.")
+            return
+        context.user_data["fatsecret_username"] = text
+        context.user_data["mode"] = "fatsecret_password"
+        await update.effective_chat.send_message("Теперь пришли пароль от FatSecret. Я тоже постараюсь удалить это сообщение.")
+
+    async def _handle_fatsecret_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        await self._delete_user_message(update)
+        user = update.effective_user
+        username = context.user_data.get("fatsecret_username", "")
+        if user is None or not username or not text:
+            context.user_data.clear()
+            await update.effective_chat.send_message("Контекст подключения потерян. Нажми «Аккаунты» и начни заново.")
+            return
+        existing = self.storage.get_fatsecret_account_by_telegram_id(user.id)
+        if existing is None and self.storage.fatsecret_account_count() >= 2:
+            context.user_data.clear()
+            await update.effective_chat.send_message("Уже подключены два FatSecret аккаунта. Сначала удали один из них.")
+            return
+
+        account = FatSecretAccountConfig(
+            key=f"tg{user.id}",
+            label=user.full_name or str(user.id),
+            username=username,
+            password=text,
+            market=self.default_market,
+            language=self.default_language,
+        )
+        status = await update.effective_chat.send_message("Проверяю логин в FatSecret...")
+        try:
+            await self.sync_engine.validate_account(account)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("FatSecret account validation failed")
+            context.user_data.clear()
+            await status.edit_text(f"FatSecret не принял логин/пароль: {exc}")
+            return
+
+        self.storage.upsert_fatsecret_account(
+            telegram_id=user.id,
+            label=account.label,
+            username=account.username,
+            password=account.password,
+            market=account.market,
+            language=account.language,
+        )
+        context.user_data.clear()
+        await status.edit_text(
+            "FatSecret аккаунт подключен.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+        )
 
     async def _handle_new_recipe(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         try:

@@ -51,3 +51,57 @@ def test_remote_hydration_update_does_not_bump_version(tmp_path) -> None:
         assert after.portions == Decimal("3")
     finally:
         storage.close()
+
+
+def test_fatsecret_account_upsert_replaces_user_account(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        first_key = storage.upsert_fatsecret_account(
+            telegram_id=11,
+            label="User One",
+            username="old@example.com",
+            password="old-password",
+            market="BY",
+            language="ru",
+        )
+        second_key = storage.upsert_fatsecret_account(
+            telegram_id=11,
+            label="User One",
+            username="new@example.com",
+            password="new-password",
+            market="PL",
+            language="en",
+        )
+
+        account = storage.get_fatsecret_account_by_telegram_id(11)
+        assert first_key == second_key == "tg11"
+        assert storage.fatsecret_account_count() == 1
+        assert account is not None
+        assert account.username == "new@example.com"
+        assert account.password == "new-password"
+        assert account.market == "PL"
+        assert account.language == "en"
+    finally:
+        storage.close()
+
+
+def test_delete_fatsecret_account_removes_remote_recipe_mapping(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.upsert_fatsecret_account(
+            telegram_id=11,
+            label="User One",
+            username="one@example.com",
+            password="password",
+            market="BY",
+            language="ru",
+        )
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("2"), 5, 10, updated_by=11)
+        storage.set_remote_recipe_id(recipe_id, "tg11", "123", last_synced_version=1)
+
+        assert storage.delete_fatsecret_account_for_user(11) is True
+        assert storage.delete_fatsecret_account_for_user(11) is False
+        assert storage.get_fatsecret_account_by_telegram_id(11) is None
+        assert storage.remote_ids(recipe_id) == {}
+    finally:
+        storage.close()
