@@ -139,7 +139,7 @@ def _recipe_actions_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}"),
-                InlineKeyboardButton("Удалить из бота", callback_data=f"delete:{recipe_id}"),
+                InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}"),
             ],
             [InlineKeyboardButton("К списку", callback_data="list:0")],
         ]
@@ -308,6 +308,7 @@ class TelegramRecipeBot:
                 InlineKeyboardButton("Обновить", callback_data="refresh:0"),
             ]
         )
+        buttons.append([InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}")])
         return InlineKeyboardMarkup(buttons)
 
     def _filter_recipes(self, query: str) -> list[Recipe]:
@@ -383,6 +384,17 @@ class TelegramRecipeBot:
             context.user_data.clear()
             source_key, _, recipe_id = value.partition(":")
             await self._sync_recipe_message(query, recipe_id, source_key)
+        elif action == "batchdel":
+            await self._open_batch_delete(query, context, int(value or "0"))
+        elif action == "bdtoggle":
+            await self._toggle_batch_delete(query, context, value)
+        elif action == "bdconfirm":
+            await self._confirm_batch_delete(query, context, int(value or "0"))
+        elif action == "bdexecute":
+            await self._execute_batch_delete(query, context)
+        elif action == "bdcancel":
+            context.user_data.clear()
+            await self._edit_recipe_list(query, 0)
         elif action == "delete":
             context.user_data.clear()
             await self._confirm_delete_recipe(query, value)
@@ -549,11 +561,11 @@ class TelegramRecipeBot:
             await query.edit_message_text("Рецепт не найден.")
             return
         await query.edit_message_text(
-            f"Удалить «{html.escape(recipe.title)}» из списка бота?\n\n"
-            "В FatSecret рецепт не удаляю.",
+            f"Удалить «{html.escape(recipe.title)}» из FatSecret на всех привязанных аккаунтах?\n\n"
+            "После успешного удаления бот уберет рецепт из своего списка.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Удалить из бота", callback_data=f"delete_confirm:{recipe_id}")],
+                    [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete_confirm:{recipe_id}")],
                     [InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")],
                 ]
             ),
@@ -561,12 +573,156 @@ class TelegramRecipeBot:
         )
 
     async def _delete_recipe(self, query, recipe_id: str) -> None:
-        deleted = self.storage.delete_recipe(recipe_id)
+        await query.edit_message_text("Удаляю рецепт в FatSecret...")
+        try:
+            results = await self.sync_engine.delete_recipe_everywhere(recipe_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("delete failed")
+            await query.edit_message_text(f"Ошибка удаления: {exc}")
+            return
+        account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts()}
+        lines = [
+            f"{account_labels.get(result.account_key, result.account_key)}: "
+            f"{'OK' if result.ok else 'ERROR'} {result.remote_recipe_id or ''} {result.message}"
+            for result in results
+        ]
         await query.edit_message_text(
-            "Удалил из списка бота. В FatSecret рецепт не трогал."
-            if deleted
-            else "Рецепт уже не найден в списке бота.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            "Удаление завершено:\n" + "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                    [InlineKeyboardButton("Обновить", callback_data="refresh:0")],
+                ]
+            ),
+        )
+
+    def _batch_delete_ids(self, context: ContextTypes.DEFAULT_TYPE) -> set[str]:
+        selected = context.user_data.setdefault("batch_delete_ids", set())
+        if not isinstance(selected, set):
+            selected = set(selected)
+            context.user_data["batch_delete_ids"] = selected
+        return selected
+
+    async def _open_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+        recipes = self.storage.list_recipes()
+        if not recipes:
+            await query.edit_message_text("Рецептов пока нет.")
+            return
+        context.user_data["mode"] = "batch_delete"
+        selected = self._batch_delete_ids(context)
+        selected.intersection_update({recipe.id for recipe in recipes})
+        await query.edit_message_text(
+            f"Выбери рецепты для удаления из FatSecret. Отмечено: {len(selected)}",
+            reply_markup=self._batch_delete_keyboard(recipes, page, selected),
+        )
+
+    async def _toggle_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
+        recipe_id, _, page_text = value.partition(":")
+        selected = self._batch_delete_ids(context)
+        if recipe_id in selected:
+            selected.remove(recipe_id)
+        else:
+            selected.add(recipe_id)
+        await self._open_batch_delete(query, context, int(page_text or "0"))
+
+    def _batch_delete_keyboard(self, recipes: list[Recipe], page: int, selected: set[str]) -> InlineKeyboardMarkup:
+        page = max(0, page)
+        total_pages = max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE)
+        page = min(page, total_pages - 1)
+        start = page * RECIPES_PAGE_SIZE
+        current = recipes[start : start + RECIPES_PAGE_SIZE]
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"{'[x]' if recipe.id in selected else '[ ]'} {recipe.title[:48]}",
+                    callback_data=f"bdtoggle:{recipe.id}:{page}",
+                )
+            ]
+            for recipe in current
+        ]
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("Назад", callback_data=f"batchdel:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"batchdel:{page}"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton("Дальше", callback_data=f"batchdel:{page + 1}"))
+        if nav:
+            buttons.append(nav)
+        if selected:
+            buttons.append([InlineKeyboardButton(f"Удалить выбранные: {len(selected)}", callback_data=f"bdconfirm:{page}")])
+        buttons.append([InlineKeyboardButton("Отмена", callback_data="bdcancel:0")])
+        return InlineKeyboardMarkup(buttons)
+
+    async def _confirm_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+        selected = self._batch_delete_ids(context)
+        selected_recipes = [recipe for recipe in self.storage.list_recipes() if recipe.id in selected]
+        if not selected_recipes:
+            await query.edit_message_text(
+                "Ничего не выбрано.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад к выбору", callback_data=f"batchdel:{page}")]]),
+            )
+            return
+        preview = "\n".join(f"- {html.escape(recipe.title)}" for recipe in selected_recipes[:10])
+        if len(selected_recipes) > 10:
+            preview += f"\n...и еще {len(selected_recipes) - 10}"
+        await query.edit_message_text(
+            f"<b>Удалить из FatSecret рецептов: {len(selected_recipes)}?</b>\n\n"
+            f"{preview}\n\n"
+            "Удаление пройдет по всем привязанным аккаунтам.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Да, удалить в FatSecret", callback_data="bdexecute:0")],
+                    [InlineKeyboardButton("Назад к выбору", callback_data=f"batchdel:{page}")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _execute_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        selected_set = self._batch_delete_ids(context)
+        recipes = self.storage.list_recipes()
+        selected = [recipe.id for recipe in recipes if recipe.id in selected_set]
+        if not selected:
+            await query.edit_message_text("Ничего не выбрано.")
+            return
+        title_by_id = {recipe.id: recipe.title for recipe in recipes}
+        await query.edit_message_text(f"Удаляю рецепты в FatSecret: {len(selected)}...")
+        try:
+            results_by_recipe = await self.sync_engine.delete_recipes_everywhere(selected)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("batch delete failed")
+            await query.edit_message_text(f"Ошибка batch удаления: {exc}")
+            return
+        context.user_data.clear()
+        account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts()}
+        ok_count = 0
+        error_count = 0
+        lines: list[str] = []
+        for recipe_id in selected:
+            results = results_by_recipe.get(recipe_id, [])
+            ok = bool(results) and all(result.ok for result in results)
+            ok_count += int(ok)
+            error_count += int(not ok)
+            result_text = "; ".join(
+                f"{account_labels.get(result.account_key, result.account_key)} "
+                f"{'OK' if result.ok else 'ERROR'} {result.message}"
+                for result in results
+            )
+            lines.append(f"- {title_by_id.get(recipe_id, recipe_id)}: {'OK' if ok else 'ERROR'}; {result_text}")
+        text = (
+            f"Массовое удаление завершено. OK: {ok_count}; ошибок: {error_count}.\n\n"
+            + "\n".join(lines)
+        )
+        if len(text) > 3800:
+            text = text[:3700].rstrip() + "\n...результат обрезан, часть строк не помещается в Telegram."
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                    [InlineKeyboardButton("Обновить", callback_data="refresh:0")],
+                ]
+            ),
         )
 
     async def _select_food(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:

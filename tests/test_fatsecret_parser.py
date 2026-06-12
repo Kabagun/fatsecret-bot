@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from urllib.parse import parse_qs
+
+import httpx
+
 from fatsecret_bot.fatsecret_client import FatSecretClient, parse_recipe_initial_save_response
-from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig
+from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession
 
 
 def _client() -> FatSecretClient:
@@ -65,3 +70,38 @@ def test_parse_recipe_ingredients() -> None:
 def test_parse_recipe_initial_save_response() -> None:
     assert parse_recipe_initial_save_response("SUCCESS:129226840") == "129226840"
     assert parse_recipe_initial_save_response("129226840") == "129226840"
+
+
+def test_delete_recipe_posts_recipedelete_form() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="True")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+    )
+    client._session = FatSecretSession(server_id="server", device_key="device", secret_key="secret")
+    try:
+        ok = asyncio.run(client.delete_recipe("123456"))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert ok is True
+    assert len(requests) == 1
+    form = parse_qs(requests[0].content.decode())
+    assert form["action"] == ["recipedelete"]
+    assert form["rid"] == ["123456"]
+    assert form["fl"] == ["5"]

@@ -267,6 +267,66 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return results
 
+    async def delete_recipe_everywhere(self, recipe_id: str) -> list[AccountSyncResult]:
+        """Delete one recipe from every FatSecret account where it is mapped."""
+        clients = self._build_clients()
+        try:
+            return await self._delete_recipe_with_clients(recipe_id, clients)
+        finally:
+            await self._close_clients(clients)
+
+    async def delete_recipes_everywhere(self, recipe_ids: list[str]) -> dict[str, list[AccountSyncResult]]:
+        """Delete several recipes from all mapped FatSecret accounts."""
+        clients = self._build_clients()
+        results: dict[str, list[AccountSyncResult]] = {}
+        try:
+            for recipe_id in recipe_ids:
+                try:
+                    results[recipe_id] = await self._delete_recipe_with_clients(recipe_id, clients)
+                except Exception as exc:  # noqa: BLE001 - keep batch deletion moving.
+                    results[recipe_id] = [AccountSyncResult("local", None, False, str(exc))]
+        finally:
+            await self._close_clients(clients)
+        return results
+
+    async def _delete_recipe_with_clients(
+        self,
+        recipe_id: str,
+        clients: dict[str, FatSecretClient],
+    ) -> list[AccountSyncResult]:
+        recipe = self.storage.get_recipe(recipe_id)
+        if recipe is None:
+            raise FatSecretError(f"Unknown local recipe id: {recipe_id}")
+        if not recipe.remote_ids:
+            self.storage.delete_recipe(recipe.id)
+            return [AccountSyncResult("local", None, True, "нет привязок к FatSecret; удалил локально")]
+
+        results: list[AccountSyncResult] = []
+        deleted_account_keys: list[str] = []
+        for account_key, remote_id in list(recipe.remote_ids.items()):
+            client = clients.get(account_key)
+            if client is None:
+                message = "FatSecret аккаунт больше не подключен"
+                self.storage.record_sync(recipe.id, account_key, "error", message)
+                results.append(AccountSyncResult(account_key, remote_id, False, message))
+                continue
+            try:
+                ok = await client.delete_recipe(remote_id)
+                if not ok:
+                    raise FatSecretError(f"{client.account.label}: recipe delete returned false")
+                self.storage.record_sync(recipe.id, account_key, "ok", f"deleted remote recipe {remote_id}")
+                deleted_account_keys.append(account_key)
+                results.append(AccountSyncResult(account_key, remote_id, True, "удален в FatSecret"))
+            except Exception as exc:  # noqa: BLE001 - keep per-account deletion isolated.
+                self.storage.record_sync(recipe.id, account_key, "error", str(exc))
+                results.append(AccountSyncResult(account_key, remote_id, False, str(exc)))
+
+        for account_key in deleted_account_keys:
+            self.storage.delete_remote_recipe_id(recipe.id, account_key)
+        if deleted_account_keys and not self.storage.remote_ids(recipe.id):
+            self.storage.delete_recipe(recipe.id)
+        return results
+
     async def _ensure_remote_recipe(
         self,
         client: FatSecretClient,

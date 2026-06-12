@@ -122,3 +122,18 @@ def test_delete_recipe_removes_local_recipe_data(tmp_path) -> None:
         assert storage.remote_ids(recipe_id) == {}
     finally:
         storage.close()
+
+
+def test_delete_remote_recipe_id_removes_one_mapping(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("2"), 5, 10, updated_by=11)
+        storage.set_remote_recipe_id(recipe_id, "tg11", "111", last_synced_version=1)
+        storage.set_remote_recipe_id(recipe_id, "tg22", "222", last_synced_version=1)
+
+        assert storage.delete_remote_recipe_id(recipe_id, "tg11") is True
+        assert storage.delete_remote_recipe_id(recipe_id, "tg11") is False
+        assert storage.remote_ids(recipe_id) == {"tg22": "222"}
+        assert storage.get_recipe(recipe_id) is not None
+    finally:
+        storage.close()

@@ -213,6 +213,16 @@ class FatSecretClient:
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
         return _looks_like_true(response.text)
 
+    async def delete_recipe(self, remote_recipe_id: str) -> bool:
+        """Delete a recipe from the current account's FatSecret cookbook."""
+        form = {
+            "action": "recipedelete",
+            "fl": "5",
+            "rid": remote_recipe_id,
+        }
+        response = await self._post_android("RecipeActionAndroidPage.aspx", form)
+        return _looks_like_true(response.text)
+
     async def _post_android(self, page: str, fields: dict[str, str]) -> httpx.Response:
         session = await self.ensure_logged_in()
         common = self._common_form(session)

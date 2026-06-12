@@ -9,17 +9,19 @@ from fatsecret_bot.sync import RecipeSyncEngine
 
 
 class FakeFatSecretClient:
-    def __init__(self, target: Recipe) -> None:
+    def __init__(self, target: Recipe, account_key: str = "target", delete_ok: bool = True) -> None:
         self.account = FatSecretAccountConfig(
-            key="target",
-            label="Target",
-            username="target@example.com",
+            key=account_key,
+            label=account_key,
+            username=f"{account_key}@example.com",
             password="secret",
             market="BY",
             language="ru",
         )
         self.target = target
+        self.delete_ok = delete_ok
         self.saved_ingredients: list[Ingredient] = []
+        self.deleted_recipe_ids: list[str] = []
 
     async def get_recipe(self, remote_id: str) -> Recipe:
         assert remote_id == self.target.id
@@ -29,6 +31,13 @@ class FakeFatSecretClient:
         assert remote_recipe_id == self.target.id
         self.saved_ingredients.append(ingredient)
         return True
+
+    async def delete_recipe(self, remote_recipe_id: str) -> bool:
+        self.deleted_recipe_ids.append(remote_recipe_id)
+        return self.delete_ok
+
+    async def close(self) -> None:
+        return None
 
 
 def _device() -> FatSecretDeviceConfig:
@@ -98,5 +107,47 @@ def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> No
         assert client.saved_ingredients[0].remote_ingredient_id == "iid-1"
         assert client.saved_ingredients[0].amount == Decimal("125")
         assert client.saved_ingredients[1].remote_ingredient_id is None
+    finally:
+        storage.close()
+
+
+def test_delete_recipe_everywhere_deletes_all_mappings_and_local_recipe(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("2"), 5, 10, updated_by=11)
+        storage.set_remote_recipe_id(recipe_id, "tg11", "111", last_synced_version=1)
+        storage.set_remote_recipe_id(recipe_id, "tg22", "222", last_synced_version=1)
+        engine = RecipeSyncEngine(storage, _device())
+        first = FakeFatSecretClient(Recipe(id="111", title="Омлет"), account_key="tg11")
+        second = FakeFatSecretClient(Recipe(id="222", title="Омлет"), account_key="tg22")
+        engine._build_clients = lambda: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+
+        results = asyncio.run(engine.delete_recipe_everywhere(recipe_id))
+
+        assert all(result.ok for result in results)
+        assert first.deleted_recipe_ids == ["111"]
+        assert second.deleted_recipe_ids == ["222"]
+        assert storage.get_recipe(recipe_id) is None
+        assert storage.remote_ids(recipe_id) == {}
+    finally:
+        storage.close()
+
+
+def test_delete_recipe_everywhere_keeps_failed_remote_mapping(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("2"), 5, 10, updated_by=11)
+        storage.set_remote_recipe_id(recipe_id, "tg11", "111", last_synced_version=1)
+        storage.set_remote_recipe_id(recipe_id, "tg22", "222", last_synced_version=1)
+        engine = RecipeSyncEngine(storage, _device())
+        first = FakeFatSecretClient(Recipe(id="111", title="Омлет"), account_key="tg11")
+        second = FakeFatSecretClient(Recipe(id="222", title="Омлет"), account_key="tg22", delete_ok=False)
+        engine._build_clients = lambda: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+
+        results = asyncio.run(engine.delete_recipe_everywhere(recipe_id))
+
+        assert [result.ok for result in results] == [True, False]
+        assert storage.get_recipe(recipe_id) is not None
+        assert storage.remote_ids(recipe_id) == {"tg22": "222"}
     finally:
         storage.close()

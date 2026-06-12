@@ -478,6 +478,15 @@ class Storage:
             (recipe_id, account_key, remote_recipe_id, last_synced_version, _now()),
         )
 
+    def delete_remote_recipe_id(self, recipe_id: str, account_key: str) -> bool:
+        """Remove one FatSecret account mapping for a local recipe."""
+        cursor = self._conn.execute(
+            "DELETE FROM account_recipes WHERE recipe_id = ? AND account_key = ?",
+            (recipe_id, account_key),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
     def mark_synced(self, recipe_id: str, account_key: str, remote_recipe_id: str, version: int) -> None:
         self.set_remote_recipe_id(recipe_id, account_key, remote_recipe_id, version)
         self.record_sync(recipe_id, account_key, "ok", f"synced remote recipe {remote_recipe_id}")
@@ -491,3 +500,4 @@ class Storage:
             """,
             (recipe_id, account_key, status, message, _now()),
         )
+        self._conn.commit()
