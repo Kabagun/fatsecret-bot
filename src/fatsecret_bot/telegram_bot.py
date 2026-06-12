@@ -21,12 +21,12 @@ from .sync import RecipeSyncEngine
 
 logger = logging.getLogger(__name__)
 RECIPES_PAGE_SIZE = 8
+MAIN_BUTTONS = {"Рецепты", "Группы", "Аккаунты"}
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["Рецепты", "Поиск"],
-        ["Обновить", "Аккаунты"],
-        ["Группы"],
+        ["Рецепты"],
+        ["Группы", "Аккаунты"],
     ],
     resize_keyboard=True,
 )
@@ -109,7 +109,6 @@ class TelegramRecipeBot:
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("accounts", self.accounts))
         app.add_handler(CommandHandler("recipes", self.recipes))
-        app.add_handler(CommandHandler("search", self.search_recipes))
         app.add_handler(CommandHandler("refresh", self.refresh))
         app.add_handler(CommandHandler("groups", self.groups))
         app.add_handler(CallbackQueryHandler(self.on_callback))
@@ -177,6 +176,7 @@ class TelegramRecipeBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
+        context.user_data.clear()
         if self.storage.active_group_for_user(update.effective_user.id) is None:
             await update.effective_message.reply_text(
                 "Готов. Для синхронизации рецептов нужна группа.",
@@ -243,6 +243,7 @@ class TelegramRecipeBot:
     async def accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
+        context.user_data.clear()
         group = await self._require_active_group(update)
         if group is None:
             return
@@ -269,6 +270,7 @@ class TelegramRecipeBot:
     async def refresh(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
+        context.user_data.clear()
         group = await self._require_active_group(update)
         if group is None:
             return
@@ -285,6 +287,7 @@ class TelegramRecipeBot:
     async def recipes(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
+        context.user_data.clear()
         if await self._require_active_group(update) is None:
             return
         await self._send_recipe_list(update, context, page=0)
@@ -305,7 +308,7 @@ class TelegramRecipeBot:
         recipes = self.storage.list_recipes(group.id)
         if not recipes:
             await update.effective_message.reply_text(
-                "Рецептов пока нет. Нажми «Обновить», чтобы загрузить их из FatSecret.",
+                "Рецептов пока нет. Создай рецепт в FatSecret и обнови список командой /refresh.",
                 reply_markup=MAIN_KEYBOARD,
             )
             return
@@ -383,11 +386,17 @@ class TelegramRecipeBot:
         elif action == "group_create":
             context.user_data.clear()
             context.user_data["mode"] = "group_create"
-            await query.edit_message_text("Пришли название новой группы.")
+            await query.edit_message_text(
+                "Пришли название новой группы.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
+            )
         elif action == "group_join":
             context.user_data.clear()
             context.user_data["mode"] = "group_join"
-            await query.edit_message_text("Пришли код группы.")
+            await query.edit_message_text(
+                "Пришли код группы.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
+            )
         elif action == "group_switch":
             context.user_data.clear()
             switched = self.storage.set_active_group_for_user(update.effective_user.id, value)
@@ -796,14 +805,11 @@ class TelegramRecipeBot:
         if mode is not None and text.casefold() in {"отмена", "назад"}:
             await self._cancel_mode(update, context)
             return
+        if text in MAIN_BUTTONS:
+            context.user_data.clear()
+            mode = None
         if mode is None and text == "Рецепты":
             await self._send_recipe_list(update, context, page=0)
-            return
-        if mode is None and text == "Поиск":
-            await self.search_recipes(update, context)
-            return
-        if mode is None and text == "Обновить":
-            await self.refresh(update, context)
             return
         if mode is None and text == "Аккаунты":
             await self.accounts(update, context)
