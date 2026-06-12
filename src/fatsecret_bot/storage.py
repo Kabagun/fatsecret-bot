@@ -388,6 +388,18 @@ class Storage:
             self._insert_ingredient(recipe_id, ingredient, index)
         self._conn.commit()
 
+    def delete_recipe(self, recipe_id: str) -> bool:
+        """Delete a local recipe cache entry and all bot-side sync metadata."""
+        row = self._conn.execute("SELECT 1 FROM recipes WHERE id = ?", (recipe_id,)).fetchone()
+        if row is None:
+            return False
+        self._conn.execute("DELETE FROM ingredients WHERE recipe_id = ?", (recipe_id,))
+        self._conn.execute("DELETE FROM account_recipes WHERE recipe_id = ?", (recipe_id,))
+        self._conn.execute("DELETE FROM sync_events WHERE recipe_id = ?", (recipe_id,))
+        self._conn.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
+        self._conn.commit()
+        return True
+
     def add_ingredient(
         self,
         recipe_id: str,

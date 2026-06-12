@@ -105,3 +105,20 @@ def test_delete_fatsecret_account_removes_remote_recipe_mapping(tmp_path) -> Non
         assert storage.remote_ids(recipe_id) == {}
     finally:
         storage.close()
+
+
+def test_delete_recipe_removes_local_recipe_data(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("2"), 5, 10, updated_by=11)
+        storage.add_ingredient(recipe_id, "4881229", "Куриное Филе", "4751539", Decimal("100"))
+        storage.set_remote_recipe_id(recipe_id, "tg11", "123", last_synced_version=1)
+        storage.record_sync(recipe_id, "tg11", "ok", "synced")
+
+        assert storage.delete_recipe(recipe_id) is True
+        assert storage.delete_recipe(recipe_id) is False
+        assert storage.get_recipe(recipe_id) is None
+        assert storage.list_ingredients(recipe_id) == []
+        assert storage.remote_ids(recipe_id) == {}
+    finally:
+        storage.close()

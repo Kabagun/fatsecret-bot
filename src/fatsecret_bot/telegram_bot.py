@@ -33,8 +33,7 @@ EDIT_FIELD_LABELS = {
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Рецепты", "Поиск"],
-        ["Обновить", "Новый рецепт"],
-        ["Аккаунты"],
+        ["Обновить", "Аккаунты"],
     ],
     resize_keyboard=True,
 )
@@ -139,13 +138,10 @@ def _recipe_actions_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Добавить ингредиент", callback_data=f"add:{recipe_id}"),
-                InlineKeyboardButton("Изменить", callback_data=f"edit:{recipe_id}"),
-            ],
-            [
                 InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}"),
-                InlineKeyboardButton("К списку", callback_data="list:0"),
+                InlineKeyboardButton("Удалить из бота", callback_data=f"delete:{recipe_id}"),
             ],
+            [InlineKeyboardButton("К списку", callback_data="list:0")],
         ]
     )
 
@@ -191,7 +187,6 @@ class TelegramRecipeBot:
         app.add_handler(CommandHandler("recipes", self.recipes))
         app.add_handler(CommandHandler("search", self.search_recipes))
         app.add_handler(CommandHandler("refresh", self.refresh))
-        app.add_handler(CommandHandler("new", self.new_recipe))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         return app
@@ -218,7 +213,7 @@ class TelegramRecipeBot:
         if not await self._require_user(update):
             return
         await update.effective_message.reply_text(
-            "Готов. Сначала подключи FatSecret в «Аккаунты», затем обнови рецепты.",
+            "Готов. Создавай и редактируй рецепты в FatSecret, а здесь обновляй список и синхронизируй выбранный рецепт.",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -283,7 +278,7 @@ class TelegramRecipeBot:
         recipes = self.storage.list_recipes()
         if not recipes:
             await update.effective_message.reply_text(
-                "Рецептов пока нет. Нажми «Обновить» или «Новый рецепт».",
+                "Рецептов пока нет. Нажми «Обновить», чтобы загрузить их из FatSecret.",
                 reply_markup=MAIN_KEYBOARD,
             )
             return
@@ -313,7 +308,6 @@ class TelegramRecipeBot:
                 InlineKeyboardButton("Обновить", callback_data="refresh:0"),
             ]
         )
-        buttons.append([InlineKeyboardButton("Новый рецепт", callback_data="new:0")])
         return InlineKeyboardMarkup(buttons)
 
     def _filter_recipes(self, query: str) -> list[Recipe]:
@@ -382,32 +376,24 @@ class TelegramRecipeBot:
         elif action == "refresh":
             context.user_data.clear()
             await self._refresh_from_callback(query)
-        elif action == "new":
-            context.user_data.clear()
-            context.user_data["mode"] = "new_recipe"
-            await query.edit_message_text(
-                "Пришли рецепт одной строкой:\n"
-                "Название | порции | подготовка_мин | готовка_мин | описание\n\n"
-                "Пример: Омлет | 2 | 5 | 10 | Завтрак"
-            )
-        elif action == "add":
-            context.user_data.clear()
-            context.user_data["mode"] = "ingredient_search"
-            context.user_data["recipe_id"] = value
-            await query.edit_message_text(
-                "Введите название продукта/ингредиента для поиска.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{value}")]]),
-            )
-        elif action == "edit":
-            context.user_data.clear()
-            await self._open_edit_menu(query, value)
-        elif action == "editfield":
-            await self._start_edit_field(query, context, value)
         elif action == "sync":
             context.user_data.clear()
-            await self._sync_recipe_message(query, value)
-        elif action == "food":
-            await self._select_food(query, context, value)
+            await self._open_sync_menu(query, value)
+        elif action == "syncfrom":
+            context.user_data.clear()
+            source_key, _, recipe_id = value.partition(":")
+            await self._sync_recipe_message(query, recipe_id, source_key)
+        elif action == "delete":
+            context.user_data.clear()
+            await self._confirm_delete_recipe(query, value)
+        elif action == "delete_confirm":
+            context.user_data.clear()
+            await self._delete_recipe(query, value)
+        else:
+            await query.edit_message_text(
+                "Это действие устарело. Открой список рецептов заново.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            )
 
     async def _start_account_add(self, query, context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> None:
         existing = self.storage.get_fatsecret_account_by_telegram_id(telegram_id)
@@ -506,20 +492,82 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
-    async def _sync_recipe_message(self, query, recipe_id: str) -> None:
-        await query.edit_message_text("Синхронизирую в оба FatSecret аккаунта...")
+    async def _open_sync_menu(self, query, recipe_id: str) -> None:
+        recipe = self.storage.get_recipe(recipe_id)
+        if recipe is None:
+            await query.edit_message_text("Рецепт не найден.")
+            return
+        accounts = {account.key: account.label for account in self.storage.list_fatsecret_accounts()}
+        source_keys = [key for key in recipe.remote_ids if key in accounts]
+        if not source_keys:
+            await query.edit_message_text(
+                "У рецепта нет привязки к подключенным FatSecret аккаунтам. Нажми «Обновить» и попробуй снова.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Обновить", callback_data="refresh:0")]]),
+            )
+            return
+        if len(source_keys) == 1:
+            await self._sync_recipe_message(query, recipe_id, source_keys[0])
+            return
+        buttons = [
+            [InlineKeyboardButton(f"Из {accounts[key]}", callback_data=f"syncfrom:{key}:{recipe_id}")]
+            for key in source_keys
+        ]
+        buttons.append([InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")])
+        await query.edit_message_text(
+            "На каком FatSecret аккаунте сейчас правильная версия рецепта?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def _sync_recipe_message(self, query, recipe_id: str, source_account_key: str) -> None:
+        account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts()}
+        source_label = account_labels.get(source_account_key, source_account_key)
+        await query.edit_message_text(f"Синхронизирую рецепт из FatSecret аккаунта «{source_label}»...")
         try:
-            results = await self.sync_engine.sync_recipe(recipe_id)
+            results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
         except Exception as exc:  # noqa: BLE001
             logger.exception("sync failed")
             await query.edit_message_text(f"Ошибка синхронизации: {exc}")
             return
         lines = [
-            f"{result.account_key}: {'OK' if result.ok else 'ERROR'}"
+            f"{account_labels.get(result.account_key, result.account_key)}: {'OK' if result.ok else 'ERROR'}"
             f" {result.remote_recipe_id or ''} {result.message}"
             for result in results
         ]
-        await query.edit_message_text("Синхронизация завершена:\n" + "\n".join(lines))
+        await query.edit_message_text(
+            "Синхронизация завершена:\n" + "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Открыть рецепт", callback_data=f"open:{recipe_id}")],
+                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                ]
+            ),
+        )
+
+    async def _confirm_delete_recipe(self, query, recipe_id: str) -> None:
+        recipe = self.storage.get_recipe(recipe_id)
+        if recipe is None:
+            await query.edit_message_text("Рецепт не найден.")
+            return
+        await query.edit_message_text(
+            f"Удалить «{html.escape(recipe.title)}» из списка бота?\n\n"
+            "В FatSecret рецепт не удаляю.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Удалить из бота", callback_data=f"delete_confirm:{recipe_id}")],
+                    [InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _delete_recipe(self, query, recipe_id: str) -> None:
+        deleted = self.storage.delete_recipe(recipe_id)
+        await query.edit_message_text(
+            "Удалил из списка бота. В FatSecret рецепт не трогал."
+            if deleted
+            else "Рецепт уже не найден в списке бота.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+        )
 
     async def _select_food(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
         choices: list[FoodSearchResult] = context.user_data.get("food_choices", [])
@@ -554,24 +602,11 @@ class TelegramRecipeBot:
         if mode is None and text == "Обновить":
             await self.refresh(update, context)
             return
-        if mode is None and text == "Новый рецепт":
-            await self.new_recipe(update, context)
-            return
         if mode is None and text == "Аккаунты":
             await self.accounts(update, context)
             return
-        if mode == "new_recipe":
-            await self._handle_new_recipe(update, context, text)
-        elif mode == "edit_recipe":
-            await self._handle_edit_recipe(update, context, text)
-        elif mode == "ingredient_search":
-            await self._handle_ingredient_search(update, context, text)
-        elif mode == "ingredient_amount":
-            await self._handle_ingredient_amount(update, context, text)
-        elif mode == "recipe_search":
+        if mode == "recipe_search":
             await self._handle_recipe_search(update, context, text)
-        elif isinstance(mode, str) and mode.startswith("edit_"):
-            await self._handle_edit_field(update, context, text)
         elif mode == "fatsecret_login":
             await self._handle_fatsecret_login(update, context, text)
         elif mode == "fatsecret_password":
