@@ -55,6 +55,19 @@ class RecipeSyncEngine:
         finally:
             await client.close()
 
+    async def refresh_account_recipes(self, account: FatSecretAccountConfig) -> int:
+        """Import cookbook recipes for one connected FatSecret account."""
+        client = FatSecretClient(account, self.device)
+        imported = 0
+        try:
+            recipes = await client.cookbook()
+            for summary in recipes:
+                self.storage.import_remote_recipe(account.key, summary)
+                imported += 1
+        finally:
+            await client.close()
+        return imported
+
     async def refresh_remote_recipes(self) -> int:
         imported = 0
         clients = self._build_clients()

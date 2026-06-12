@@ -16,17 +16,25 @@ from telegram.ext import (
 )
 
 from .models import FatSecretAccountConfig, FoodSearchResult, Recipe
-from .storage import Storage
+from .storage import Storage, normalize_title
 from .sync import RecipeSyncEngine
 
 logger = logging.getLogger(__name__)
 RECIPES_PAGE_SIZE = 8
+EDIT_FIELD_LABELS = {
+    "title": "Название",
+    "portions": "Порции",
+    "prep": "Подготовка, мин",
+    "cook": "Готовка, мин",
+    "description": "Описание",
+}
 
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["Рецепты", "Обновить"],
-        ["Новый рецепт", "Аккаунты"],
+        ["Рецепты", "Поиск"],
+        ["Обновить", "Новый рецепт"],
+        ["Аккаунты"],
     ],
     resize_keyboard=True,
 )
@@ -51,19 +59,45 @@ def _parse_recipe_meta(text: str) -> tuple[str, Decimal, int, int, str]:
 
 def _format_recipe(recipe: Recipe) -> str:
     ingredients = "\n".join(
-        f"- {html.escape(item.title)}: {item.amount} {html.escape(item.portion_description or '')}".rstrip()
+        f"- {html.escape(item.title)}: {html.escape(_format_ingredient_amount(item.amount, item.portion_description))}"
         for item in recipe.ingredients
     )
     if not ingredients:
         ingredients = "Ингредиентов пока нет."
-    remote = ", ".join(f"{k}: {v}" for k, v in recipe.remote_ids.items()) or "нет"
+    description = f"\n\n{html.escape(recipe.description)}" if recipe.description else ""
     return (
         f"<b>{html.escape(recipe.title)}</b>\n"
-        f"Порций: {recipe.portions}; подготовка: {recipe.prep_time} мин; готовка: {recipe.cook_time} мин\n"
-        f"Remote: {html.escape(remote)}\n\n"
-        f"{html.escape(recipe.description)}\n\n"
+        f"Порций: {_format_decimal_plain(recipe.portions)}; "
+        f"подготовка: {recipe.prep_time} мин; готовка: {recipe.cook_time} мин"
+        f"{description}\n\n"
         f"<b>Ингредиенты</b>\n{ingredients}"
     )
+
+
+def _format_decimal_plain(value: Decimal) -> str:
+    return format(value.normalize(), "f")
+
+
+def _format_ingredient_unit(amount: Decimal, portion_description: str) -> str:
+    unit = portion_description.strip()
+    normalized = unit.casefold()
+    if normalized in {"g", "gram", "grams", "гр", "г"}:
+        return "г"
+    if normalized in {"ml", "milliliter", "milliliters", "мл"}:
+        return "мл"
+    if normalized in {"serving", "servings"}:
+        return "порция" if amount == Decimal("1") else "порции"
+    return unit
+
+
+def _format_ingredient_amount(amount: Decimal, portion_description: str) -> str:
+    number = _format_decimal_plain(amount)
+    unit = _format_ingredient_unit(amount, portion_description)
+    if not unit:
+        return number
+    if unit in {"г", "мл"}:
+        return f"{number}{unit}"
+    return f"{number} {unit}"
 
 
 def _format_decimal(value: Decimal | None, digits: int = 1) -> str:
@@ -101,6 +135,38 @@ def _format_food_list(results: list[FoodSearchResult]) -> str:
     return "\n\n".join(lines)
 
 
+def _recipe_actions_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Добавить ингредиент", callback_data=f"add:{recipe_id}"),
+                InlineKeyboardButton("Изменить", callback_data=f"edit:{recipe_id}"),
+            ],
+            [
+                InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}"),
+                InlineKeyboardButton("К списку", callback_data="list:0"),
+            ],
+        ]
+    )
+
+
+def _recipe_edit_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Название", callback_data=f"editfield:title:{recipe_id}"),
+                InlineKeyboardButton("Порции", callback_data=f"editfield:portions:{recipe_id}"),
+            ],
+            [
+                InlineKeyboardButton("Подготовка", callback_data=f"editfield:prep:{recipe_id}"),
+                InlineKeyboardButton("Готовка", callback_data=f"editfield:cook:{recipe_id}"),
+            ],
+            [InlineKeyboardButton("Описание", callback_data=f"editfield:description:{recipe_id}")],
+            [InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")],
+        ]
+    )
+
+
 class TelegramRecipeBot:
     def __init__(
         self,
@@ -123,6 +189,7 @@ class TelegramRecipeBot:
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("accounts", self.accounts))
         app.add_handler(CommandHandler("recipes", self.recipes))
+        app.add_handler(CommandHandler("search", self.search_recipes))
         app.add_handler(CommandHandler("refresh", self.refresh))
         app.add_handler(CommandHandler("new", self.new_recipe))
         app.add_handler(CallbackQueryHandler(self.on_callback))
@@ -220,32 +287,54 @@ class TelegramRecipeBot:
                 reply_markup=MAIN_KEYBOARD,
             )
             return
+        await update.effective_message.reply_text(
+            "Общий список рецептов:",
+            reply_markup=self._recipe_list_keyboard(recipes, page, "list"),
+        )
+
+    def _recipe_list_keyboard(self, recipes: list[Recipe], page: int, page_action: str) -> InlineKeyboardMarkup:
         page = max(0, page)
         total_pages = max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE)
         page = min(page, total_pages - 1)
         start = page * RECIPES_PAGE_SIZE
         current = recipes[start : start + RECIPES_PAGE_SIZE]
-        buttons = [
-            [InlineKeyboardButton(recipe.title[:55], callback_data=f"open:{recipe.id}")]
-            for recipe in current
-        ]
+        buttons = [[InlineKeyboardButton(recipe.title[:55], callback_data=f"open:{recipe.id}")] for recipe in current]
         nav: list[InlineKeyboardButton] = []
         if page > 0:
-            nav.append(InlineKeyboardButton("Назад", callback_data=f"list:{page - 1}"))
-        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"list:{page}"))
+            nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"{page_action}:{page}"))
         if page + 1 < total_pages:
-            nav.append(InlineKeyboardButton("Дальше", callback_data=f"list:{page + 1}"))
-        buttons.append(nav)
+            nav.append(InlineKeyboardButton("Дальше", callback_data=f"{page_action}:{page + 1}"))
+        if nav:
+            buttons.append(nav)
         buttons.append(
             [
+                InlineKeyboardButton("Поиск", callback_data="search:0"),
                 InlineKeyboardButton("Обновить", callback_data="refresh:0"),
-                InlineKeyboardButton("Новый рецепт", callback_data="new:0"),
             ]
         )
-        await update.effective_message.reply_text(
-            "Общий список рецептов:",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        buttons.append([InlineKeyboardButton("Новый рецепт", callback_data="new:0")])
+        return InlineKeyboardMarkup(buttons)
+
+    def _filter_recipes(self, query: str) -> list[Recipe]:
+        terms = normalize_title(query).split()
+        if not terms:
+            return []
+        matches: list[Recipe] = []
+        for recipe in self.storage.list_recipes():
+            haystack = normalize_title(
+                " ".join([recipe.title, recipe.description, *(item.title for item in recipe.ingredients)])
+            )
+            if all(term in haystack for term in terms):
+                matches.append(recipe)
+        return matches
+
+    async def search_recipes(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_user(update):
+            return
+        context.user_data.clear()
+        context.user_data["mode"] = "recipe_search"
+        await update.effective_message.reply_text("Что искать в рецептах? Пришли часть названия или ингредиента.")
 
     async def new_recipe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
@@ -267,22 +356,34 @@ class TelegramRecipeBot:
         action, _, value = query.data.partition(":")
 
         if action == "open":
+            context.user_data.clear()
             await self._open_recipe(query, value)
         elif action == "accounts":
+            context.user_data.clear()
             await self._edit_accounts(query, update.effective_user.id)
         elif action == "account_add":
             await self._start_account_add(query, context, update.effective_user.id)
         elif action == "account_remove":
+            context.user_data.clear()
             removed = self.storage.delete_fatsecret_account_for_user(update.effective_user.id)
             await query.edit_message_text(
                 "FatSecret аккаунт удален." if removed else "У тебя нет подключенного FatSecret аккаунта.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
             )
         elif action == "list":
+            context.user_data.clear()
             await self._edit_recipe_list(query, int(value or "0"))
+        elif action == "search":
+            context.user_data.clear()
+            context.user_data["mode"] = "recipe_search"
+            await query.edit_message_text("Что искать в рецептах? Пришли часть названия или ингредиента.")
+        elif action == "searchpage":
+            await self._edit_search_results(query, context, int(value or "0"))
         elif action == "refresh":
+            context.user_data.clear()
             await self._refresh_from_callback(query)
         elif action == "new":
+            context.user_data.clear()
             context.user_data["mode"] = "new_recipe"
             await query.edit_message_text(
                 "Пришли рецепт одной строкой:\n"
@@ -290,6 +391,7 @@ class TelegramRecipeBot:
                 "Пример: Омлет | 2 | 5 | 10 | Завтрак"
             )
         elif action == "add":
+            context.user_data.clear()
             context.user_data["mode"] = "ingredient_search"
             context.user_data["recipe_id"] = value
             await query.edit_message_text(
@@ -297,12 +399,12 @@ class TelegramRecipeBot:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{value}")]]),
             )
         elif action == "edit":
-            context.user_data["mode"] = "edit_recipe"
-            context.user_data["recipe_id"] = value
-            await query.edit_message_text(
-                "Пришли новые данные:\nНазвание | порции | подготовка_мин | готовка_мин | описание"
-            )
+            context.user_data.clear()
+            await self._open_edit_menu(query, value)
+        elif action == "editfield":
+            await self._start_edit_field(query, context, value)
         elif action == "sync":
+            context.user_data.clear()
             await self._sync_recipe_message(query, value)
         elif action == "food":
             await self._select_food(query, context, value)
@@ -321,28 +423,31 @@ class TelegramRecipeBot:
         if not recipes:
             await query.edit_message_text("Рецептов пока нет.")
             return
-        total_pages = max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE)
-        page = min(max(0, page), total_pages - 1)
-        start = page * RECIPES_PAGE_SIZE
-        current = recipes[start : start + RECIPES_PAGE_SIZE]
-        buttons = [
-            [InlineKeyboardButton(recipe.title[:55], callback_data=f"open:{recipe.id}")]
-            for recipe in current
-        ]
-        nav: list[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("Назад", callback_data=f"list:{page - 1}"))
-        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"list:{page}"))
-        if page + 1 < total_pages:
-            nav.append(InlineKeyboardButton("Дальше", callback_data=f"list:{page + 1}"))
-        buttons.append(nav)
-        buttons.append(
-            [
-                InlineKeyboardButton("Обновить", callback_data="refresh:0"),
-                InlineKeyboardButton("Новый рецепт", callback_data="new:0"),
-            ]
+        await query.edit_message_text(
+            "Общий список рецептов:",
+            reply_markup=self._recipe_list_keyboard(recipes, page, "list"),
         )
-        await query.edit_message_text("Общий список рецептов:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def _edit_search_results(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+        search_query = context.user_data.get("recipe_search_query")
+        if not search_query:
+            await query.edit_message_text(
+                "Поиск устарел. Запусти поиск заново.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Поиск", callback_data="search:0")]]),
+            )
+            return
+        recipes = self._filter_recipes(search_query)
+        if not recipes:
+            await query.edit_message_text(
+                f"По запросу «{html.escape(search_query)}» ничего не найдено.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Новый поиск", callback_data="search:0")]]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await query.edit_message_text(
+            f"Найдено рецептов: {len(recipes)}",
+            reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage"),
+        )
 
     async def _refresh_from_callback(self, query) -> None:
         await query.edit_message_text("Обновляю рецепты из двух FatSecret аккаунтов...")
@@ -359,19 +464,47 @@ class TelegramRecipeBot:
         if recipe is None:
             await query.edit_message_text("Рецепт не найден.")
             return
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Добавить ингредиент", callback_data=f"add:{recipe.id}"),
-                    InlineKeyboardButton("Изменить", callback_data=f"edit:{recipe.id}"),
-                ],
-                [
-                    InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe.id}"),
-                    InlineKeyboardButton("К списку", callback_data="list:0"),
-                ],
-            ]
+        await query.edit_message_text(
+            _format_recipe(recipe),
+            reply_markup=_recipe_actions_keyboard(recipe.id),
+            parse_mode=ParseMode.HTML,
         )
-        await query.edit_message_text(_format_recipe(recipe), reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+    async def _open_edit_menu(self, query, recipe_id: str) -> None:
+        recipe = self.storage.get_recipe(recipe_id)
+        if recipe is None:
+            await query.edit_message_text("Рецепт не найден.")
+            return
+        await query.edit_message_text(
+            f"Что изменить в рецепте «{html.escape(recipe.title)}»?",
+            reply_markup=_recipe_edit_keyboard(recipe_id),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _start_edit_field(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
+        field, _, recipe_id = value.partition(":")
+        if field not in EDIT_FIELD_LABELS or not recipe_id:
+            await query.edit_message_text("Не понял, какое поле нужно изменить.")
+            return
+        recipe = self.storage.get_recipe(recipe_id)
+        if recipe is None:
+            await query.edit_message_text("Рецепт не найден.")
+            return
+        current = {
+            "title": recipe.title,
+            "portions": _format_decimal_plain(recipe.portions),
+            "prep": str(recipe.prep_time),
+            "cook": str(recipe.cook_time),
+            "description": recipe.description or "-",
+        }[field]
+        context.user_data.clear()
+        context.user_data["mode"] = f"edit_{field}"
+        context.user_data["recipe_id"] = recipe_id
+        await query.edit_message_text(
+            f"{EDIT_FIELD_LABELS[field]}\nСейчас: {html.escape(current)}\n\nПришли новое значение.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")]]),
+            parse_mode=ParseMode.HTML,
+        )
 
     async def _sync_recipe_message(self, query, recipe_id: str) -> None:
         await query.edit_message_text("Синхронизирую в оба FatSecret аккаунта...")
@@ -409,8 +542,14 @@ class TelegramRecipeBot:
             return
         mode = context.user_data.get("mode")
         text = update.effective_message.text.strip()
+        if mode is not None and text.casefold() in {"отмена", "назад"}:
+            await self._cancel_mode(update, context)
+            return
         if mode is None and text == "Рецепты":
             await self._send_recipe_list(update, context, page=0)
+            return
+        if mode is None and text == "Поиск":
+            await self.search_recipes(update, context)
             return
         if mode is None and text == "Обновить":
             await self.refresh(update, context)
@@ -429,6 +568,10 @@ class TelegramRecipeBot:
             await self._handle_ingredient_search(update, context, text)
         elif mode == "ingredient_amount":
             await self._handle_ingredient_amount(update, context, text)
+        elif mode == "recipe_search":
+            await self._handle_recipe_search(update, context, text)
+        elif isinstance(mode, str) and mode.startswith("edit_"):
+            await self._handle_edit_field(update, context, text)
         elif mode == "fatsecret_login":
             await self._handle_fatsecret_login(update, context, text)
         elif mode == "fatsecret_password":
@@ -438,6 +581,18 @@ class TelegramRecipeBot:
                 "Выбери действие кнопками ниже.",
                 reply_markup=MAIN_KEYBOARD,
             )
+
+    async def _cancel_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        recipe_id = context.user_data.get("recipe_id")
+        context.user_data.clear()
+        if recipe_id and (recipe := self.storage.get_recipe(recipe_id)):
+            await update.effective_message.reply_text(
+                _format_recipe(recipe),
+                reply_markup=_recipe_actions_keyboard(recipe.id),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await update.effective_message.reply_text("Ок, отменил.", reply_markup=MAIN_KEYBOARD)
 
     async def _delete_user_message(self, update: Update) -> None:
         try:
@@ -494,10 +649,92 @@ class TelegramRecipeBot:
             language=account.language,
         )
         context.user_data.clear()
+        await status.edit_text("FatSecret аккаунт подключен. Загружаю рецепты из этого аккаунта...")
+        try:
+            imported = await self.sync_engine.refresh_account_recipes(account)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("FatSecret cookbook import failed after account connect")
+            await status.edit_text(
+                f"Аккаунт подключен, но рецепты не загрузились: {exc}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+            )
+            return
         await status.edit_text(
-            "FatSecret аккаунт подключен.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+            f"FatSecret аккаунт подключен. Загружено/смёржено рецептов: {imported}.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Рецепты", callback_data="list:0")],
+                    [InlineKeyboardButton("Аккаунты", callback_data="accounts:0")],
+                ]
+            ),
         )
+
+    async def _handle_recipe_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        recipes = self._filter_recipes(text)
+        context.user_data["recipe_search_query"] = text
+        if not recipes:
+            await update.effective_message.reply_text(
+                f"По запросу «{html.escape(text)}» ничего не найдено.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Новый поиск", callback_data="search:0")]]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        context.user_data.pop("mode", None)
+        await update.effective_message.reply_text(
+            f"Найдено рецептов: {len(recipes)}",
+            reply_markup=self._recipe_list_keyboard(recipes, 0, "searchpage"),
+        )
+
+    async def _handle_edit_field(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        mode = str(context.user_data.get("mode", ""))
+        field = mode.removeprefix("edit_")
+        recipe_id = context.user_data.get("recipe_id")
+        recipe = self.storage.get_recipe(recipe_id) if recipe_id else None
+        if recipe is None or field not in EDIT_FIELD_LABELS:
+            context.user_data.clear()
+            await update.effective_message.reply_text("Контекст редактирования потерян.")
+            return
+
+        title = recipe.title
+        description = recipe.description
+        portions = recipe.portions
+        prep_time = recipe.prep_time
+        cook_time = recipe.cook_time
+        try:
+            if field == "title":
+                if not text:
+                    raise ValueError("Название не может быть пустым.")
+                title = text
+            elif field == "description":
+                description = "" if text == "-" else text
+            elif field == "portions":
+                portions = Decimal(text.replace(",", "."))
+            elif field == "prep":
+                prep_time = int(text)
+            elif field == "cook":
+                cook_time = int(text)
+        except (InvalidOperation, ValueError) as exc:
+            await update.effective_message.reply_text(f"Не понял значение: {exc}")
+            return
+
+        self.storage.update_recipe_meta(
+            recipe_id=recipe.id,
+            title=title,
+            description=description,
+            portions=portions,
+            prep_time=prep_time,
+            cook_time=cook_time,
+            updated_by=update.effective_user.id,
+        )
+        context.user_data.clear()
+        await update.effective_message.reply_text("Сохранил локально. Синхронизирую в оба аккаунта...")
+        await self._sync_after_text(update, recipe.id)
+        if updated := self.storage.get_recipe(recipe.id):
+            await update.effective_message.reply_text(
+                _format_recipe(updated),
+                reply_markup=_recipe_actions_keyboard(updated.id),
+                parse_mode=ParseMode.HTML,
+            )
 
     async def _handle_new_recipe(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         try:
