@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import secrets
 import sqlite3
+import string
 import uuid
 from decimal import Decimal
 from pathlib import Path
 
-from .models import FatSecretAccountConfig, Ingredient, Recipe, RecipeSummary
+from .models import FatSecretAccountConfig, Ingredient, Recipe, RecipeGroup, RecipeSummary
+
+
+INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
 
 
 def normalize_title(title: str) -> str:
@@ -15,6 +20,10 @@ def normalize_title(title: str) -> str:
 
 def _now() -> str:
     return dt.datetime.now(dt.UTC).isoformat()
+
+
+def _new_invite_code() -> str:
+    return "".join(secrets.choice(INVITE_ALPHABET) for _ in range(8))
 
 
 class Storage:
@@ -34,7 +43,23 @@ class Storage:
             CREATE TABLE IF NOT EXISTS telegram_users (
                 telegram_id INTEGER PRIMARY KEY,
                 display_name TEXT NOT NULL,
+                active_group_id TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS recipe_groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                invite_code TEXT NOT NULL UNIQUE,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL REFERENCES recipe_groups(id) ON DELETE CASCADE,
+                telegram_id INTEGER NOT NULL REFERENCES telegram_users(telegram_id) ON DELETE CASCADE,
+                joined_at TEXT NOT NULL,
+                PRIMARY KEY (group_id, telegram_id)
             );
 
             CREATE TABLE IF NOT EXISTS fatsecret_accounts (
@@ -58,12 +83,10 @@ class Storage:
                 prep_time INTEGER NOT NULL DEFAULT 0,
                 cook_time INTEGER NOT NULL DEFAULT 0,
                 version INTEGER NOT NULL DEFAULT 1,
+                group_id TEXT,
                 updated_by INTEGER,
                 updated_at TEXT NOT NULL
             );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_normalized_title
-                ON recipes(normalized_title);
 
             CREATE TABLE IF NOT EXISTS ingredients (
                 id TEXT PRIMARY KEY,
@@ -96,22 +119,126 @@ class Storage:
             );
             """
         )
+        self._ensure_column("telegram_users", "active_group_id", "TEXT")
+        self._ensure_column("recipes", "group_id", "TEXT")
+        self._conn.execute("DROP INDEX IF EXISTS idx_recipes_normalized_title")
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_group_title ON recipes(group_id, normalized_title)"
+        )
+        self._backfill_default_group()
         self._conn.commit()
 
-    def fatsecret_account_count(self) -> int:
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _backfill_default_group(self) -> None:
+        group_count = int(self._conn.execute("SELECT COUNT(*) AS c FROM recipe_groups").fetchone()["c"])
+        user_count = int(self._conn.execute("SELECT COUNT(*) AS c FROM telegram_users").fetchone()["c"])
+        recipe_count = int(self._conn.execute("SELECT COUNT(*) AS c FROM recipes").fetchone()["c"])
+        if group_count == 0 and (user_count or recipe_count):
+            group_id = str(uuid.uuid4())
+            self._conn.execute(
+                """
+                INSERT INTO recipe_groups(id, name, invite_code, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (group_id, "Основная группа", self._unique_invite_code(), 0, _now()),
+            )
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO group_members(group_id, telegram_id, joined_at)
+                SELECT ?, telegram_id, ? FROM telegram_users
+                """,
+                (group_id, _now()),
+            )
+            self._conn.execute(
+                "UPDATE telegram_users SET active_group_id = ? WHERE active_group_id IS NULL",
+                (group_id,),
+            )
+            self._conn.execute(
+                "UPDATE recipes SET group_id = ? WHERE group_id IS NULL",
+                (group_id,),
+            )
+            return
+
+        first_group = self._conn.execute(
+            "SELECT id FROM recipe_groups ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        if first_group is None:
+            return
+        self._conn.execute(
+            "UPDATE recipes SET group_id = ? WHERE group_id IS NULL",
+            (first_group["id"],),
+        )
+        self._conn.execute(
+            """
+            UPDATE telegram_users
+            SET active_group_id = COALESCE(
+                (
+                    SELECT gm.group_id
+                    FROM group_members gm
+                    WHERE gm.telegram_id = telegram_users.telegram_id
+                    ORDER BY gm.joined_at ASC
+                    LIMIT 1
+                ),
+                active_group_id
+            )
+            WHERE active_group_id IS NULL
+            """
+        )
+
+    def _unique_invite_code(self) -> str:
+        while True:
+            code = _new_invite_code()
+            row = self._conn.execute(
+                "SELECT 1 FROM recipe_groups WHERE invite_code = ?",
+                (code,),
+            ).fetchone()
+            if row is None:
+                return code
+
+    def fatsecret_account_count(self, group_id: str | None = None) -> int:
         """Return how many FatSecret accounts are connected to the bot."""
-        row = self._conn.execute("SELECT COUNT(*) AS c FROM fatsecret_accounts").fetchone()
+        if group_id is None:
+            row = self._conn.execute("SELECT COUNT(*) AS c FROM fatsecret_accounts").fetchone()
+        else:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM fatsecret_accounts fa
+                JOIN group_members gm ON gm.telegram_id = fa.telegram_id
+                WHERE gm.group_id = ?
+                """,
+                (group_id,),
+            ).fetchone()
         return int(row["c"])
 
-    def list_fatsecret_accounts(self) -> list[FatSecretAccountConfig]:
+    def list_fatsecret_accounts(self, group_id: str | None = None) -> list[FatSecretAccountConfig]:
         """Return connected FatSecret accounts for runtime API clients."""
-        rows = self._conn.execute(
-            """
-            SELECT account_key, label, username, password, market, language
-            FROM fatsecret_accounts
-            ORDER BY label ASC, account_key ASC
-            """
-        ).fetchall()
+        if group_id is None:
+            rows = self._conn.execute(
+                """
+                SELECT account_key, label, username, password, market, language
+                FROM fatsecret_accounts
+                ORDER BY label ASC, account_key ASC
+                """
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT fa.account_key, fa.label, fa.username, fa.password, fa.market, fa.language
+                FROM fatsecret_accounts fa
+                JOIN group_members gm ON gm.telegram_id = fa.telegram_id
+                WHERE gm.group_id = ?
+                ORDER BY fa.label ASC, fa.account_key ASC
+                """,
+                (group_id,),
+            ).fetchall()
         return [
             FatSecretAccountConfig(
                 key=row["account_key"],
@@ -144,6 +271,99 @@ class Storage:
             market=row["market"],
             language=row["language"],
         )
+
+    def active_group_for_user(self, telegram_id: int) -> RecipeGroup | None:
+        """Return the active recipe group for a Telegram user."""
+        row = self._conn.execute(
+            """
+            SELECT g.id, g.name, g.invite_code
+            FROM telegram_users u
+            JOIN recipe_groups g ON g.id = u.active_group_id
+            JOIN group_members gm ON gm.group_id = g.id AND gm.telegram_id = u.telegram_id
+            WHERE u.telegram_id = ?
+            """,
+            (telegram_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return RecipeGroup(id=row["id"], name=row["name"], invite_code=row["invite_code"])
+
+    def list_groups_for_user(self, telegram_id: int) -> list[RecipeGroup]:
+        """Return groups that a Telegram user belongs to."""
+        rows = self._conn.execute(
+            """
+            SELECT g.id, g.name, g.invite_code
+            FROM recipe_groups g
+            JOIN group_members gm ON gm.group_id = g.id
+            WHERE gm.telegram_id = ?
+            ORDER BY g.name ASC, g.created_at ASC
+            """,
+            (telegram_id,),
+        ).fetchall()
+        return [RecipeGroup(id=row["id"], name=row["name"], invite_code=row["invite_code"]) for row in rows]
+
+    def create_group(self, telegram_id: int, name: str) -> RecipeGroup:
+        """Create a recipe sync group and make it active for the creator."""
+        group = RecipeGroup(id=str(uuid.uuid4()), name=name.strip() or "Группа", invite_code=self._unique_invite_code())
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO recipe_groups(id, name, invite_code, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (group.id, group.name, group.invite_code, telegram_id, now),
+        )
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO group_members(group_id, telegram_id, joined_at)
+            VALUES (?, ?, ?)
+            """,
+            (group.id, telegram_id, now),
+        )
+        self._conn.execute(
+            "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
+            (group.id, telegram_id),
+        )
+        self._conn.commit()
+        return group
+
+    def join_group_by_code(self, telegram_id: int, invite_code: str) -> RecipeGroup | None:
+        """Join a group by invite code and make it active for the user."""
+        normalized = invite_code.strip().upper().replace(" ", "")
+        row = self._conn.execute(
+            "SELECT id, name, invite_code FROM recipe_groups WHERE invite_code = ?",
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            return None
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO group_members(group_id, telegram_id, joined_at)
+            VALUES (?, ?, ?)
+            """,
+            (row["id"], telegram_id, _now()),
+        )
+        self._conn.execute(
+            "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
+            (row["id"], telegram_id),
+        )
+        self._conn.commit()
+        return RecipeGroup(id=row["id"], name=row["name"], invite_code=row["invite_code"])
+
+    def set_active_group_for_user(self, telegram_id: int, group_id: str) -> bool:
+        """Switch the active group if the Telegram user is a group member."""
+        row = self._conn.execute(
+            "SELECT 1 FROM group_members WHERE telegram_id = ? AND group_id = ?",
+            (telegram_id, group_id),
+        ).fetchone()
+        if row is None:
+            return False
+        self._conn.execute(
+            "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
+            (group_id, telegram_id),
+        )
+        self._conn.commit()
+        return True
 
     def upsert_fatsecret_account(
         self,
@@ -215,7 +435,7 @@ class Storage:
         )
         self._conn.commit()
 
-    def import_remote_recipe(self, account_key: str, summary: RecipeSummary) -> str:
+    def import_remote_recipe(self, account_key: str, summary: RecipeSummary, group_id: str | None = None) -> str:
         normalized = normalize_title(summary.title)
         row = self._conn.execute(
             """
@@ -223,19 +443,23 @@ class Storage:
             FROM recipes r
             LEFT JOIN account_recipes ar
                 ON ar.recipe_id = r.id AND ar.account_key = ? AND ar.remote_recipe_id = ?
-            WHERE ar.recipe_id IS NOT NULL OR r.normalized_title = ?
+            WHERE ar.recipe_id IS NOT NULL
+                OR (
+                    r.normalized_title = ?
+                    AND (r.group_id = ? OR (r.group_id IS NULL AND ? IS NULL))
+                )
             LIMIT 1
             """,
-            (account_key, summary.remote_id, normalized),
+            (account_key, summary.remote_id, normalized, group_id, group_id),
         ).fetchone()
         recipe_id = row["id"] if row else str(uuid.uuid4())
         if row is None:
             self._conn.execute(
                 """
-                INSERT INTO recipes(id, title, normalized_title, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO recipes(id, title, normalized_title, group_id, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (recipe_id, summary.title, normalized, _now()),
+                (recipe_id, summary.title, normalized, group_id, _now()),
             )
         self.set_remote_recipe_id(recipe_id, account_key, summary.remote_id, last_synced_version=0)
         self._conn.commit()
@@ -249,15 +473,16 @@ class Storage:
         prep_time: int,
         cook_time: int,
         updated_by: int | None,
+        group_id: str | None = None,
     ) -> str:
         recipe_id = str(uuid.uuid4())
         self._conn.execute(
             """
             INSERT INTO recipes(
                 id, title, normalized_title, description, portions, prep_time,
-                cook_time, version, updated_by, updated_at
+                cook_time, version, group_id, updated_by, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             """,
             (
                 recipe_id,
@@ -267,6 +492,7 @@ class Storage:
                 str(portions),
                 prep_time,
                 cook_time,
+                group_id,
                 updated_by,
                 _now(),
             ),
@@ -348,15 +574,22 @@ class Storage:
             cook_time=int(row["cook_time"]),
             default_portion_id="0",
             version=int(row["version"]),
+            group_id=row["group_id"],
         )
         recipe.ingredients = self.list_ingredients(recipe.id)
         recipe.remote_ids = self.remote_ids(recipe.id)
         return recipe
 
-    def list_recipes(self) -> list[Recipe]:
-        rows = self._conn.execute(
-            "SELECT id FROM recipes ORDER BY normalized_title ASC"
-        ).fetchall()
+    def list_recipes(self, group_id: str | None = None) -> list[Recipe]:
+        if group_id is None:
+            rows = self._conn.execute(
+                "SELECT id FROM recipes ORDER BY normalized_title ASC"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id FROM recipes WHERE group_id = ? ORDER BY normalized_title ASC",
+                (group_id,),
+            ).fetchall()
         return [r for row in rows if (r := self.get_recipe(row["id"])) is not None]
 
     def list_ingredients(self, recipe_id: str) -> list[Ingredient]:

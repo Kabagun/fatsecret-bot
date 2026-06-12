@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from .fatsecret_client import FatSecretClient, FatSecretError
-from .models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
+from .models import FatSecretAccountConfig, FatSecretDeviceConfig, Ingredient, Recipe
 from .storage import Storage
 
 
@@ -113,8 +113,8 @@ class RecipeSyncEngine:
     async def close(self) -> None:
         return None
 
-    def _build_clients(self) -> dict[str, FatSecretClient]:
-        accounts = self.storage.list_fatsecret_accounts()
+    def _build_clients(self, group_id: str | None = None) -> dict[str, FatSecretClient]:
+        accounts = self.storage.list_fatsecret_accounts(group_id)
         if not accounts:
             raise FatSecretError("Сначала подключи хотя бы один FatSecret аккаунт через кнопку «Аккаунты».")
         return {account.key: FatSecretClient(account, self.device) for account in accounts}
@@ -131,27 +131,27 @@ class RecipeSyncEngine:
         finally:
             await client.close()
 
-    async def refresh_account_recipes(self, account: FatSecretAccountConfig) -> int:
+    async def refresh_account_recipes(self, account: FatSecretAccountConfig, group_id: str | None = None) -> int:
         """Import cookbook recipes for one connected FatSecret account."""
         client = FatSecretClient(account, self.device)
         imported = 0
         try:
             recipes = await client.cookbook()
             for summary in recipes:
-                self.storage.import_remote_recipe(account.key, summary)
+                self.storage.import_remote_recipe(account.key, summary, group_id)
                 imported += 1
         finally:
             await client.close()
         return imported
 
-    async def refresh_remote_recipes(self) -> int:
+    async def refresh_remote_recipes(self, group_id: str | None = None) -> int:
         imported = 0
-        clients = self._build_clients()
+        clients = self._build_clients(group_id)
         try:
             for account_key, client in clients.items():
                 recipes = await client.cookbook()
                 for summary in recipes:
-                    self.storage.import_remote_recipe(account_key, summary)
+                    self.storage.import_remote_recipe(account_key, summary, group_id)
                     imported += 1
         finally:
             await self._close_clients(clients)
@@ -164,7 +164,7 @@ class RecipeSyncEngine:
         if recipe.ingredients:
             return recipe
 
-        clients = self._build_clients()
+        clients = self._build_clients(recipe.group_id)
         try:
             for account_key, remote_id in recipe.remote_ids.items():
                 client = clients.get(account_key)
@@ -186,25 +186,6 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return recipe
 
-    async def search_food(self, query: str, limit: int = 8) -> list[FoodSearchResult]:
-        clients = self._build_clients()
-        try:
-            first_client = next(iter(clients.values()))
-            autocomplete = await first_client.autocomplete_food(query)
-            if autocomplete:
-                return autocomplete[:limit]
-            return (await first_client.search_recipes(query))[:limit]
-        finally:
-            await self._close_clients(clients)
-
-    async def resolve_food(self, result: FoodSearchResult) -> FoodSearchResult:
-        clients = self._build_clients()
-        try:
-            first_client = next(iter(clients.values()))
-            return await first_client.resolve_food_detail(result)
-        finally:
-            await self._close_clients(clients)
-
     async def sync_recipe(self, recipe_id: str) -> list[AccountSyncResult]:
         recipe = self.storage.get_recipe(recipe_id)
         if recipe is None:
@@ -224,7 +205,7 @@ class RecipeSyncEngine:
             raise FatSecretError("Выбранный аккаунт не содержит этот рецепт. Обнови список рецептов.")
 
         results: list[AccountSyncResult] = []
-        clients = self._build_clients()
+        clients = self._build_clients(recipe.group_id)
         try:
             source_client = clients.get(source_account_key)
             if source_client is None:
@@ -269,7 +250,10 @@ class RecipeSyncEngine:
 
     async def delete_recipe_everywhere(self, recipe_id: str) -> list[AccountSyncResult]:
         """Delete one recipe from every FatSecret account where it is mapped."""
-        clients = self._build_clients()
+        recipe = self.storage.get_recipe(recipe_id)
+        if recipe is None:
+            raise FatSecretError(f"Unknown local recipe id: {recipe_id}")
+        clients = self._build_clients(recipe.group_id if recipe else None)
         try:
             return await self._delete_recipe_with_clients(recipe_id, clients)
         finally:
@@ -277,7 +261,8 @@ class RecipeSyncEngine:
 
     async def delete_recipes_everywhere(self, recipe_ids: list[str]) -> dict[str, list[AccountSyncResult]]:
         """Delete several recipes from all mapped FatSecret accounts."""
-        clients = self._build_clients()
+        recipe = self.storage.get_recipe(recipe_ids[0]) if recipe_ids else None
+        clients = self._build_clients(recipe.group_id if recipe else None)
         results: dict[str, list[AccountSyncResult]] = {}
         try:
             for recipe_id in recipe_ids:

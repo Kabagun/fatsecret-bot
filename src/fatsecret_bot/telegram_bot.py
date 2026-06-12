@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -15,45 +15,21 @@ from telegram.ext import (
     filters,
 )
 
-from .models import FatSecretAccountConfig, FoodSearchResult, Recipe
+from .models import FatSecretAccountConfig, Recipe, RecipeGroup
 from .storage import Storage, normalize_title
 from .sync import RecipeSyncEngine
 
 logger = logging.getLogger(__name__)
 RECIPES_PAGE_SIZE = 8
-EDIT_FIELD_LABELS = {
-    "title": "Название",
-    "portions": "Порции",
-    "prep": "Подготовка, мин",
-    "cook": "Готовка, мин",
-    "description": "Описание",
-}
-
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Рецепты", "Поиск"],
         ["Обновить", "Аккаунты"],
+        ["Группы"],
     ],
     resize_keyboard=True,
 )
-
-
-def _parse_recipe_meta(text: str) -> tuple[str, Decimal, int, int, str]:
-    parts = [part.strip() for part in text.split("|", 4)]
-    if len(parts) < 4:
-        raise ValueError("Нужно: название | порции | подготовка_мин | готовка_мин | описание")
-    title = parts[0]
-    if not title:
-        raise ValueError("Название не может быть пустым")
-    try:
-        portions = Decimal(parts[1].replace(",", "."))
-        prep = int(parts[2])
-        cook = int(parts[3])
-    except (InvalidOperation, ValueError) as exc:
-        raise ValueError("Порции должны быть числом, время - целыми минутами") from exc
-    description = parts[4] if len(parts) > 4 else ""
-    return title, portions, prep, cook, description
 
 
 def _format_recipe(recipe: Recipe) -> str:
@@ -99,41 +75,6 @@ def _format_ingredient_amount(amount: Decimal, portion_description: str) -> str:
     return f"{number} {unit}"
 
 
-def _format_decimal(value: Decimal | None, digits: int = 1) -> str:
-    if value is None:
-        return "-"
-    quantum = Decimal("1") if digits == 0 else Decimal("0." + ("0" * (digits - 1)) + "1")
-    return str(value.quantize(quantum)).rstrip("0").rstrip(".")
-
-
-def _format_food_macros(result: FoodSearchResult) -> str:
-    kcal = _format_decimal(result.energy_per_portion, 0)
-    protein = _format_decimal(result.protein_per_portion)
-    fat = _format_decimal(result.fat_per_portion)
-    carbs = _format_decimal(result.carbohydrate_per_portion)
-    if kcal == protein == fat == carbs == "-":
-        return "КБЖУ нет в выдаче"
-    return f"{kcal} ккал; Б {protein}; Ж {fat}; У {carbs}"
-
-
-def _format_food_button(result: FoodSearchResult) -> str:
-    title = result.title.strip()
-    macros = _format_food_macros(result)
-    label = f"{title} | {macros}"
-    return label[:90]
-
-
-def _format_food_list(results: list[FoodSearchResult]) -> str:
-    lines = ["<b>Результаты поиска</b>"]
-    for index, result in enumerate(results, 1):
-        description = f"\n   {html.escape(result.description[:90])}" if result.description else ""
-        lines.append(
-            f"{index}. <b>{html.escape(result.title)}</b>\n"
-            f"   {html.escape(_format_food_macros(result))}{description}"
-        )
-    return "\n\n".join(lines)
-
-
 def _recipe_actions_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -142,23 +83,6 @@ def _recipe_actions_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}"),
             ],
             [InlineKeyboardButton("К списку", callback_data="list:0")],
-        ]
-    )
-
-
-def _recipe_edit_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Название", callback_data=f"editfield:title:{recipe_id}"),
-                InlineKeyboardButton("Порции", callback_data=f"editfield:portions:{recipe_id}"),
-            ],
-            [
-                InlineKeyboardButton("Подготовка", callback_data=f"editfield:prep:{recipe_id}"),
-                InlineKeyboardButton("Готовка", callback_data=f"editfield:cook:{recipe_id}"),
-            ],
-            [InlineKeyboardButton("Описание", callback_data=f"editfield:description:{recipe_id}")],
-            [InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")],
         ]
     )
 
@@ -187,6 +111,7 @@ class TelegramRecipeBot:
         app.add_handler(CommandHandler("recipes", self.recipes))
         app.add_handler(CommandHandler("search", self.search_recipes))
         app.add_handler(CommandHandler("refresh", self.refresh))
+        app.add_handler(CommandHandler("groups", self.groups))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         return app
@@ -209,19 +134,99 @@ class TelegramRecipeBot:
         self.storage.register_user(user.id, user.full_name or str(user.id))
         return True
 
+    async def _require_active_group(self, update: Update) -> RecipeGroup | None:
+        user = update.effective_user
+        message = update.effective_message
+        if user is None or message is None:
+            return None
+        group = self.storage.active_group_for_user(user.id)
+        if group is None:
+            await message.reply_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(user.id),
+                parse_mode=ParseMode.HTML,
+            )
+            return None
+        return group
+
+    async def _require_active_group_query(self, query, telegram_id: int) -> RecipeGroup | None:
+        group = self.storage.active_group_for_user(telegram_id)
+        if group is None:
+            await query.edit_message_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(telegram_id),
+                parse_mode=ParseMode.HTML,
+            )
+            return None
+        return group
+
+    async def _require_recipe_in_active_group(self, query, recipe: Recipe | None) -> bool:
+        if recipe is None:
+            await query.edit_message_text("Рецепт не найден.")
+            return False
+        user = query.from_user
+        group = self.storage.active_group_for_user(user.id) if user else None
+        if group is None or recipe.group_id != group.id:
+            await query.edit_message_text(
+                "Этот рецепт не из активной группы. Переключи группу и открой рецепт из списка заново.",
+                reply_markup=self._groups_keyboard(user.id) if user else None,
+            )
+            return False
+        return True
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
+            return
+        if self.storage.active_group_for_user(update.effective_user.id) is None:
+            await update.effective_message.reply_text(
+                "Готов. Для синхронизации рецептов нужна группа.",
+                reply_markup=self._groups_keyboard(update.effective_user.id),
+                parse_mode=ParseMode.HTML,
+            )
             return
         await update.effective_message.reply_text(
             "Готов. Создавай и редактируй рецепты в FatSecret, а здесь обновляй список и синхронизируй выбранный рецепт.",
             reply_markup=MAIN_KEYBOARD,
         )
 
-    def _accounts_text(self) -> str:
-        accounts = self.storage.list_fatsecret_accounts()
+    def _groups_text(self, telegram_id: int) -> str:
+        groups = self.storage.list_groups_for_user(telegram_id)
+        active = self.storage.active_group_for_user(telegram_id)
+        if not groups:
+            return "Группы пока нет. Создай новую группу или подключись по коду."
+        lines = ["<b>Группы</b>"]
+        for group in groups:
+            marker = "активна" if active and active.id == group.id else "доступна"
+            lines.append(f"- {html.escape(group.name)}: {marker}; код {html.escape(group.invite_code)}")
+        return "\n".join(lines)
+
+    def _groups_keyboard(self, telegram_id: int) -> InlineKeyboardMarkup:
+        buttons: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton("Создать группу", callback_data="group_create:0"),
+                InlineKeyboardButton("Подключиться", callback_data="group_join:0"),
+            ]
+        ]
+        for group in self.storage.list_groups_for_user(telegram_id):
+            buttons.append([InlineKeyboardButton(f"Открыть: {group.name[:40]}", callback_data=f"group_switch:{group.id}")])
+        buttons.append([InlineKeyboardButton("К рецептам", callback_data="list:0")])
+        return InlineKeyboardMarkup(buttons)
+
+    async def groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_user(update):
+            return
+        context.user_data.clear()
+        await update.effective_message.reply_text(
+            self._groups_text(update.effective_user.id),
+            reply_markup=self._groups_keyboard(update.effective_user.id),
+            parse_mode=ParseMode.HTML,
+        )
+
+    def _accounts_text(self, group: RecipeGroup) -> str:
+        accounts = self.storage.list_fatsecret_accounts(group.id)
         if not accounts:
-            return "FatSecret аккаунты еще не подключены. Нужно подключить два аккаунта."
-        lines = [f"<b>Подключено FatSecret аккаунтов: {len(accounts)}/2</b>"]
+            return f"<b>{html.escape(group.name)}</b>\nFatSecret аккаунты в этой группе еще не подключены."
+        lines = [f"<b>{html.escape(group.name)}</b>\nПодключено FatSecret аккаунтов: {len(accounts)}/2"]
         for account in accounts:
             lines.append(f"- {html.escape(account.label)}: {html.escape(account.username)}")
         if len(accounts) < 2:
@@ -238,15 +243,25 @@ class TelegramRecipeBot:
     async def accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
+        group = await self._require_active_group(update)
+        if group is None:
+            return
         await update.effective_message.reply_text(
-            self._accounts_text(),
+            self._accounts_text(group),
             reply_markup=self._accounts_keyboard(update.effective_user.id),
             parse_mode=ParseMode.HTML,
         )
 
     async def _edit_accounts(self, query, telegram_id: int) -> None:
+        group = self.storage.active_group_for_user(telegram_id)
+        if group is None:
+            await query.edit_message_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(telegram_id),
+            )
+            return
         await query.edit_message_text(
-            self._accounts_text(),
+            self._accounts_text(group),
             reply_markup=self._accounts_keyboard(telegram_id),
             parse_mode=ParseMode.HTML,
         )
@@ -254,9 +269,12 @@ class TelegramRecipeBot:
     async def refresh(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
-        msg = await update.effective_message.reply_text("Обновляю рецепты из двух FatSecret аккаунтов...")
+        group = await self._require_active_group(update)
+        if group is None:
+            return
+        msg = await update.effective_message.reply_text(f"Обновляю рецепты группы «{group.name}» из FatSecret...")
         try:
-            imported = await self.sync_engine.refresh_remote_recipes()
+            imported = await self.sync_engine.refresh_remote_recipes(group.id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("refresh failed")
             await msg.edit_text(f"Ошибка обновления: {exc}")
@@ -267,6 +285,8 @@ class TelegramRecipeBot:
     async def recipes(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
+        if await self._require_active_group(update) is None:
+            return
         await self._send_recipe_list(update, context, page=0)
 
     async def _send_recipe_list(
@@ -275,7 +295,14 @@ class TelegramRecipeBot:
         context: ContextTypes.DEFAULT_TYPE,
         page: int,
     ) -> None:
-        recipes = self.storage.list_recipes()
+        group = self.storage.active_group_for_user(update.effective_user.id)
+        if group is None:
+            await update.effective_message.reply_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(update.effective_user.id),
+            )
+            return
+        recipes = self.storage.list_recipes(group.id)
         if not recipes:
             await update.effective_message.reply_text(
                 "Рецептов пока нет. Нажми «Обновить», чтобы загрузить их из FatSecret.",
@@ -305,18 +332,17 @@ class TelegramRecipeBot:
         buttons.append(
             [
                 InlineKeyboardButton("Поиск", callback_data="search:0"),
-                InlineKeyboardButton("Обновить", callback_data="refresh:0"),
             ]
         )
         buttons.append([InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}")])
         return InlineKeyboardMarkup(buttons)
 
-    def _filter_recipes(self, query: str) -> list[Recipe]:
+    def _filter_recipes(self, query: str, group_id: str) -> list[Recipe]:
         terms = normalize_title(query).split()
         if not terms:
             return []
         matches: list[Recipe] = []
-        for recipe in self.storage.list_recipes():
+        for recipe in self.storage.list_recipes(group_id):
             haystack = normalize_title(
                 " ".join([recipe.title, recipe.description, *(item.title for item in recipe.ingredients)])
             )
@@ -327,19 +353,13 @@ class TelegramRecipeBot:
     async def search_recipes(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
+        group = await self._require_active_group(update)
+        if group is None:
+            return
         context.user_data.clear()
         context.user_data["mode"] = "recipe_search"
+        context.user_data["group_id"] = group.id
         await update.effective_message.reply_text("Что искать в рецептах? Пришли часть названия или ингредиента.")
-
-    async def new_recipe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._require_user(update):
-            return
-        context.user_data["mode"] = "new_recipe"
-        await update.effective_message.reply_text(
-            "Пришли рецепт одной строкой:\n"
-            "Название | порции | подготовка_мин | готовка_мин | описание\n\n"
-            "Пример: Омлет | 2 | 5 | 10 | Завтрак"
-        )
 
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
@@ -353,6 +373,28 @@ class TelegramRecipeBot:
         if action == "open":
             context.user_data.clear()
             await self._open_recipe(query, value)
+        elif action == "groups":
+            context.user_data.clear()
+            await query.edit_message_text(
+                self._groups_text(update.effective_user.id),
+                reply_markup=self._groups_keyboard(update.effective_user.id),
+                parse_mode=ParseMode.HTML,
+            )
+        elif action == "group_create":
+            context.user_data.clear()
+            context.user_data["mode"] = "group_create"
+            await query.edit_message_text("Пришли название новой группы.")
+        elif action == "group_join":
+            context.user_data.clear()
+            context.user_data["mode"] = "group_join"
+            await query.edit_message_text("Пришли код группы.")
+        elif action == "group_switch":
+            context.user_data.clear()
+            switched = self.storage.set_active_group_for_user(update.effective_user.id, value)
+            await query.edit_message_text(
+                "Группа выбрана." if switched else "Не нашел такую группу среди твоих групп.",
+                reply_markup=self._groups_keyboard(update.effective_user.id),
+            )
         elif action == "accounts":
             context.user_data.clear()
             await self._edit_accounts(query, update.effective_user.id)
@@ -370,7 +412,11 @@ class TelegramRecipeBot:
             await self._edit_recipe_list(query, int(value or "0"))
         elif action == "search":
             context.user_data.clear()
+            group = await self._require_active_group_query(query, update.effective_user.id)
+            if group is None:
+                return
             context.user_data["mode"] = "recipe_search"
+            context.user_data["group_id"] = group.id
             await query.edit_message_text("Что искать в рецептах? Пришли часть названия или ингредиента.")
         elif action == "searchpage":
             await self._edit_search_results(query, context, int(value or "0"))
@@ -408,16 +454,32 @@ class TelegramRecipeBot:
             )
 
     async def _start_account_add(self, query, context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> None:
+        group = self.storage.active_group_for_user(telegram_id)
+        if group is None:
+            await query.edit_message_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(telegram_id),
+            )
+            return
         existing = self.storage.get_fatsecret_account_by_telegram_id(telegram_id)
-        if existing is None and self.storage.fatsecret_account_count() >= 2:
+        if existing is None and self.storage.fatsecret_account_count(group.id) >= 2:
             await query.edit_message_text("Уже подключены два FatSecret аккаунта. Сначала удали один из них.")
             return
         context.user_data.clear()
         context.user_data["mode"] = "fatsecret_login"
+        context.user_data["group_id"] = group.id
         await query.edit_message_text("Пришли логин или email от FatSecret. Сообщение я постараюсь удалить после чтения.")
 
     async def _edit_recipe_list(self, query, page: int) -> None:
-        recipes = self.storage.list_recipes()
+        user = query.from_user
+        group = self.storage.active_group_for_user(user.id) if user else None
+        if group is None:
+            await query.edit_message_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(user.id) if user else None,
+            )
+            return
+        recipes = self.storage.list_recipes(group.id)
         if not recipes:
             await query.edit_message_text("Рецептов пока нет.")
             return
@@ -428,13 +490,17 @@ class TelegramRecipeBot:
 
     async def _edit_search_results(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
         search_query = context.user_data.get("recipe_search_query")
+        group_id = context.user_data.get("group_id")
         if not search_query:
             await query.edit_message_text(
                 "Поиск устарел. Запусти поиск заново.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Поиск", callback_data="search:0")]]),
             )
             return
-        recipes = self._filter_recipes(search_query)
+        if not group_id:
+            await query.edit_message_text("Группа поиска устарела. Запусти поиск заново.")
+            return
+        recipes = self._filter_recipes(search_query, group_id)
         if not recipes:
             await query.edit_message_text(
                 f"По запросу «{html.escape(search_query)}» ничего не найдено.",
@@ -448,9 +514,17 @@ class TelegramRecipeBot:
         )
 
     async def _refresh_from_callback(self, query) -> None:
-        await query.edit_message_text("Обновляю рецепты из двух FatSecret аккаунтов...")
+        user = query.from_user
+        group = self.storage.active_group_for_user(user.id) if user else None
+        if group is None:
+            await query.edit_message_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(user.id) if user else None,
+            )
+            return
+        await query.edit_message_text(f"Обновляю рецепты группы «{group.name}» из FatSecret...")
         try:
-            imported = await self.sync_engine.refresh_remote_recipes()
+            imported = await self.sync_engine.refresh_remote_recipes(group.id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("refresh failed")
             await query.edit_message_text(f"Ошибка обновления: {exc}")
@@ -458,6 +532,9 @@ class TelegramRecipeBot:
         await query.edit_message_text(f"Готово. Импортировано/смёржено записей: {imported}.")
 
     async def _open_recipe(self, query, recipe_id: str) -> None:
+        local_recipe = self.storage.get_recipe(recipe_id)
+        if not await self._require_recipe_in_active_group(query, local_recipe):
+            return
         recipe = await self.sync_engine.hydrate_recipe_from_remote(recipe_id)
         if recipe is None:
             await query.edit_message_text("Рецепт не найден.")
@@ -468,53 +545,16 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
-    async def _open_edit_menu(self, query, recipe_id: str) -> None:
-        recipe = self.storage.get_recipe(recipe_id)
-        if recipe is None:
-            await query.edit_message_text("Рецепт не найден.")
-            return
-        await query.edit_message_text(
-            f"Что изменить в рецепте «{html.escape(recipe.title)}»?",
-            reply_markup=_recipe_edit_keyboard(recipe_id),
-            parse_mode=ParseMode.HTML,
-        )
-
-    async def _start_edit_field(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
-        field, _, recipe_id = value.partition(":")
-        if field not in EDIT_FIELD_LABELS or not recipe_id:
-            await query.edit_message_text("Не понял, какое поле нужно изменить.")
-            return
-        recipe = self.storage.get_recipe(recipe_id)
-        if recipe is None:
-            await query.edit_message_text("Рецепт не найден.")
-            return
-        current = {
-            "title": recipe.title,
-            "portions": _format_decimal_plain(recipe.portions),
-            "prep": str(recipe.prep_time),
-            "cook": str(recipe.cook_time),
-            "description": recipe.description or "-",
-        }[field]
-        context.user_data.clear()
-        context.user_data["mode"] = f"edit_{field}"
-        context.user_data["recipe_id"] = recipe_id
-        await query.edit_message_text(
-            f"{EDIT_FIELD_LABELS[field]}\nСейчас: {html.escape(current)}\n\nПришли новое значение.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")]]),
-            parse_mode=ParseMode.HTML,
-        )
-
     async def _open_sync_menu(self, query, recipe_id: str) -> None:
         recipe = self.storage.get_recipe(recipe_id)
-        if recipe is None:
-            await query.edit_message_text("Рецепт не найден.")
+        if not await self._require_recipe_in_active_group(query, recipe):
             return
-        accounts = {account.key: account.label for account in self.storage.list_fatsecret_accounts()}
+        accounts = {account.key: account.label for account in self.storage.list_fatsecret_accounts(recipe.group_id)}
         source_keys = [key for key in recipe.remote_ids if key in accounts]
         if not source_keys:
             await query.edit_message_text(
-                "У рецепта нет привязки к подключенным FatSecret аккаунтам. Нажми «Обновить» и попробуй снова.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Обновить", callback_data="refresh:0")]]),
+                "У рецепта нет привязки к подключенным FatSecret аккаунтам. Обнови группу из основной клавиатуры и попробуй снова.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
             )
             return
         if len(source_keys) == 1:
@@ -531,7 +571,13 @@ class TelegramRecipeBot:
         )
 
     async def _sync_recipe_message(self, query, recipe_id: str, source_account_key: str) -> None:
-        account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts()}
+        recipe = self.storage.get_recipe(recipe_id)
+        if not await self._require_recipe_in_active_group(query, recipe):
+            return
+        account_labels = {
+            account.key: account.label
+            for account in self.storage.list_fatsecret_accounts(recipe.group_id)
+        }
         source_label = account_labels.get(source_account_key, source_account_key)
         await query.edit_message_text(f"Синхронизирую рецепт из FatSecret аккаунта «{source_label}»...")
         try:
@@ -557,8 +603,7 @@ class TelegramRecipeBot:
 
     async def _confirm_delete_recipe(self, query, recipe_id: str) -> None:
         recipe = self.storage.get_recipe(recipe_id)
-        if recipe is None:
-            await query.edit_message_text("Рецепт не найден.")
+        if not await self._require_recipe_in_active_group(query, recipe):
             return
         await query.edit_message_text(
             f"Удалить «{html.escape(recipe.title)}» из FatSecret на всех привязанных аккаунтах?\n\n"
@@ -573,6 +618,10 @@ class TelegramRecipeBot:
         )
 
     async def _delete_recipe(self, query, recipe_id: str) -> None:
+        recipe = self.storage.get_recipe(recipe_id)
+        if not await self._require_recipe_in_active_group(query, recipe):
+            return
+        account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts(recipe.group_id)}
         await query.edit_message_text("Удаляю рецепт в FatSecret...")
         try:
             results = await self.sync_engine.delete_recipe_everywhere(recipe_id)
@@ -580,7 +629,6 @@ class TelegramRecipeBot:
             logger.exception("delete failed")
             await query.edit_message_text(f"Ошибка удаления: {exc}")
             return
-        account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts()}
         lines = [
             f"{account_labels.get(result.account_key, result.account_key)}: "
             f"{'OK' if result.ok else 'ERROR'} {result.remote_recipe_id or ''} {result.message}"
@@ -591,7 +639,6 @@ class TelegramRecipeBot:
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("К списку", callback_data="list:0")],
-                    [InlineKeyboardButton("Обновить", callback_data="refresh:0")],
                 ]
             ),
         )
@@ -604,11 +651,20 @@ class TelegramRecipeBot:
         return selected
 
     async def _open_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
-        recipes = self.storage.list_recipes()
+        user = query.from_user
+        group = self.storage.active_group_for_user(user.id) if user else None
+        if group is None:
+            await query.edit_message_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(user.id) if user else None,
+            )
+            return
+        recipes = self.storage.list_recipes(group.id)
         if not recipes:
             await query.edit_message_text("Рецептов пока нет.")
             return
         context.user_data["mode"] = "batch_delete"
+        context.user_data["group_id"] = group.id
         selected = self._batch_delete_ids(context)
         selected.intersection_update({recipe.id for recipe in recipes})
         await query.edit_message_text(
@@ -655,7 +711,11 @@ class TelegramRecipeBot:
 
     async def _confirm_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
         selected = self._batch_delete_ids(context)
-        selected_recipes = [recipe for recipe in self.storage.list_recipes() if recipe.id in selected]
+        group_id = context.user_data.get("group_id")
+        if not group_id:
+            await query.edit_message_text("Группа выбора устарела. Начни batch-удаление заново.")
+            return
+        selected_recipes = [recipe for recipe in self.storage.list_recipes(group_id) if recipe.id in selected]
         if not selected_recipes:
             await query.edit_message_text(
                 "Ничего не выбрано.",
@@ -680,7 +740,11 @@ class TelegramRecipeBot:
 
     async def _execute_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
         selected_set = self._batch_delete_ids(context)
-        recipes = self.storage.list_recipes()
+        group_id = context.user_data.get("group_id")
+        if not group_id:
+            await query.edit_message_text("Группа выбора устарела. Начни batch-удаление заново.")
+            return
+        recipes = self.storage.list_recipes(group_id)
         selected = [recipe.id for recipe in recipes if recipe.id in selected_set]
         if not selected:
             await query.edit_message_text("Ничего не выбрано.")
@@ -694,7 +758,7 @@ class TelegramRecipeBot:
             await query.edit_message_text(f"Ошибка batch удаления: {exc}")
             return
         context.user_data.clear()
-        account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts()}
+        account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts(group_id)}
         ok_count = 0
         error_count = 0
         lines: list[str] = []
@@ -720,25 +784,8 @@ class TelegramRecipeBot:
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("К списку", callback_data="list:0")],
-                    [InlineKeyboardButton("Обновить", callback_data="refresh:0")],
                 ]
             ),
-        )
-
-    async def _select_food(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
-        choices: list[FoodSearchResult] = context.user_data.get("food_choices", [])
-        try:
-            choice = choices[int(value)]
-        except (ValueError, IndexError):
-            await query.edit_message_text("Выбор продукта устарел. Повтори поиск.")
-            return
-        context.user_data["selected_food"] = choice
-        context.user_data["mode"] = "ingredient_amount"
-        await query.edit_message_text(
-            f"<b>{html.escape(choice.title)}</b>\n"
-            f"{html.escape(_format_food_macros(choice))}\n\n"
-            "Количество для добавления. Например: 100",
-            parse_mode=ParseMode.HTML,
         )
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -761,8 +808,15 @@ class TelegramRecipeBot:
         if mode is None and text == "Аккаунты":
             await self.accounts(update, context)
             return
+        if mode is None and text == "Группы":
+            await self.groups(update, context)
+            return
         if mode == "recipe_search":
             await self._handle_recipe_search(update, context, text)
+        elif mode == "group_create":
+            await self._handle_group_create(update, context, text)
+        elif mode == "group_join":
+            await self._handle_group_join(update, context, text)
         elif mode == "fatsecret_login":
             await self._handle_fatsecret_login(update, context, text)
         elif mode == "fatsecret_password":
@@ -784,6 +838,33 @@ class TelegramRecipeBot:
             )
             return
         await update.effective_message.reply_text("Ок, отменил.", reply_markup=MAIN_KEYBOARD)
+
+    async def _handle_group_create(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        user = update.effective_user
+        if user is None:
+            return
+        group = self.storage.create_group(user.id, text)
+        context.user_data.clear()
+        await update.effective_message.reply_text(
+            f"Группа создана: {html.escape(group.name)}\nКод для второго пользователя: <code>{group.invite_code}</code>",
+            reply_markup=MAIN_KEYBOARD,
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _handle_group_join(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        user = update.effective_user
+        if user is None:
+            return
+        group = self.storage.join_group_by_code(user.id, text)
+        if group is None:
+            await update.effective_message.reply_text("Не нашел группу с таким кодом. Проверь код и пришли еще раз.")
+            return
+        context.user_data.clear()
+        await update.effective_message.reply_text(
+            f"Подключился к группе: {html.escape(group.name)}.",
+            reply_markup=MAIN_KEYBOARD,
+            parse_mode=ParseMode.HTML,
+        )
 
     async def _delete_user_message(self, update: Update) -> None:
         try:
@@ -809,7 +890,14 @@ class TelegramRecipeBot:
             await update.effective_chat.send_message("Контекст подключения потерян. Нажми «Аккаунты» и начни заново.")
             return
         existing = self.storage.get_fatsecret_account_by_telegram_id(user.id)
-        if existing is None and self.storage.fatsecret_account_count() >= 2:
+        group_id = context.user_data.get("group_id")
+        group = self.storage.active_group_for_user(user.id)
+        group_id = group_id or (group.id if group else None)
+        if group_id is None:
+            context.user_data.clear()
+            await update.effective_chat.send_message("Сначала создай группу или подключись к группе.")
+            return
+        if existing is None and self.storage.fatsecret_account_count(group_id) >= 2:
             context.user_data.clear()
             await update.effective_chat.send_message("Уже подключены два FatSecret аккаунта. Сначала удали один из них.")
             return
@@ -842,7 +930,7 @@ class TelegramRecipeBot:
         context.user_data.clear()
         await status.edit_text("FatSecret аккаунт подключен. Загружаю рецепты из этого аккаунта...")
         try:
-            imported = await self.sync_engine.refresh_account_recipes(account)
+            imported = await self.sync_engine.refresh_account_recipes(account, group_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("FatSecret cookbook import failed after account connect")
             await status.edit_text(
@@ -861,8 +949,15 @@ class TelegramRecipeBot:
         )
 
     async def _handle_recipe_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-        recipes = self._filter_recipes(text)
+        group_id = context.user_data.get("group_id")
+        if not group_id:
+            group = await self._require_active_group(update)
+            if group is None:
+                return
+            group_id = group.id
+        recipes = self._filter_recipes(text, group_id)
         context.user_data["recipe_search_query"] = text
+        context.user_data["group_id"] = group_id
         if not recipes:
             await update.effective_message.reply_text(
                 f"По запросу «{html.escape(text)}» ничего не найдено.",
@@ -875,156 +970,3 @@ class TelegramRecipeBot:
             f"Найдено рецептов: {len(recipes)}",
             reply_markup=self._recipe_list_keyboard(recipes, 0, "searchpage"),
         )
-
-    async def _handle_edit_field(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-        mode = str(context.user_data.get("mode", ""))
-        field = mode.removeprefix("edit_")
-        recipe_id = context.user_data.get("recipe_id")
-        recipe = self.storage.get_recipe(recipe_id) if recipe_id else None
-        if recipe is None or field not in EDIT_FIELD_LABELS:
-            context.user_data.clear()
-            await update.effective_message.reply_text("Контекст редактирования потерян.")
-            return
-
-        title = recipe.title
-        description = recipe.description
-        portions = recipe.portions
-        prep_time = recipe.prep_time
-        cook_time = recipe.cook_time
-        try:
-            if field == "title":
-                if not text:
-                    raise ValueError("Название не может быть пустым.")
-                title = text
-            elif field == "description":
-                description = "" if text == "-" else text
-            elif field == "portions":
-                portions = Decimal(text.replace(",", "."))
-            elif field == "prep":
-                prep_time = int(text)
-            elif field == "cook":
-                cook_time = int(text)
-        except (InvalidOperation, ValueError) as exc:
-            await update.effective_message.reply_text(f"Не понял значение: {exc}")
-            return
-
-        self.storage.update_recipe_meta(
-            recipe_id=recipe.id,
-            title=title,
-            description=description,
-            portions=portions,
-            prep_time=prep_time,
-            cook_time=cook_time,
-            updated_by=update.effective_user.id,
-        )
-        context.user_data.clear()
-        await update.effective_message.reply_text("Сохранил локально. Синхронизирую в оба аккаунта...")
-        await self._sync_after_text(update, recipe.id)
-        if updated := self.storage.get_recipe(recipe.id):
-            await update.effective_message.reply_text(
-                _format_recipe(updated),
-                reply_markup=_recipe_actions_keyboard(updated.id),
-                parse_mode=ParseMode.HTML,
-            )
-
-    async def _handle_new_recipe(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-        try:
-            title, portions, prep, cook, description = _parse_recipe_meta(text)
-        except ValueError as exc:
-            await update.effective_message.reply_text(str(exc))
-            return
-        recipe_id = self.storage.create_recipe(
-            title=title,
-            description=description,
-            portions=portions,
-            prep_time=prep,
-            cook_time=cook,
-            updated_by=update.effective_user.id,
-        )
-        context.user_data.clear()
-        await update.effective_message.reply_text("Создал локально. Синхронизирую в оба аккаунта...")
-        await self._sync_after_text(update, recipe_id)
-
-    async def _handle_edit_recipe(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-        recipe_id = context.user_data.get("recipe_id")
-        if not recipe_id:
-            context.user_data.clear()
-            await update.effective_message.reply_text("Контекст редактирования потерян.")
-            return
-        try:
-            title, portions, prep, cook, description = _parse_recipe_meta(text)
-        except ValueError as exc:
-            await update.effective_message.reply_text(str(exc))
-            return
-        self.storage.update_recipe_meta(
-            recipe_id=recipe_id,
-            title=title,
-            description=description,
-            portions=portions,
-            prep_time=prep,
-            cook_time=cook,
-            updated_by=update.effective_user.id,
-        )
-        context.user_data.clear()
-        await update.effective_message.reply_text("Сохранил локально. Синхронизирую в оба аккаунта...")
-        await self._sync_after_text(update, recipe_id)
-
-    async def _handle_ingredient_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-        try:
-            results = await self.sync_engine.search_food(text)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("food search failed")
-            await update.effective_message.reply_text(f"Ошибка поиска: {exc}")
-            return
-        if not results:
-            await update.effective_message.reply_text("Ничего не найдено.")
-            return
-        context.user_data["food_choices"] = results
-        buttons = [
-            [InlineKeyboardButton(_format_food_button(result), callback_data=f"food:{index}")]
-            for index, result in enumerate(results)
-        ]
-        buttons.append([InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{context.user_data['recipe_id']}")])
-        await update.effective_message.reply_text(
-            _format_food_list(results),
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.HTML,
-        )
-
-    async def _handle_ingredient_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-        recipe_id = context.user_data.get("recipe_id")
-        selected: FoodSearchResult | None = context.user_data.get("selected_food")
-        if not recipe_id or selected is None:
-            context.user_data.clear()
-            await update.effective_message.reply_text("Контекст добавления ингредиента потерян.")
-            return
-        try:
-            amount = Decimal(text.replace(",", "."))
-        except InvalidOperation:
-            await update.effective_message.reply_text("Количество должно быть числом.")
-            return
-        try:
-            detail = await self.sync_engine.resolve_food(selected)
-        except Exception:
-            logger.exception("food resolve failed")
-            detail = selected
-        self.storage.add_ingredient(
-            recipe_id=recipe_id,
-            food_id=detail.food_id,
-            title=detail.title,
-            portion_id=detail.default_portion_id or "0",
-            amount=amount,
-        )
-        context.user_data.clear()
-        await update.effective_message.reply_text("Ингредиент добавлен локально. Синхронизирую...")
-        await self._sync_after_text(update, recipe_id)
-
-    async def _sync_after_text(self, update: Update, recipe_id: str) -> None:
-        try:
-            results = await self.sync_engine.sync_recipe(recipe_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("sync failed")
-            await update.effective_message.reply_text(f"Ошибка синхронизации: {exc}")
-            return
-        lines = [f"{r.account_key}: {'OK' if r.ok else 'ERROR'} {r.message}" for r in results]
-        await update.effective_message.reply_text("\n".join(lines))

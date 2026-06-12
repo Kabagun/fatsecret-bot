@@ -23,6 +23,47 @@ def test_import_remote_recipe_merges_by_title(tmp_path) -> None:
         storage.close()
 
 
+def test_import_remote_recipe_is_group_scoped(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        storage.register_user(22, "Two")
+        first_group = storage.create_group(11, "Дом")
+        second_group = storage.create_group(22, "Работа")
+
+        first = storage.import_remote_recipe("a1", RecipeSummary(remote_id="101", title="Омлет"), first_group.id)
+        second = storage.import_remote_recipe("a2", RecipeSummary(remote_id="202", title="омлет"), second_group.id)
+
+        assert first != second
+        assert [recipe.id for recipe in storage.list_recipes(first_group.id)] == [first]
+        assert [recipe.id for recipe in storage.list_recipes(second_group.id)] == [second]
+    finally:
+        storage.close()
+
+
+def test_group_join_switch_and_group_scoped_accounts(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        storage.register_user(22, "Two")
+        group = storage.create_group(11, "Семья")
+        joined = storage.join_group_by_code(22, group.invite_code)
+        assert joined == group
+        assert storage.active_group_for_user(22) == group
+
+        storage.upsert_fatsecret_account(11, "One", "one@example.com", "secret", "BY", "ru")
+        storage.upsert_fatsecret_account(22, "Two", "two@example.com", "secret", "BY", "ru")
+
+        assert storage.fatsecret_account_count(group.id) == 2
+        assert {account.key for account in storage.list_fatsecret_accounts(group.id)} == {"tg11", "tg22"}
+
+        other_group = storage.create_group(11, "Solo")
+        assert storage.set_active_group_for_user(22, other_group.id) is False
+        assert {account.key for account in storage.list_fatsecret_accounts(other_group.id)} == {"tg11"}
+    finally:
+        storage.close()
+
+
 def test_add_ingredient_bumps_version(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

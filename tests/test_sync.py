@@ -120,7 +120,7 @@ def test_delete_recipe_everywhere_deletes_all_mappings_and_local_recipe(tmp_path
         engine = RecipeSyncEngine(storage, _device())
         first = FakeFatSecretClient(Recipe(id="111", title="Омлет"), account_key="tg11")
         second = FakeFatSecretClient(Recipe(id="222", title="Омлет"), account_key="tg22")
-        engine._build_clients = lambda: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+        engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
 
         results = asyncio.run(engine.delete_recipe_everywhere(recipe_id))
 
@@ -142,7 +142,7 @@ def test_delete_recipe_everywhere_keeps_failed_remote_mapping(tmp_path) -> None:
         engine = RecipeSyncEngine(storage, _device())
         first = FakeFatSecretClient(Recipe(id="111", title="Омлет"), account_key="tg11")
         second = FakeFatSecretClient(Recipe(id="222", title="Омлет"), account_key="tg22", delete_ok=False)
-        engine._build_clients = lambda: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+        engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
 
         results = asyncio.run(engine.delete_recipe_everywhere(recipe_id))
 

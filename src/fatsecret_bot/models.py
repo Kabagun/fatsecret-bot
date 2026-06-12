@@ -68,8 +68,16 @@ class Recipe:
     cook_time: int = 0
     default_portion_id: str = "0"
     version: int = 1
+    group_id: str | None = None
     ingredients: list[Ingredient] = field(default_factory=list)
     remote_ids: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RecipeGroup:
+    id: str
+    name: str
+    invite_code: str
 
 
 @dataclass
