@@ -80,6 +80,14 @@ class RecipeGroup:
     invite_code: str
 
 
+@dataclass(frozen=True)
+class RecipeGroupMember:
+    telegram_id: int
+    display_name: str
+    fatsecret_label: str | None = None
+    fatsecret_username: str | None = None
+
+
 @dataclass
 class FoodSearchResult:
     food_id: str

@@ -64,6 +64,46 @@ def test_group_join_switch_and_group_scoped_accounts(tmp_path) -> None:
         storage.close()
 
 
+def test_group_members_and_leave_active_group(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        storage.register_user(22, "Two")
+        group = storage.create_group(11, "Семья")
+        storage.join_group_by_code(22, group.invite_code)
+        storage.upsert_fatsecret_account(11, "One FS", "one@example.com", "secret", "BY", "ru")
+
+        members = storage.group_members(group.id)
+        assert [(member.telegram_id, member.display_name, member.fatsecret_label) for member in members] == [
+            (11, "One", "One FS"),
+            (22, "Two", None),
+        ]
+
+        assert storage.leave_active_group(22) == group
+        assert storage.active_group_for_user(22) is None
+        assert [member.telegram_id for member in storage.group_members(group.id)] == [11]
+    finally:
+        storage.close()
+
+
+def test_delete_selected_fatsecret_account_removes_remote_mapping(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        account_key = storage.upsert_fatsecret_account(11, "One FS", "one@example.com", "secret", "BY", "ru")
+        recipe_id = storage.import_remote_recipe(account_key, RecipeSummary(remote_id="101", title="Омлет"), group.id)
+
+        assert storage.delete_fatsecret_account(account_key) is True
+        assert storage.get_fatsecret_account(account_key) is None
+        recipe = storage.get_recipe(recipe_id)
+        assert recipe is not None
+        assert recipe.remote_ids == {}
+        assert storage.delete_fatsecret_account(account_key) is False
+    finally:
+        storage.close()
+
+
 def test_add_ingredient_bumps_version(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

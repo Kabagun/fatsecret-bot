@@ -8,7 +8,7 @@ import uuid
 from decimal import Decimal
 from pathlib import Path
 
-from .models import FatSecretAccountConfig, Ingredient, Recipe, RecipeGroup, RecipeSummary
+from .models import FatSecretAccountConfig, Ingredient, Recipe, RecipeGroup, RecipeGroupMember, RecipeSummary
 
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
@@ -272,6 +272,27 @@ class Storage:
             language=row["language"],
         )
 
+    def get_fatsecret_account(self, account_key: str) -> FatSecretAccountConfig | None:
+        """Return one connected FatSecret account by storage key."""
+        row = self._conn.execute(
+            """
+            SELECT account_key, label, username, password, market, language
+            FROM fatsecret_accounts
+            WHERE account_key = ?
+            """,
+            (account_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return FatSecretAccountConfig(
+            key=row["account_key"],
+            label=row["label"],
+            username=row["username"],
+            password=row["password"],
+            market=row["market"],
+            language=row["language"],
+        )
+
     def active_group_for_user(self, telegram_id: int) -> RecipeGroup | None:
         """Return the active recipe group for a Telegram user."""
         row = self._conn.execute(
@@ -301,6 +322,33 @@ class Storage:
             (telegram_id,),
         ).fetchall()
         return [RecipeGroup(id=row["id"], name=row["name"], invite_code=row["invite_code"]) for row in rows]
+
+    def group_members(self, group_id: str) -> list[RecipeGroupMember]:
+        """Return Telegram users joined to a recipe group with their FatSecret account, if connected."""
+        rows = self._conn.execute(
+            """
+            SELECT
+                u.telegram_id,
+                u.display_name,
+                fa.label AS fatsecret_label,
+                fa.username AS fatsecret_username
+            FROM group_members gm
+            JOIN telegram_users u ON u.telegram_id = gm.telegram_id
+            LEFT JOIN fatsecret_accounts fa ON fa.telegram_id = u.telegram_id
+            WHERE gm.group_id = ?
+            ORDER BY u.display_name ASC, u.telegram_id ASC
+            """,
+            (group_id,),
+        ).fetchall()
+        return [
+            RecipeGroupMember(
+                telegram_id=int(row["telegram_id"]),
+                display_name=row["display_name"],
+                fatsecret_label=row["fatsecret_label"],
+                fatsecret_username=row["fatsecret_username"],
+            )
+            for row in rows
+        ]
 
     def create_group(self, telegram_id: int, name: str) -> RecipeGroup:
         """Create a recipe sync group and make it active for the creator."""
@@ -365,6 +413,32 @@ class Storage:
         self._conn.commit()
         return True
 
+    def leave_active_group(self, telegram_id: int) -> RecipeGroup | None:
+        """Remove a Telegram user from their active group and switch to another joined group if one exists."""
+        group = self.active_group_for_user(telegram_id)
+        if group is None:
+            return None
+        self._conn.execute(
+            "DELETE FROM group_members WHERE telegram_id = ? AND group_id = ?",
+            (telegram_id, group.id),
+        )
+        next_group = self._conn.execute(
+            """
+            SELECT group_id
+            FROM group_members
+            WHERE telegram_id = ?
+            ORDER BY joined_at ASC
+            LIMIT 1
+            """,
+            (telegram_id,),
+        ).fetchone()
+        self._conn.execute(
+            "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
+            (next_group["group_id"] if next_group else None, telegram_id),
+        )
+        self._conn.commit()
+        return group
+
     def upsert_fatsecret_account(
         self,
         telegram_id: int,
@@ -411,6 +485,19 @@ class Storage:
             return False
         self._conn.execute("DELETE FROM account_recipes WHERE account_key = ?", (row["account_key"],))
         self._conn.execute("DELETE FROM fatsecret_accounts WHERE telegram_id = ?", (telegram_id,))
+        self._conn.commit()
+        return True
+
+    def delete_fatsecret_account(self, account_key: str) -> bool:
+        """Delete a selected FatSecret account and stale remote recipe mappings."""
+        row = self._conn.execute(
+            "SELECT 1 FROM fatsecret_accounts WHERE account_key = ?",
+            (account_key,),
+        ).fetchone()
+        if row is None:
+            return False
+        self._conn.execute("DELETE FROM account_recipes WHERE account_key = ?", (account_key,))
+        self._conn.execute("DELETE FROM fatsecret_accounts WHERE account_key = ?", (account_key,))
         self._conn.commit()
         return True
 

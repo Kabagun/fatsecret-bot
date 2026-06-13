@@ -87,6 +87,20 @@ def _recipe_actions_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def _recipe_owner_text(recipe: Recipe, account_labels: dict[str, str]) -> str:
+    owners = [account_labels.get(key, key) for key in recipe.remote_ids if key in account_labels]
+    if not owners and recipe.remote_ids:
+        owners = list(recipe.remote_ids)
+    if not owners:
+        return "без аккаунта"
+    return ", ".join(owners)
+
+
+def _recipe_list_button_text(recipe: Recipe, account_labels: dict[str, str], prefix: str = "") -> str:
+    text = f"{prefix}{recipe.title} - {_recipe_owner_text(recipe, account_labels)}"
+    return text[:90]
+
+
 class TelegramRecipeBot:
     def __init__(
         self,
@@ -190,26 +204,37 @@ class TelegramRecipeBot:
         )
 
     def _groups_text(self, telegram_id: int) -> str:
-        groups = self.storage.list_groups_for_user(telegram_id)
         active = self.storage.active_group_for_user(telegram_id)
-        if not groups:
-            return "Группы пока нет. Создай новую группу или подключись по коду."
-        lines = ["<b>Группы</b>"]
-        for group in groups:
-            marker = "активна" if active and active.id == group.id else "доступна"
-            lines.append(f"- {html.escape(group.name)}: {marker}; код {html.escape(group.invite_code)}")
+        if active is None:
+            return "Ты пока не в группе. Создай группу или подключись по коду."
+        lines = [
+            "<b>Моя группа</b>",
+            f"Название: {html.escape(active.name)}",
+            f"Код для подключения: <code>{html.escape(active.invite_code)}</code>",
+            "",
+            "<b>Участники</b>",
+        ]
+        for member in self.storage.group_members(active.id):
+            account = (
+                f" - {html.escape(member.fatsecret_label)}"
+                if member.fatsecret_label
+                else " - FatSecret не подключен"
+            )
+            lines.append(f"- {html.escape(member.display_name)}{account}")
         return "\n".join(lines)
 
     def _groups_keyboard(self, telegram_id: int) -> InlineKeyboardMarkup:
+        active = self.storage.active_group_for_user(telegram_id)
+        if active is not None:
+            return InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отключиться от группы", callback_data="group_leave:0")]]
+            )
         buttons: list[list[InlineKeyboardButton]] = [
             [
                 InlineKeyboardButton("Создать группу", callback_data="group_create:0"),
                 InlineKeyboardButton("Подключиться", callback_data="group_join:0"),
             ]
         ]
-        for group in self.storage.list_groups_for_user(telegram_id):
-            buttons.append([InlineKeyboardButton(f"Открыть: {group.name[:40]}", callback_data=f"group_switch:{group.id}")])
-        buttons.append([InlineKeyboardButton("К рецептам", callback_data="list:0")])
         return InlineKeyboardMarkup(buttons)
 
     async def groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -233,11 +258,16 @@ class TelegramRecipeBot:
             lines.append("\nПодключи второй аккаунт, чтобы синхронизация шла в обе стороны.")
         return "\n".join(lines)
 
-    def _accounts_keyboard(self, telegram_id: int) -> InlineKeyboardMarkup:
-        buttons = [[InlineKeyboardButton("Подключить мой FatSecret", callback_data="account_add:0")]]
-        if self.storage.get_fatsecret_account_by_telegram_id(telegram_id):
-            buttons.append([InlineKeyboardButton("Удалить мой FatSecret", callback_data="account_remove:0")])
-        buttons.append([InlineKeyboardButton("К списку рецептов", callback_data="list:0")])
+    def _accounts_keyboard(self, telegram_id: int, group: RecipeGroup) -> InlineKeyboardMarkup:
+        accounts = self.storage.list_fatsecret_accounts(group.id)
+        existing = self.storage.get_fatsecret_account_by_telegram_id(telegram_id)
+        buttons: list[list[InlineKeyboardButton]] = []
+        if existing is not None:
+            buttons.append([InlineKeyboardButton("Заменить мой FatSecret", callback_data="account_add:0")])
+        elif len(accounts) < 2:
+            buttons.append([InlineKeyboardButton("Подключить мой FatSecret", callback_data="account_add:0")])
+        for account in accounts:
+            buttons.append([InlineKeyboardButton(f"Удалить: {account.label[:40]}", callback_data=f"account_remove:{account.key}")])
         return InlineKeyboardMarkup(buttons)
 
     async def accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -249,7 +279,7 @@ class TelegramRecipeBot:
             return
         await update.effective_message.reply_text(
             self._accounts_text(group),
-            reply_markup=self._accounts_keyboard(update.effective_user.id),
+            reply_markup=self._accounts_keyboard(update.effective_user.id, group),
             parse_mode=ParseMode.HTML,
         )
 
@@ -263,7 +293,7 @@ class TelegramRecipeBot:
             return
         await query.edit_message_text(
             self._accounts_text(group),
-            reply_markup=self._accounts_keyboard(telegram_id),
+            reply_markup=self._accounts_keyboard(telegram_id, group),
             parse_mode=ParseMode.HTML,
         )
 
@@ -314,16 +344,29 @@ class TelegramRecipeBot:
             return
         await update.effective_message.reply_text(
             "Общий список рецептов:",
-            reply_markup=self._recipe_list_keyboard(recipes, page, "list"),
+            reply_markup=self._recipe_list_keyboard(recipes, page, "list", self._account_labels_for_group(group.id)),
         )
 
-    def _recipe_list_keyboard(self, recipes: list[Recipe], page: int, page_action: str) -> InlineKeyboardMarkup:
+    def _account_labels_for_group(self, group_id: str | None) -> dict[str, str]:
+        return {account.key: account.label for account in self.storage.list_fatsecret_accounts(group_id)}
+
+    def _recipe_list_keyboard(
+        self,
+        recipes: list[Recipe],
+        page: int,
+        page_action: str,
+        account_labels: dict[str, str] | None = None,
+    ) -> InlineKeyboardMarkup:
+        account_labels = account_labels or {}
         page = max(0, page)
         total_pages = max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE)
         page = min(page, total_pages - 1)
         start = page * RECIPES_PAGE_SIZE
         current = recipes[start : start + RECIPES_PAGE_SIZE]
-        buttons = [[InlineKeyboardButton(recipe.title[:55], callback_data=f"open:{recipe.id}")] for recipe in current]
+        buttons = [
+            [InlineKeyboardButton(_recipe_list_button_text(recipe, account_labels), callback_data=f"open:{recipe.id}")]
+            for recipe in current
+        ]
         nav: list[InlineKeyboardButton] = []
         if page > 0:
             nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
@@ -397,12 +440,13 @@ class TelegramRecipeBot:
                 "Пришли код группы.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
             )
-        elif action == "group_switch":
+        elif action == "group_leave":
             context.user_data.clear()
-            switched = self.storage.set_active_group_for_user(update.effective_user.id, value)
+            left = self.storage.leave_active_group(update.effective_user.id)
             await query.edit_message_text(
-                "Группа выбрана." if switched else "Не нашел такую группу среди твоих групп.",
+                "Отключился от группы." if left else "Ты сейчас не в группе.",
                 reply_markup=self._groups_keyboard(update.effective_user.id),
+                parse_mode=ParseMode.HTML,
             )
         elif action == "accounts":
             context.user_data.clear()
@@ -411,9 +455,44 @@ class TelegramRecipeBot:
             await self._start_account_add(query, context, update.effective_user.id)
         elif action == "account_remove":
             context.user_data.clear()
-            removed = self.storage.delete_fatsecret_account_for_user(update.effective_user.id)
+            group = self.storage.active_group_for_user(update.effective_user.id)
+            group_account_keys = {account.key for account in self.storage.list_fatsecret_accounts(group.id)} if group else set()
+            if value not in group_account_keys:
+                await query.edit_message_text(
+                    "Этот FatSecret аккаунт не из твоей активной группы.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+                )
+                return
+            account = self.storage.get_fatsecret_account(value)
+            if account is None:
+                await query.edit_message_text(
+                    "FatSecret аккаунт уже удален или не найден.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+                )
+                return
             await query.edit_message_text(
-                "FatSecret аккаунт удален." if removed else "У тебя нет подключенного FatSecret аккаунта.",
+                f"Удалить FatSecret аккаунт «{html.escape(account.label)}»?",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Да, удалить", callback_data=f"account_remove_confirm:{account.key}")],
+                        [InlineKeyboardButton("Назад к аккаунтам", callback_data="accounts:0")],
+                    ]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        elif action == "account_remove_confirm":
+            context.user_data.clear()
+            group = self.storage.active_group_for_user(update.effective_user.id)
+            group_account_keys = {account.key for account in self.storage.list_fatsecret_accounts(group.id)} if group else set()
+            if value not in group_account_keys:
+                await query.edit_message_text(
+                    "Этот FatSecret аккаунт не из твоей активной группы.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+                )
+                return
+            removed = self.storage.delete_fatsecret_account(value)
+            await query.edit_message_text(
+                "FatSecret аккаунт удален." if removed else "FatSecret аккаунт уже удален или не найден.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
             )
         elif action == "list":
@@ -494,7 +573,7 @@ class TelegramRecipeBot:
             return
         await query.edit_message_text(
             "Общий список рецептов:",
-            reply_markup=self._recipe_list_keyboard(recipes, page, "list"),
+            reply_markup=self._recipe_list_keyboard(recipes, page, "list", self._account_labels_for_group(group.id)),
         )
 
     async def _edit_search_results(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
@@ -519,7 +598,7 @@ class TelegramRecipeBot:
             return
         await query.edit_message_text(
             f"Найдено рецептов: {len(recipes)}",
-            reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage"),
+            reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage", self._account_labels_for_group(group_id)),
         )
 
     async def _refresh_from_callback(self, query) -> None:
@@ -678,7 +757,12 @@ class TelegramRecipeBot:
         selected.intersection_update({recipe.id for recipe in recipes})
         await query.edit_message_text(
             f"Выбери рецепты для удаления из FatSecret. Отмечено: {len(selected)}",
-            reply_markup=self._batch_delete_keyboard(recipes, page, selected),
+            reply_markup=self._batch_delete_keyboard(
+                recipes,
+                page,
+                selected,
+                self._account_labels_for_group(group.id),
+            ),
         )
 
     async def _toggle_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
@@ -690,7 +774,13 @@ class TelegramRecipeBot:
             selected.add(recipe_id)
         await self._open_batch_delete(query, context, int(page_text or "0"))
 
-    def _batch_delete_keyboard(self, recipes: list[Recipe], page: int, selected: set[str]) -> InlineKeyboardMarkup:
+    def _batch_delete_keyboard(
+        self,
+        recipes: list[Recipe],
+        page: int,
+        selected: set[str],
+        account_labels: dict[str, str],
+    ) -> InlineKeyboardMarkup:
         page = max(0, page)
         total_pages = max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE)
         page = min(page, total_pages - 1)
@@ -699,7 +789,11 @@ class TelegramRecipeBot:
         buttons = [
             [
                 InlineKeyboardButton(
-                    f"{'[x]' if recipe.id in selected else '[ ]'} {recipe.title[:48]}",
+                    _recipe_list_button_text(
+                        recipe,
+                        account_labels,
+                        prefix=f"{'[x]' if recipe.id in selected else '[ ]'} ",
+                    ),
                     callback_data=f"bdtoggle:{recipe.id}:{page}",
                 )
             ]
@@ -974,5 +1068,5 @@ class TelegramRecipeBot:
         context.user_data.pop("mode", None)
         await update.effective_message.reply_text(
             f"Найдено рецептов: {len(recipes)}",
-            reply_markup=self._recipe_list_keyboard(recipes, 0, "searchpage"),
+            reply_markup=self._recipe_list_keyboard(recipes, 0, "searchpage", self._account_labels_for_group(group_id)),
         )
