@@ -413,6 +413,42 @@ class Storage:
         self._conn.commit()
         return True
 
+    def active_group_created_by(self, telegram_id: int) -> bool:
+        """Return whether the Telegram user created their active recipe group."""
+        row = self._conn.execute(
+            """
+            SELECT 1
+            FROM telegram_users u
+            JOIN recipe_groups g ON g.id = u.active_group_id
+            WHERE u.telegram_id = ? AND g.created_by = ?
+            """,
+            (telegram_id, telegram_id),
+        ).fetchone()
+        return row is not None
+
+    def rename_active_group(self, telegram_id: int, name: str) -> RecipeGroup | None:
+        """Rename the active recipe group when the Telegram user is its creator."""
+        clean_name = name.strip()
+        if not clean_name:
+            return None
+        row = self._conn.execute(
+            """
+            SELECT g.id, g.invite_code
+            FROM telegram_users u
+            JOIN recipe_groups g ON g.id = u.active_group_id
+            WHERE u.telegram_id = ? AND g.created_by = ?
+            """,
+            (telegram_id, telegram_id),
+        ).fetchone()
+        if row is None:
+            return None
+        self._conn.execute(
+            "UPDATE recipe_groups SET name = ? WHERE id = ?",
+            (clean_name, row["id"]),
+        )
+        self._conn.commit()
+        return RecipeGroup(id=row["id"], name=clean_name, invite_code=row["invite_code"])
+
     def leave_active_group(self, telegram_id: int) -> RecipeGroup | None:
         """Remove a Telegram user from their active group and switch to another joined group if one exists."""
         group = self.active_group_for_user(telegram_id)

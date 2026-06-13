@@ -86,6 +86,24 @@ def test_group_members_and_leave_active_group(tmp_path) -> None:
         storage.close()
 
 
+def test_group_creator_can_rename_active_group(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        storage.register_user(22, "Two")
+        group = storage.create_group(11, "Старое")
+        storage.join_group_by_code(22, group.invite_code)
+
+        renamed = storage.rename_active_group(11, "Новое")
+        assert renamed is not None
+        assert renamed.name == "Новое"
+        assert storage.rename_active_group(22, "Чужое") is None
+        assert storage.active_group_created_by(11) is True
+        assert storage.active_group_created_by(22) is False
+    finally:
+        storage.close()
+
+
 def test_delete_selected_fatsecret_account_removes_remote_mapping(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

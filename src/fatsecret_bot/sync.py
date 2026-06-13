@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
 from .fatsecret_client import FatSecretClient, FatSecretError
-from .models import FatSecretAccountConfig, FatSecretDeviceConfig, Ingredient, Recipe
-from .storage import Storage
+from .models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
+from .storage import Storage, normalize_title
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,36 @@ class IngredientSyncStats:
         if self.extras:
             parts.append(f"лишних ингредиентов в целевом рецепте: {self.extras} (не удалял)")
         return "; ".join(parts) if parts else "ингредиентов нет"
+
+
+@dataclass(frozen=True)
+class RecipeListItem:
+    query: str
+    grams: Decimal
+
+
+@dataclass(frozen=True)
+class ResolvedRecipeListItem:
+    requested_query: str
+    grams: Decimal
+    ingredient: Ingredient
+    source: str
+    energy_per_100g: Decimal | None = None
+    protein_per_100g: Decimal | None = None
+    fat_per_100g: Decimal | None = None
+    carbohydrate_per_100g: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class RecipeListDraft:
+    items: list[ResolvedRecipeListItem]
+    unresolved: list[str]
+
+
+@dataclass(frozen=True)
+class RecipeCreateResult:
+    recipe_id: str
+    results: list[AccountSyncResult]
 
 
 def _same_decimal(left: Decimal, right: Decimal) -> bool:
@@ -156,6 +187,149 @@ class RecipeSyncEngine:
         finally:
             await self._close_clients(clients)
         return imported
+
+    def _frequent_local_ingredient(self, group_id: str, query: str) -> Ingredient | None:
+        terms = normalize_title(query).split()
+        if not terms:
+            return None
+        matches: dict[tuple[str, str, str, str], tuple[int, Ingredient]] = {}
+        for recipe in self.storage.list_recipes(group_id):
+            for ingredient in recipe.ingredients:
+                haystack = normalize_title(ingredient.title)
+                if not all(term in haystack for term in terms):
+                    continue
+                key = (
+                    ingredient.food_id,
+                    ingredient.portion_id or "0",
+                    ingredient.title,
+                    ingredient.portion_description,
+                )
+                count, stored = matches.get(key, (0, ingredient))
+                matches[key] = (count + 1, stored)
+        if not matches:
+            return None
+        return max(matches.values(), key=lambda item: item[0])[1]
+
+    async def resolve_recipe_list_items(self, group_id: str, items: list[RecipeListItem]) -> RecipeListDraft:
+        """Resolve free-text ingredient lines using local frequency first, then FatSecret search."""
+        clients = self._build_clients(group_id)
+        resolved: list[ResolvedRecipeListItem] = []
+        unresolved: list[str] = []
+        try:
+            first_client = next(iter(clients.values()))
+            for item in items:
+                local = self._frequent_local_ingredient(group_id, item.query)
+                if local is not None:
+                    resolved.append(
+                        ResolvedRecipeListItem(
+                            requested_query=item.query,
+                            grams=item.grams,
+                            ingredient=Ingredient(
+                                id=str(uuid.uuid4()),
+                                recipe_id="",
+                                food_id=local.food_id,
+                                title=local.title,
+                                portion_id=local.portion_id or "0",
+                                amount=item.grams,
+                                portion_description="г",
+                            ),
+                            source="часто использовался",
+                        )
+                    )
+                    continue
+
+                found = await self._resolve_food_from_remote(first_client, item.query)
+                if found is None:
+                    unresolved.append(item.query)
+                    continue
+                resolved.append(
+                    ResolvedRecipeListItem(
+                        requested_query=item.query,
+                        grams=item.grams,
+                        ingredient=Ingredient(
+                            id=str(uuid.uuid4()),
+                            recipe_id="",
+                            food_id=found.food_id,
+                            title=found.title,
+                            portion_id=found.default_portion_id or "0",
+                            amount=item.grams,
+                            portion_description="г",
+                        ),
+                        source="FatSecret",
+                        energy_per_100g=found.energy_per_portion,
+                        protein_per_100g=found.protein_per_portion,
+                        fat_per_100g=found.fat_per_portion,
+                        carbohydrate_per_100g=found.carbohydrate_per_portion,
+                    )
+                )
+        finally:
+            await self._close_clients(clients)
+        return RecipeListDraft(items=resolved, unresolved=unresolved)
+
+    async def _resolve_food_from_remote(self, client: FatSecretClient, query: str) -> FoodSearchResult | None:
+        autocomplete = await client.autocomplete_food(query)
+        candidates = autocomplete or await client.search_recipes(query)
+        if not candidates:
+            return None
+        return await client.resolve_food_detail(candidates[0])
+
+    async def create_recipe_from_list(
+        self,
+        group_id: str,
+        title: str,
+        items: list[ResolvedRecipeListItem],
+        updated_by: int,
+    ) -> RecipeCreateResult:
+        """Create a recipe from a validated ingredient list on every FatSecret account in a group."""
+        recipe_id = self.storage.create_recipe(
+            title=title,
+            description="",
+            portions=Decimal("1"),
+            prep_time=0,
+            cook_time=0,
+            updated_by=updated_by,
+            group_id=group_id,
+        )
+        ingredients = [
+            Ingredient(
+                id=item.ingredient.id,
+                recipe_id=recipe_id,
+                food_id=item.ingredient.food_id,
+                title=item.ingredient.title,
+                portion_id=item.ingredient.portion_id or "0",
+                amount=item.grams,
+                portion_description=item.ingredient.portion_description or "г",
+            )
+            for item in items
+        ]
+        self.storage.replace_ingredients(recipe_id, ingredients)
+        recipe = self.storage.get_recipe(recipe_id)
+        if recipe is None:
+            raise FatSecretError("Не удалось создать локальный рецепт.")
+
+        clients = self._build_clients(group_id)
+        results: list[AccountSyncResult] = []
+        try:
+            for account_key, client in clients.items():
+                try:
+                    remote_id = await client.create_recipe(recipe)
+                    self.storage.set_remote_recipe_id(recipe.id, account_key, remote_id, last_synced_version=0)
+                    recipe.remote_ids[account_key] = remote_id
+                    for ingredient in recipe.ingredients:
+                        ok = await client.add_ingredient(remote_id, ingredient)
+                        if not ok:
+                            raise FatSecretError(f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}».")
+                    ok = await client.save_recipe_meta(recipe, remote_id)
+                    if not ok:
+                        raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
+                    self.storage.mark_synced(recipe.id, account_key, remote_id, recipe.version)
+                    results.append(AccountSyncResult(account_key, remote_id, True, "создан"))
+                except Exception as exc:  # noqa: BLE001 - keep per-account creation isolated.
+                    self.storage.record_sync(recipe.id, account_key, "error", str(exc))
+                    results.append(AccountSyncResult(account_key, recipe.remote_ids.get(account_key), False, str(exc)))
+        finally:
+            await self._close_clients(clients)
+        return RecipeCreateResult(recipe_id=recipe_id, results=results)
 
     async def hydrate_recipe_from_remote(self, recipe_id: str) -> Recipe | None:
         recipe = self.storage.get_recipe(recipe_id)

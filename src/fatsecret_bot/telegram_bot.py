@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import html
 import logging
-from decimal import Decimal
+import re
+from decimal import Decimal, InvalidOperation
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -17,11 +18,12 @@ from telegram.ext import (
 
 from .models import FatSecretAccountConfig, Recipe, RecipeGroup
 from .storage import Storage, normalize_title
-from .sync import RecipeSyncEngine
+from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 
 logger = logging.getLogger(__name__)
 RECIPES_PAGE_SIZE = 8
 MAIN_BUTTONS = {"Рецепты", "Группы", "Аккаунты"}
+RECIPE_LIST_LINE_RE = re.compile(r"^(?P<name>.+?)\s+(?P<grams>\d+(?:[,.]\d+)?)$")
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -99,6 +101,78 @@ def _recipe_owner_text(recipe: Recipe, account_labels: dict[str, str]) -> str:
 def _recipe_list_button_text(recipe: Recipe, account_labels: dict[str, str], prefix: str = "") -> str:
     text = f"{prefix}{recipe.title} - {_recipe_owner_text(recipe, account_labels)}"
     return text[:90]
+
+
+def _default_account_label(username: str) -> str:
+    label = username.strip().split("@", 1)[0].strip()
+    return label[:24] or "FatSecret"
+
+
+def _parse_recipe_list_lines(text: str) -> tuple[list[RecipeListItem], list[str]]:
+    items: list[RecipeListItem] = []
+    bad_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = RECIPE_LIST_LINE_RE.match(line)
+        if match is None:
+            bad_lines.append(line)
+            continue
+        try:
+            grams = Decimal(match.group("grams").replace(",", "."))
+        except InvalidOperation:
+            bad_lines.append(line)
+            continue
+        if grams <= 0:
+            bad_lines.append(line)
+            continue
+        items.append(RecipeListItem(query=match.group("name").strip(), grams=grams))
+    return items, bad_lines
+
+
+def _format_decimal(value: Decimal | None, digits: int = 1) -> str:
+    if value is None:
+        return "-"
+    quantum = Decimal("1") if digits == 0 else Decimal("0." + ("0" * (digits - 1)) + "1")
+    return str(value.quantize(quantum)).rstrip("0").rstrip(".")
+
+
+def _scaled_macro(value: Decimal | None, grams: Decimal) -> Decimal | None:
+    if value is None:
+        return None
+    return value * grams / Decimal("100")
+
+
+def _format_resolved_item(item: ResolvedRecipeListItem) -> str:
+    kcal = _format_decimal(_scaled_macro(item.energy_per_100g, item.grams), 0)
+    protein = _format_decimal(_scaled_macro(item.protein_per_100g, item.grams))
+    fat = _format_decimal(_scaled_macro(item.fat_per_100g, item.grams))
+    carbs = _format_decimal(_scaled_macro(item.carbohydrate_per_100g, item.grams))
+    macros = f"{kcal}/{protein}/{fat}/{carbs}"
+    return f"- {html.escape(item.ingredient.title)} | {macros} | {_format_decimal(item.grams)}г"
+
+
+def _sum_known_macros(values: list[Decimal | None]) -> Decimal | None:
+    known = [value for value in values if value is not None]
+    if not known:
+        return None
+    return sum(known, Decimal("0"))
+
+
+def _format_recipe_list_draft(title: str, items: list[ResolvedRecipeListItem]) -> str:
+    energy = _sum_known_macros([_scaled_macro(item.energy_per_100g, item.grams) for item in items])
+    protein = _sum_known_macros([_scaled_macro(item.protein_per_100g, item.grams) for item in items])
+    fat = _sum_known_macros([_scaled_macro(item.fat_per_100g, item.grams) for item in items])
+    carbs = _sum_known_macros([_scaled_macro(item.carbohydrate_per_100g, item.grams) for item in items])
+    lines = [
+        f"<b>Рецепт: {html.escape(title)}</b>",
+        f"Итого ккал/Б/Ж/У: {_format_decimal(energy, 0)}/{_format_decimal(protein)}/{_format_decimal(fat)}/{_format_decimal(carbs)}",
+        "",
+        "<b>Ингредиенты</b>",
+        *(_format_resolved_item(item) for item in items),
+    ]
+    return "\n".join(lines)
 
 
 class TelegramRecipeBot:
@@ -226,9 +300,11 @@ class TelegramRecipeBot:
     def _groups_keyboard(self, telegram_id: int) -> InlineKeyboardMarkup:
         active = self.storage.active_group_for_user(telegram_id)
         if active is not None:
-            return InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Отключиться от группы", callback_data="group_leave:0")]]
-            )
+            buttons = []
+            if self.storage.active_group_created_by(telegram_id):
+                buttons.append([InlineKeyboardButton("Переименовать группу", callback_data="group_rename:0")])
+            buttons.append([InlineKeyboardButton("Отключиться от группы", callback_data="group_leave:0")])
+            return InlineKeyboardMarkup(buttons)
         buttons: list[list[InlineKeyboardButton]] = [
             [
                 InlineKeyboardButton("Создать группу", callback_data="group_create:0"),
@@ -263,7 +339,7 @@ class TelegramRecipeBot:
         existing = self.storage.get_fatsecret_account_by_telegram_id(telegram_id)
         buttons: list[list[InlineKeyboardButton]] = []
         if existing is not None:
-            buttons.append([InlineKeyboardButton("Заменить мой FatSecret", callback_data="account_add:0")])
+            buttons.append([InlineKeyboardButton("Обновить логин/пароль/ник", callback_data="account_add:0")])
         elif len(accounts) < 2:
             buttons.append([InlineKeyboardButton("Подключить мой FatSecret", callback_data="account_add:0")])
         for account in accounts:
@@ -339,7 +415,9 @@ class TelegramRecipeBot:
         if not recipes:
             await update.effective_message.reply_text(
                 "Рецептов пока нет. Создай рецепт в FatSecret и обнови список командой /refresh.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0")]]
+                ),
             )
             return
         await update.effective_message.reply_text(
@@ -378,6 +456,7 @@ class TelegramRecipeBot:
         buttons.append(
             [
                 InlineKeyboardButton("Поиск", callback_data="search:0"),
+                InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0"),
             ]
         )
         buttons.append([InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}")])
@@ -438,6 +517,13 @@ class TelegramRecipeBot:
             context.user_data["mode"] = "group_join"
             await query.edit_message_text(
                 "Пришли код группы.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
+            )
+        elif action == "group_rename":
+            context.user_data.clear()
+            context.user_data["mode"] = "group_rename"
+            await query.edit_message_text(
+                "Пришли новое название группы.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
             )
         elif action == "group_leave":
@@ -508,6 +594,20 @@ class TelegramRecipeBot:
             await query.edit_message_text("Что искать в рецептах? Пришли часть названия или ингредиента.")
         elif action == "searchpage":
             await self._edit_search_results(query, context, int(value or "0"))
+        elif action == "recipe_list_create":
+            context.user_data.clear()
+            if await self._require_active_group_query(query, update.effective_user.id) is None:
+                return
+            context.user_data["mode"] = "recipe_list_title"
+            await query.edit_message_text(
+                "Пришли название рецепта.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="list:0")]]),
+            )
+        elif action == "recipe_list_confirm":
+            await self._create_recipe_list_from_draft(query, context, update.effective_user.id)
+        elif action == "recipe_list_cancel":
+            context.user_data.clear()
+            await self._edit_recipe_list(query, 0)
         elif action == "refresh":
             context.user_data.clear()
             await self._refresh_from_callback(query)
@@ -913,14 +1013,22 @@ class TelegramRecipeBot:
             return
         if mode == "recipe_search":
             await self._handle_recipe_search(update, context, text)
+        elif mode == "recipe_list_title":
+            await self._handle_recipe_list_title(update, context, text)
+        elif mode == "recipe_list_items":
+            await self._handle_recipe_list_items(update, context, text)
         elif mode == "group_create":
             await self._handle_group_create(update, context, text)
         elif mode == "group_join":
             await self._handle_group_join(update, context, text)
+        elif mode == "group_rename":
+            await self._handle_group_rename(update, context, text)
         elif mode == "fatsecret_login":
             await self._handle_fatsecret_login(update, context, text)
         elif mode == "fatsecret_password":
             await self._handle_fatsecret_password(update, context, text)
+        elif mode == "fatsecret_label":
+            await self._handle_fatsecret_label(update, context, text)
         else:
             await update.effective_message.reply_text(
                 "Выбери действие кнопками ниже.",
@@ -966,6 +1074,21 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _handle_group_rename(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        user = update.effective_user
+        if user is None:
+            return
+        group = self.storage.rename_active_group(user.id, text)
+        if group is None:
+            await update.effective_message.reply_text("Переименовать группу может только создатель. Название не должно быть пустым.")
+            return
+        context.user_data.clear()
+        await update.effective_message.reply_text(
+            f"Группа переименована: {html.escape(group.name)}.",
+            reply_markup=MAIN_KEYBOARD,
+            parse_mode=ParseMode.HTML,
+        )
+
     async def _delete_user_message(self, update: Update) -> None:
         try:
             await update.effective_message.delete()
@@ -1004,7 +1127,7 @@ class TelegramRecipeBot:
 
         account = FatSecretAccountConfig(
             key=f"tg{user.id}",
-            label=user.full_name or str(user.id),
+            label=_default_account_label(username),
             username=username,
             password=text,
             market=self.default_market,
@@ -1019,6 +1142,45 @@ class TelegramRecipeBot:
             await status.edit_text(f"FatSecret не принял логин/пароль: {exc}")
             return
 
+        context.user_data.clear()
+        context.user_data["mode"] = "fatsecret_label"
+        context.user_data["fatsecret_pending"] = {
+            "username": account.username,
+            "password": account.password,
+            "market": account.market,
+            "language": account.language,
+            "group_id": group_id,
+            "default_label": account.label,
+        }
+        await status.edit_text(
+            "Логин принят. Пришли короткий ник для кнопок и списков.\n"
+            f"Например: <code>{html.escape(account.label)}</code>\n"
+            "Отправь <code>-</code>, чтобы взять этот вариант.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    async def _handle_fatsecret_label(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        user = update.effective_user
+        pending = context.user_data.get("fatsecret_pending")
+        if user is None or not isinstance(pending, dict):
+            context.user_data.clear()
+            await update.effective_message.reply_text("Контекст подключения потерян. Нажми «Аккаунты» и начни заново.")
+            return
+        default_label = str(pending.get("default_label") or "FatSecret")
+        label = default_label if text.strip() == "-" else text.strip()
+        if not label:
+            await update.effective_message.reply_text("Ник не должен быть пустым. Пришли короткое имя или `-`.")
+            return
+        account = FatSecretAccountConfig(
+            key=f"tg{user.id}",
+            label=label[:32],
+            username=str(pending["username"]),
+            password=str(pending["password"]),
+            market=str(pending["market"]),
+            language=str(pending["language"]),
+        )
+        group_id = str(pending["group_id"])
         self.storage.upsert_fatsecret_account(
             telegram_id=user.id,
             label=account.label,
@@ -1028,7 +1190,7 @@ class TelegramRecipeBot:
             language=account.language,
         )
         context.user_data.clear()
-        await status.edit_text("FatSecret аккаунт подключен. Загружаю рецепты из этого аккаунта...")
+        status = await update.effective_message.reply_text("FatSecret аккаунт подключен. Загружаю рецепты из этого аккаунта...")
         try:
             imported = await self.sync_engine.refresh_account_recipes(account, group_id)
         except Exception as exc:  # noqa: BLE001
@@ -1044,6 +1206,105 @@ class TelegramRecipeBot:
                 [
                     [InlineKeyboardButton("Рецепты", callback_data="list:0")],
                     [InlineKeyboardButton("Аккаунты", callback_data="accounts:0")],
+                ]
+            ),
+        )
+
+    async def _handle_recipe_list_title(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        group = await self._require_active_group(update)
+        if group is None:
+            return
+        title = text.strip()
+        if not title:
+            await update.effective_message.reply_text("Название не должно быть пустым.")
+            return
+        context.user_data["mode"] = "recipe_list_items"
+        context.user_data["recipe_list_title"] = title
+        context.user_data["group_id"] = group.id
+        await update.effective_message.reply_text(
+            "Пришли ингредиенты списком. Последнее число в строке считаю граммами.\n\n"
+            "Например:\n"
+            "Филе 100\n"
+            "Теос греческий 200"
+        )
+
+    async def _handle_recipe_list_items(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        user = update.effective_user
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        group_id = context.user_data.get("group_id")
+        if user is None or not title or not group_id:
+            context.user_data.clear()
+            await update.effective_message.reply_text("Контекст создания рецепта потерян. Начни заново из списка рецептов.")
+            return
+        items, bad_lines = _parse_recipe_list_lines(text)
+        if bad_lines:
+            lines = "\n".join(f"- {html.escape(line)}" for line in bad_lines)
+            await update.effective_message.reply_text(
+                "Эти строки я совсем не понимаю:\n"
+                f"{lines}\n\n"
+                "Формат: название и последним токеном масса в граммах.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not items:
+            await update.effective_message.reply_text("Не вижу ингредиентов. Пришли строки вида: Филе 100")
+            return
+        status = await update.effective_message.reply_text("Подбираю ингредиенты по твоим прошлым рецептам и FatSecret...")
+        try:
+            draft = await self.sync_engine.resolve_recipe_list_items(str(group_id), items)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recipe list resolve failed")
+            await status.edit_text(f"Не удалось подобрать ингредиенты: {exc}")
+            return
+        if draft.unresolved:
+            lines = "\n".join(f"- {html.escape(line)}" for line in draft.unresolved)
+            await status.edit_text(
+                "Не нашел ингредиенты в FatSecret:\n"
+                f"{lines}\n\n"
+                "Попробуй уточнить названия и пришли список заново.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        context.user_data["recipe_list_draft"] = draft.items
+        context.user_data["mode"] = "recipe_list_confirm"
+        await status.edit_text(
+            _format_recipe_list_draft(title, draft.items),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Создать рецепт", callback_data="recipe_list_confirm:0")],
+                    [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _create_recipe_list_from_draft(self, query, context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> None:
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        group_id = context.user_data.get("group_id")
+        draft_items = context.user_data.get("recipe_list_draft")
+        if not title or not group_id or not isinstance(draft_items, list):
+            await query.edit_message_text("Черновик устарел. Начни создание заново из списка рецептов.")
+            return
+        await query.edit_message_text("Создаю рецепт в FatSecret аккаунтах группы...")
+        try:
+            created = await self.sync_engine.create_recipe_from_list(str(group_id), title, draft_items, telegram_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recipe list create failed")
+            await query.edit_message_text(f"Ошибка создания рецепта: {exc}")
+            return
+        context.user_data.clear()
+        account_labels = self._account_labels_for_group(str(group_id))
+        lines = [
+            f"{account_labels.get(result.account_key, result.account_key)}: "
+            f"{'OK' if result.ok else 'ERROR'} {result.remote_recipe_id or ''} {result.message}"
+            for result in created.results
+        ]
+        await query.edit_message_text(
+            "Создание завершено:\n" + "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Открыть рецепт", callback_data=f"open:{created.recipe_id}")],
+                    [InlineKeyboardButton("К списку", callback_data="list:0")],
                 ]
             ),
         )
