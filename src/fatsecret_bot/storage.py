@@ -511,6 +511,22 @@ class Storage:
         self._conn.commit()
         return account_key
 
+    def update_fatsecret_account_label(self, account_key: str, label: str) -> bool:
+        """Update the bot-facing nickname for one connected FatSecret account."""
+        clean_label = label.strip()[:32]
+        if not clean_label:
+            return False
+        cursor = self._conn.execute(
+            """
+            UPDATE fatsecret_accounts
+            SET label = ?, updated_at = ?
+            WHERE account_key = ?
+            """,
+            (clean_label, _now(), account_key),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
     def delete_fatsecret_account_for_user(self, telegram_id: int) -> bool:
         """Delete a user's FatSecret account and stale remote recipe mappings."""
         row = self._conn.execute(

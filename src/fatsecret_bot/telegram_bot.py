@@ -175,6 +175,49 @@ def _format_recipe_list_draft(title: str, items: list[ResolvedRecipeListItem]) -
     return "\n".join(lines)
 
 
+def _recipe_list_draft_keyboard(items: list[ResolvedRecipeListItem]) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"Заменить: {item.ingredient.title[:42]}",
+                callback_data=f"recipe_list_replace:{index}",
+            )
+        ]
+        for index, item in enumerate(items)
+    ]
+    buttons.append([InlineKeyboardButton("Создать рецепт", callback_data="recipe_list_confirm:0")])
+    buttons.append([InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _recipe_list_candidate_keyboard(candidates: list[ResolvedRecipeListItem]) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"{index + 1}. {item.ingredient.title[:46]}",
+                callback_data=f"recipe_list_pick:{index}",
+            )
+        ]
+        for index, item in enumerate(candidates)
+    ]
+    buttons.append([InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _format_recipe_list_candidates(
+    query: str,
+    grams: Decimal,
+    candidates: list[ResolvedRecipeListItem],
+) -> str:
+    lines = [
+        f"Варианты для <b>{html.escape(query)}</b>. Масса останется {_format_decimal(grams)}г.",
+        "",
+    ]
+    for index, item in enumerate(candidates, start=1):
+        lines.append(f"{index}. {_format_resolved_item(item)[2:]}")
+    return "\n".join(lines)
+
+
 class TelegramRecipeBot:
     def __init__(
         self,
@@ -338,13 +381,37 @@ class TelegramRecipeBot:
         accounts = self.storage.list_fatsecret_accounts(group.id)
         existing = self.storage.get_fatsecret_account_by_telegram_id(telegram_id)
         buttons: list[list[InlineKeyboardButton]] = []
-        if existing is not None:
-            buttons.append([InlineKeyboardButton("Обновить логин/пароль/ник", callback_data="account_add:0")])
-        elif len(accounts) < 2:
-            buttons.append([InlineKeyboardButton("Подключить мой FatSecret", callback_data="account_add:0")])
+        if existing is None and len(accounts) < 2:
+            buttons.append([InlineKeyboardButton("Подключить FatSecret", callback_data="account_add:0")])
         for account in accounts:
-            buttons.append([InlineKeyboardButton(f"Удалить: {account.label[:40]}", callback_data=f"account_remove:{account.key}")])
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Поменять ник: {account.label[:32]}",
+                        callback_data=f"account_label:{account.key}",
+                    )
+                ]
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Выйти: {account.label[:42]}",
+                        callback_data=f"account_logout:{account.key}",
+                    )
+                ]
+            )
         return InlineKeyboardMarkup(buttons)
+
+    def _active_group_account(
+        self,
+        telegram_id: int,
+        account_key: str,
+    ) -> tuple[RecipeGroup | None, FatSecretAccountConfig | None]:
+        group = self.storage.active_group_for_user(telegram_id)
+        if group is None:
+            return None, None
+        accounts = {account.key: account for account in self.storage.list_fatsecret_accounts(group.id)}
+        return group, accounts.get(account_key)
 
     async def accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
@@ -539,38 +606,48 @@ class TelegramRecipeBot:
             await self._edit_accounts(query, update.effective_user.id)
         elif action == "account_add":
             await self._start_account_add(query, context, update.effective_user.id)
-        elif action == "account_remove":
+        elif action == "account_label":
             context.user_data.clear()
-            group = self.storage.active_group_for_user(update.effective_user.id)
-            group_account_keys = {account.key for account in self.storage.list_fatsecret_accounts(group.id)} if group else set()
-            if value not in group_account_keys:
+            _, account = self._active_group_account(update.effective_user.id, value)
+            if account is None:
                 await query.edit_message_text(
                     "Этот FatSecret аккаунт не из твоей активной группы.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
                 )
                 return
-            account = self.storage.get_fatsecret_account(value)
+            context.user_data["mode"] = "account_label"
+            context.user_data["account_label_key"] = account.key
+            await query.edit_message_text(
+                f"Пришли новый короткий ник для «{html.escape(account.label)}».",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Назад к аккаунтам", callback_data="accounts:0")]]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        elif action in {"account_logout", "account_remove"}:
+            context.user_data.clear()
+            _, account = self._active_group_account(update.effective_user.id, value)
             if account is None:
                 await query.edit_message_text(
-                    "FatSecret аккаунт уже удален или не найден.",
+                    "Этот FatSecret аккаунт не из твоей активной группы.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
                 )
                 return
             await query.edit_message_text(
-                f"Удалить FatSecret аккаунт «{html.escape(account.label)}»?",
+                f"Выйти из FatSecret аккаунта «{html.escape(account.label)}» в боте?\n"
+                "Сам аккаунт и рецепты в FatSecret не удалятся.",
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("Да, удалить", callback_data=f"account_remove_confirm:{account.key}")],
+                        [InlineKeyboardButton("Да, выйти", callback_data=f"account_logout_confirm:{account.key}")],
                         [InlineKeyboardButton("Назад к аккаунтам", callback_data="accounts:0")],
                     ]
                 ),
                 parse_mode=ParseMode.HTML,
             )
-        elif action == "account_remove_confirm":
+        elif action in {"account_logout_confirm", "account_remove_confirm"}:
             context.user_data.clear()
-            group = self.storage.active_group_for_user(update.effective_user.id)
-            group_account_keys = {account.key for account in self.storage.list_fatsecret_accounts(group.id)} if group else set()
-            if value not in group_account_keys:
+            _, account = self._active_group_account(update.effective_user.id, value)
+            if account is None:
                 await query.edit_message_text(
                     "Этот FatSecret аккаунт не из твоей активной группы.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
@@ -578,7 +655,7 @@ class TelegramRecipeBot:
                 return
             removed = self.storage.delete_fatsecret_account(value)
             await query.edit_message_text(
-                "FatSecret аккаунт удален." if removed else "FatSecret аккаунт уже удален или не найден.",
+                "Вышел из FatSecret аккаунта в боте." if removed else "FatSecret аккаунт уже отключен или не найден.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
             )
         elif action == "list":
@@ -605,6 +682,12 @@ class TelegramRecipeBot:
             )
         elif action == "recipe_list_confirm":
             await self._create_recipe_list_from_draft(query, context, update.effective_user.id)
+        elif action == "recipe_list_replace":
+            await self._start_recipe_list_replace(query, context, int(value or "0"))
+        elif action == "recipe_list_pick":
+            await self._pick_recipe_list_candidate(query, context, int(value or "0"))
+        elif action == "recipe_list_back":
+            await self._edit_recipe_list_draft(query, context)
         elif action == "recipe_list_cancel":
             context.user_data.clear()
             await self._edit_recipe_list(query, 0)
@@ -1017,6 +1100,8 @@ class TelegramRecipeBot:
             await self._handle_recipe_list_title(update, context, text)
         elif mode == "recipe_list_items":
             await self._handle_recipe_list_items(update, context, text)
+        elif mode == "recipe_list_replace_query":
+            await self._handle_recipe_list_replace_query(update, context, text)
         elif mode == "group_create":
             await self._handle_group_create(update, context, text)
         elif mode == "group_join":
@@ -1029,6 +1114,8 @@ class TelegramRecipeBot:
             await self._handle_fatsecret_password(update, context, text)
         elif mode == "fatsecret_label":
             await self._handle_fatsecret_label(update, context, text)
+        elif mode == "account_label":
+            await self._handle_account_label(update, context, text)
         else:
             await update.effective_message.reply_text(
                 "Выбери действие кнопками ниже.",
@@ -1154,6 +1241,7 @@ class TelegramRecipeBot:
         }
         await status.edit_text(
             "Логин принят. Пришли короткий ник для кнопок и списков.\n"
+            "Потом его можно поменять в «Аккаунтах».\n"
             f"Например: <code>{html.escape(account.label)}</code>\n"
             "Отправь <code>-</code>, чтобы взять этот вариант.",
             parse_mode=ParseMode.HTML,
@@ -1208,6 +1296,33 @@ class TelegramRecipeBot:
                     [InlineKeyboardButton("Аккаунты", callback_data="accounts:0")],
                 ]
             ),
+        )
+
+    async def _handle_account_label(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        user = update.effective_user
+        account_key = str(context.user_data.get("account_label_key") or "")
+        label = text.strip()[:32]
+        if user is None or not account_key:
+            context.user_data.clear()
+            await update.effective_message.reply_text("Контекст переименования потерян. Открой «Аккаунты» заново.")
+            return
+        group, account = self._active_group_account(user.id, account_key)
+        if group is None or account is None:
+            context.user_data.clear()
+            await update.effective_message.reply_text(
+                "Этот FatSecret аккаунт больше не найден в активной группе.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        if not label:
+            await update.effective_message.reply_text("Ник не должен быть пустым. Пришли короткое имя.")
+            return
+        updated = self.storage.update_fatsecret_account_label(account_key, label)
+        context.user_data.clear()
+        await update.effective_message.reply_text(
+            f"Ник обновлен: {html.escape(label)}." if updated else "Не удалось обновить ник.",
+            reply_markup=self._accounts_keyboard(user.id, group),
+            parse_mode=ParseMode.HTML,
         )
 
     async def _handle_recipe_list_title(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -1269,14 +1384,131 @@ class TelegramRecipeBot:
         context.user_data["mode"] = "recipe_list_confirm"
         await status.edit_text(
             _format_recipe_list_draft(title, draft.items),
+            reply_markup=_recipe_list_draft_keyboard(draft.items),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _edit_recipe_list_draft(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        draft_items = context.user_data.get("recipe_list_draft")
+        if not title or not isinstance(draft_items, list):
+            await query.edit_message_text(
+                "Черновик устарел. Начни создание заново из списка рецептов.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            )
+            return
+        context.user_data["mode"] = "recipe_list_confirm"
+        context.user_data.pop("recipe_list_replace_index", None)
+        context.user_data.pop("recipe_list_candidates", None)
+        await query.edit_message_text(
+            _format_recipe_list_draft(title, draft_items),
+            reply_markup=_recipe_list_draft_keyboard(draft_items),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _start_recipe_list_replace(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        index: int,
+    ) -> None:
+        draft_items = context.user_data.get("recipe_list_draft")
+        if not isinstance(draft_items, list) or index < 0 or index >= len(draft_items):
+            await query.edit_message_text(
+                "Черновик устарел. Начни создание заново из списка рецептов.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            )
+            return
+        item = draft_items[index]
+        context.user_data["mode"] = "recipe_list_replace_query"
+        context.user_data["recipe_list_replace_index"] = index
+        context.user_data.pop("recipe_list_candidates", None)
+        await query.edit_message_text(
+            f"Что искать вместо «{html.escape(item.ingredient.title)}»?\n"
+            f"Массу оставлю {_format_decimal(item.grams)}г.",
             reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("Создать рецепт", callback_data="recipe_list_confirm:0")],
-                    [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
-                ]
+                [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
             ),
             parse_mode=ParseMode.HTML,
         )
+
+    async def _handle_recipe_list_replace_query(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        user = update.effective_user
+        group_id = context.user_data.get("group_id")
+        draft_items = context.user_data.get("recipe_list_draft")
+        index = context.user_data.get("recipe_list_replace_index")
+        if user is None or not group_id or not isinstance(draft_items, list) or not isinstance(index, int):
+            context.user_data.clear()
+            await update.effective_message.reply_text(
+                "Контекст замены потерян. Начни создание заново из списка рецептов."
+            )
+            return
+        if index < 0 or index >= len(draft_items):
+            context.user_data.clear()
+            await update.effective_message.reply_text("Ингредиент в черновике больше не найден. Начни создание заново.")
+            return
+        search_query = text.strip()
+        if not search_query:
+            await update.effective_message.reply_text("Пришли название ингредиента для поиска.")
+            return
+        grams = draft_items[index].grams
+        status = await update.effective_message.reply_text("Ищу варианты замены...")
+        try:
+            candidates = await self.sync_engine.recipe_list_candidates(str(group_id), search_query, grams, limit=6)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recipe list replacement search failed")
+            await status.edit_text(f"Не удалось найти замену: {exc}")
+            return
+        if not candidates:
+            await status.edit_text(
+                f"Не нашел вариантов для «{html.escape(search_query)}». Пришли другой запрос.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        context.user_data["mode"] = "recipe_list_replace_query"
+        context.user_data["recipe_list_candidates"] = candidates
+        await status.edit_text(
+            _format_recipe_list_candidates(search_query, grams, candidates),
+            reply_markup=_recipe_list_candidate_keyboard(candidates),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _pick_recipe_list_candidate(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        candidate_index: int,
+    ) -> None:
+        draft_items = context.user_data.get("recipe_list_draft")
+        candidates = context.user_data.get("recipe_list_candidates")
+        replace_index = context.user_data.get("recipe_list_replace_index")
+        if (
+            not isinstance(draft_items, list)
+            or not isinstance(candidates, list)
+            or not isinstance(replace_index, int)
+            or candidate_index < 0
+            or candidate_index >= len(candidates)
+            or replace_index < 0
+            or replace_index >= len(draft_items)
+        ):
+            await query.edit_message_text(
+                "Выбор замены устарел. Вернись к проверке и попробуй еще раз.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]
+                ),
+            )
+            return
+        draft_items[replace_index] = candidates[candidate_index]
+        context.user_data["recipe_list_draft"] = draft_items
+        await self._edit_recipe_list_draft(query, context)
 
     async def _create_recipe_list_from_draft(self, query, context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> None:
         title = str(context.user_data.get("recipe_list_title") or "").strip()

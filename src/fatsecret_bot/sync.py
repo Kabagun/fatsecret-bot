@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -7,6 +8,8 @@ from decimal import Decimal
 from .fatsecret_client import FatSecretClient, FatSecretError
 from .models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
 from .storage import Storage, normalize_title
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -189,7 +192,8 @@ class RecipeSyncEngine:
         return imported
 
     def _frequent_local_ingredient(self, group_id: str, query: str) -> Ingredient | None:
-        terms = normalize_title(query).split()
+        normalized_query = normalize_title(query)
+        terms = normalized_query.split()
         if not terms:
             return None
         matches: dict[tuple[str, str, str, str], tuple[int, Ingredient]] = {}
@@ -208,51 +212,90 @@ class RecipeSyncEngine:
                 matches[key] = (count + 1, stored)
         if not matches:
             return None
-        return max(matches.values(), key=lambda item: item[0])[1]
+        return max(
+            matches.values(),
+            key=lambda item: (
+                item[0],
+                normalize_title(item[1].title) == normalized_query,
+                -len(normalize_title(item[1].title)),
+            ),
+        )[1]
 
     async def resolve_recipe_list_items(self, group_id: str, items: list[RecipeListItem]) -> RecipeListDraft:
         """Resolve free-text ingredient lines using local frequency first, then FatSecret search."""
-        clients = self._build_clients(group_id)
         resolved: list[ResolvedRecipeListItem] = []
         unresolved: list[str] = []
+        for item in items:
+            candidates = await self.recipe_list_candidates(group_id, item.query, item.grams, limit=1)
+            if not candidates:
+                unresolved.append(item.query)
+                continue
+            resolved.append(candidates[0])
+        return RecipeListDraft(items=resolved, unresolved=unresolved)
+
+    async def recipe_list_candidates(
+        self,
+        group_id: str,
+        query: str,
+        grams: Decimal,
+        limit: int = 6,
+    ) -> list[ResolvedRecipeListItem]:
+        """Return replacement candidates for one free-text ingredient line."""
+        limit = max(1, limit)
+        candidates: list[ResolvedRecipeListItem] = []
+        seen: set[tuple[str, str]] = set()
+
+        local = self._frequent_local_ingredient(group_id, query)
+        if local is not None:
+            local_key = (local.food_id, normalize_title(local.title))
+            seen.add(local_key)
+            candidates.append(
+                ResolvedRecipeListItem(
+                    requested_query=query,
+                    grams=grams,
+                    ingredient=Ingredient(
+                        id=str(uuid.uuid4()),
+                        recipe_id="",
+                        food_id=local.food_id,
+                        title=local.title,
+                        portion_id=local.portion_id or "0",
+                        amount=grams,
+                        portion_description="г",
+                    ),
+                    source="часто использовался",
+                )
+            )
+            if len(candidates) >= limit:
+                return candidates
+
+        clients = self._build_clients(group_id)
         try:
             first_client = next(iter(clients.values()))
-            for item in items:
-                local = self._frequent_local_ingredient(group_id, item.query)
-                if local is not None:
-                    resolved.append(
-                        ResolvedRecipeListItem(
-                            requested_query=item.query,
-                            grams=item.grams,
-                            ingredient=Ingredient(
-                                id=str(uuid.uuid4()),
-                                recipe_id="",
-                                food_id=local.food_id,
-                                title=local.title,
-                                portion_id=local.portion_id or "0",
-                                amount=item.grams,
-                                portion_description="г",
-                            ),
-                            source="часто использовался",
-                        )
-                    )
+            remote_candidates = await first_client.autocomplete_food(query)
+            remote_candidates.extend(await first_client.search_recipes(query))
+            for remote in remote_candidates:
+                if len(candidates) >= limit:
+                    break
+                try:
+                    found = await first_client.resolve_food_detail(remote)
+                except Exception:  # noqa: BLE001 - keep alternative candidates usable.
+                    logger.debug("recipe list candidate resolve failed for %s", remote.title, exc_info=True)
                     continue
-
-                found = await self._resolve_food_from_remote(first_client, item.query)
-                if found is None:
-                    unresolved.append(item.query)
+                remote_key = (found.food_id, normalize_title(found.title))
+                if remote_key in seen:
                     continue
-                resolved.append(
+                seen.add(remote_key)
+                candidates.append(
                     ResolvedRecipeListItem(
-                        requested_query=item.query,
-                        grams=item.grams,
+                        requested_query=query,
+                        grams=grams,
                         ingredient=Ingredient(
                             id=str(uuid.uuid4()),
                             recipe_id="",
                             food_id=found.food_id,
                             title=found.title,
                             portion_id=found.default_portion_id or "0",
-                            amount=item.grams,
+                            amount=grams,
                             portion_description="г",
                         ),
                         source="FatSecret",
@@ -264,7 +307,7 @@ class RecipeSyncEngine:
                 )
         finally:
             await self._close_clients(clients)
-        return RecipeListDraft(items=resolved, unresolved=unresolved)
+        return candidates
 
     async def _resolve_food_from_remote(self, client: FatSecretClient, query: str) -> FoodSearchResult | None:
         autocomplete = await client.autocomplete_food(query)

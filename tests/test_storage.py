@@ -184,6 +184,28 @@ def test_fatsecret_account_upsert_replaces_user_account(tmp_path) -> None:
         storage.close()
 
 
+def test_update_fatsecret_account_label(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        account_key = storage.upsert_fatsecret_account(
+            telegram_id=11,
+            label="Long Original",
+            username="one@example.com",
+            password="password",
+            market="BY",
+            language="ru",
+        )
+
+        assert storage.update_fatsecret_account_label(account_key, "  One  ") is True
+        assert storage.update_fatsecret_account_label(account_key, " ") is False
+        assert storage.update_fatsecret_account_label("missing", "Two") is False
+        account = storage.get_fatsecret_account(account_key)
+        assert account is not None
+        assert account.label == "One"
+    finally:
+        storage.close()
+
+
 def test_delete_fatsecret_account_removes_remote_recipe_mapping(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

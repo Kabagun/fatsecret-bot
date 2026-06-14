@@ -111,6 +111,28 @@ def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> No
         storage.close()
 
 
+def test_recipe_list_candidates_prefers_frequent_local_shorter_tie(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        first = storage.create_recipe("A", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
+        second = storage.create_recipe("B", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
+        storage.add_ingredient(first, "food-cheese", "Филе Куриное в Сыре", "portion-1", Decimal("100"), "г")
+        storage.add_ingredient(second, "food-chicken", "Куриное Филе", "portion-2", Decimal("100"), "г")
+        engine = RecipeSyncEngine(storage, _device())
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "Филе", Decimal("300"), limit=1))
+
+        assert len(candidates) == 1
+        assert candidates[0].ingredient.title == "Куриное Филе"
+        assert candidates[0].ingredient.amount == Decimal("300")
+        assert candidates[0].ingredient.portion_description == "г"
+        assert candidates[0].source == "часто использовался"
+    finally:
+        storage.close()
+
+
 def test_delete_recipe_everywhere_deletes_all_mappings_and_local_recipe(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
