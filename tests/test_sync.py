@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
-from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, Ingredient, Recipe
+from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
 from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import RecipeSyncEngine
 
@@ -35,6 +35,31 @@ class FakeFatSecretClient:
     async def delete_recipe(self, remote_recipe_id: str) -> bool:
         self.deleted_recipe_ids.append(remote_recipe_id)
         return self.delete_ok
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeSearchClient:
+    def __init__(self, results: list[FoodSearchResult]) -> None:
+        self.account = FatSecretAccountConfig(
+            key="search",
+            label="search",
+            username="search@example.com",
+            password="secret",
+            market="BY",
+            language="ru",
+        )
+        self.results = results
+
+    async def autocomplete_food(self, query: str) -> list[FoodSearchResult]:
+        return list(self.results)
+
+    async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        return []
+
+    async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
+        return result
 
     async def close(self) -> None:
         return None
@@ -129,6 +154,26 @@ def test_recipe_list_candidates_prefers_frequent_local_shorter_tie(tmp_path) -> 
         assert candidates[0].ingredient.amount == Decimal("300")
         assert candidates[0].ingredient.portion_description == "г"
         assert candidates[0].source == "часто использовался"
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_ranks_remote_matches_before_raw_order(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(food_id="food-cheese", title="Филе Куриное в Сыре"),
+                FoodSearchResult(food_id="food-chicken", title="Куриное Филе"),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "Филе", Decimal("300"), limit=1))
+
+        assert len(candidates) == 1
+        assert candidates[0].ingredient.title == "Куриное Филе"
     finally:
         storage.close()
 

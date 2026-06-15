@@ -22,6 +22,7 @@ from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 
 logger = logging.getLogger(__name__)
 RECIPES_PAGE_SIZE = 8
+RECIPE_LIST_CANDIDATES_PAGE_SIZE = 10
 MAIN_BUTTONS = {"Рецепты", "Группы", "Аккаунты"}
 RECIPE_LIST_LINE_RE = re.compile(r"^(?P<name>.+?)\s+(?P<grams>\d+(?:[,.]\d+)?)$")
 
@@ -144,13 +145,25 @@ def _scaled_macro(value: Decimal | None, grams: Decimal) -> Decimal | None:
     return value * grams / Decimal("100")
 
 
+def _format_item_title(item: ResolvedRecipeListItem) -> str:
+    title = item.ingredient.title.strip()
+    brand = item.brand.strip()
+    if brand and brand.casefold() not in title.casefold():
+        title = f"{title} ({brand[:60]})"
+    return html.escape(title)
+
+
+def _format_macros_per_100g(item: ResolvedRecipeListItem) -> str:
+    return (
+        f"{_format_decimal(item.energy_per_100g, 0)}/"
+        f"{_format_decimal(item.protein_per_100g)}/"
+        f"{_format_decimal(item.fat_per_100g)}/"
+        f"{_format_decimal(item.carbohydrate_per_100g)}"
+    )
+
+
 def _format_resolved_item(item: ResolvedRecipeListItem) -> str:
-    kcal = _format_decimal(_scaled_macro(item.energy_per_100g, item.grams), 0)
-    protein = _format_decimal(_scaled_macro(item.protein_per_100g, item.grams))
-    fat = _format_decimal(_scaled_macro(item.fat_per_100g, item.grams))
-    carbs = _format_decimal(_scaled_macro(item.carbohydrate_per_100g, item.grams))
-    macros = f"{kcal}/{protein}/{fat}/{carbs}"
-    return f"- {html.escape(item.ingredient.title)} | {macros} | {_format_decimal(item.grams)}г"
+    return f"- {_format_item_title(item)} | 100г: {_format_macros_per_100g(item)} | масса: {_format_decimal(item.grams)}г"
 
 
 def _sum_known_macros(values: list[Decimal | None]) -> Decimal | None:
@@ -190,16 +203,27 @@ def _recipe_list_draft_keyboard(items: list[ResolvedRecipeListItem]) -> InlineKe
     return InlineKeyboardMarkup(buttons)
 
 
-def _recipe_list_candidate_keyboard(candidates: list[ResolvedRecipeListItem]) -> InlineKeyboardMarkup:
+def _recipe_list_candidate_keyboard(
+    candidates: list[ResolvedRecipeListItem],
+    page: int,
+    has_next: bool,
+) -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(
-                f"{index + 1}. {item.ingredient.title[:46]}",
+                f"{page * RECIPE_LIST_CANDIDATES_PAGE_SIZE + index + 1}. {item.ingredient.title[:46]}",
                 callback_data=f"recipe_list_pick:{index}",
             )
         ]
         for index, item in enumerate(candidates)
     ]
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("Назад", callback_data=f"recipe_list_cpage:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}", callback_data=f"recipe_list_cpage:{page}"))
+    if has_next:
+        nav.append(InlineKeyboardButton("Дальше", callback_data=f"recipe_list_cpage:{page + 1}"))
+    buttons.append(nav)
     buttons.append([InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")])
     return InlineKeyboardMarkup(buttons)
 
@@ -208,13 +232,15 @@ def _format_recipe_list_candidates(
     query: str,
     grams: Decimal,
     candidates: list[ResolvedRecipeListItem],
+    page: int,
 ) -> str:
     lines = [
         f"Варианты для <b>{html.escape(query)}</b>. Масса останется {_format_decimal(grams)}г.",
         "",
     ]
     for index, item in enumerate(candidates, start=1):
-        lines.append(f"{index}. {_format_resolved_item(item)[2:]}")
+        number = page * RECIPE_LIST_CANDIDATES_PAGE_SIZE + index
+        lines.append(f"{number}. {_format_resolved_item(item)[2:]}")
     return "\n".join(lines)
 
 
@@ -686,6 +712,8 @@ class TelegramRecipeBot:
             await self._start_recipe_list_replace(query, context, int(value or "0"))
         elif action == "recipe_list_pick":
             await self._pick_recipe_list_candidate(query, context, int(value or "0"))
+        elif action == "recipe_list_cpage":
+            await self._show_recipe_list_replacements(query, context, int(value or "0"))
         elif action == "recipe_list_back":
             await self._edit_recipe_list_draft(query, context)
         elif action == "recipe_list_cancel":
@@ -1456,16 +1484,61 @@ class TelegramRecipeBot:
         if not search_query:
             await update.effective_message.reply_text("Пришли название ингредиента для поиска.")
             return
-        grams = draft_items[index].grams
         status = await update.effective_message.reply_text("Ищу варианты замены...")
+        context.user_data["recipe_list_replace_query"] = search_query
+        context.user_data["recipe_list_replace_page"] = 0
+        await self._show_recipe_list_replacements(status, context, page=0)
+
+    async def _edit_flow_message(self, target, text: str, **kwargs) -> None:
+        if hasattr(target, "edit_message_text"):
+            await target.edit_message_text(text, **kwargs)
+            return
+        await target.edit_text(text, **kwargs)
+
+    async def _show_recipe_list_replacements(
+        self,
+        message,
+        context: ContextTypes.DEFAULT_TYPE,
+        page: int,
+    ) -> None:
+        group_id = context.user_data.get("group_id")
+        draft_items = context.user_data.get("recipe_list_draft")
+        index = context.user_data.get("recipe_list_replace_index")
+        search_query = str(context.user_data.get("recipe_list_replace_query") or "").strip()
+        if not group_id or not isinstance(draft_items, list) or not isinstance(index, int) or not search_query:
+            context.user_data.clear()
+            await self._edit_flow_message(
+                message,
+                "Контекст замены потерян. Начни создание заново из списка рецептов.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            )
+            return
+        if index < 0 or index >= len(draft_items):
+            context.user_data.clear()
+            await self._edit_flow_message(
+                message,
+                "Ингредиент в черновике больше не найден. Начни создание заново.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            )
+            return
+        page = max(0, page)
+        grams = draft_items[index].grams
+        offset = page * RECIPE_LIST_CANDIDATES_PAGE_SIZE
         try:
-            candidates = await self.sync_engine.recipe_list_candidates(str(group_id), search_query, grams, limit=6)
+            candidates = await self.sync_engine.recipe_list_candidates(
+                str(group_id),
+                search_query,
+                grams,
+                limit=RECIPE_LIST_CANDIDATES_PAGE_SIZE + 1,
+                offset=offset,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list replacement search failed")
-            await status.edit_text(f"Не удалось найти замену: {exc}")
+            await self._edit_flow_message(message, f"Не удалось найти замену: {exc}")
             return
         if not candidates:
-            await status.edit_text(
+            await self._edit_flow_message(
+                message,
                 f"Не нашел вариантов для «{html.escape(search_query)}». Пришли другой запрос.",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
@@ -1473,11 +1546,15 @@ class TelegramRecipeBot:
                 parse_mode=ParseMode.HTML,
             )
             return
+        visible_candidates = candidates[:RECIPE_LIST_CANDIDATES_PAGE_SIZE]
+        has_next = len(candidates) > RECIPE_LIST_CANDIDATES_PAGE_SIZE
         context.user_data["mode"] = "recipe_list_replace_query"
-        context.user_data["recipe_list_candidates"] = candidates
-        await status.edit_text(
-            _format_recipe_list_candidates(search_query, grams, candidates),
-            reply_markup=_recipe_list_candidate_keyboard(candidates),
+        context.user_data["recipe_list_replace_page"] = page
+        context.user_data["recipe_list_candidates"] = visible_candidates
+        await self._edit_flow_message(
+            message,
+            _format_recipe_list_candidates(search_query, grams, visible_candidates, page),
+            reply_markup=_recipe_list_candidate_keyboard(visible_candidates, page, has_next),
             parse_mode=ParseMode.HTML,
         )
 

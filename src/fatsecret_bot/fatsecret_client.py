@@ -52,6 +52,20 @@ def _text(parent: ET.Element, tag: str, default: str = "") -> str:
     return value.strip() if value else default
 
 
+def _strip_tags(value: str) -> str:
+    return re.sub(r"<[^>]+>", "", value).strip()
+
+
+def _food_brand(data: dict[str, Any]) -> str:
+    for key in ("brand", "brandName", "brand_name", "manufacturer", "manufacturerName", "company", "owner"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("title") or value.get("value")
+        if value:
+            return _strip_tags(str(value))
+    return ""
+
+
 def _looks_like_true(text: str) -> bool:
     normalized = text.strip().lower()
     if normalized in {"true", "1", "ok", "yes"}:
@@ -364,8 +378,9 @@ class FatSecretClient:
                 results.append(
                     FoodSearchResult(
                         food_id=str(raw_id or ""),
-                        title=re.sub(r"<[^>]+>", "", str(raw_title)),
-                        description=str(item.get("description") or item.get("subtitle") or ""),
+                        title=_strip_tags(str(raw_title)),
+                        description=_strip_tags(str(item.get("description") or item.get("subtitle") or "")),
+                        brand=_food_brand(item),
                         energy_per_portion=_decimal(
                             str(
                                 item.get("energyPerPortion")
@@ -404,6 +419,7 @@ class FatSecretClient:
             food_id=result.food_id,
             title=recipe.title or result.title,
             description=result.description,
+            brand=result.brand,
             default_portion_id=recipe.default_portion_id or "0",
             energy_per_portion=result.energy_per_portion,
             carbohydrate_per_portion=result.carbohydrate_per_portion,

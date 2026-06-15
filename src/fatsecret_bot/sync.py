@@ -53,6 +53,7 @@ class ResolvedRecipeListItem:
     grams: Decimal
     ingredient: Ingredient
     source: str
+    brand: str = ""
     energy_per_100g: Decimal | None = None
     protein_per_100g: Decimal | None = None
     fat_per_100g: Decimal | None = None
@@ -106,6 +107,23 @@ def _ingredient_needs_update(target: Ingredient, source: Ingredient) -> bool:
         or target.title != source.title
         or (target.portion_id or "0") != (source.portion_id or "0")
         or not _same_decimal(target.amount, source.amount)
+    )
+
+
+def _ingredient_query_rank(query: str, title: str) -> tuple[int, int, int, int, int, str]:
+    normalized_query = normalize_title(query)
+    normalized_title = normalize_title(title)
+    terms = normalized_query.split()
+    words = set(normalized_title.split())
+    all_terms_as_words = all(term in words for term in terms)
+    all_terms_present = all(term in normalized_title for term in terms)
+    return (
+        0 if normalized_title == normalized_query else 1,
+        0 if all_terms_as_words else 1,
+        0 if all_terms_present else 1,
+        len(normalized_title.split()),
+        len(normalized_title),
+        normalized_title,
     )
 
 
@@ -239,9 +257,12 @@ class RecipeSyncEngine:
         query: str,
         grams: Decimal,
         limit: int = 6,
+        offset: int = 0,
     ) -> list[ResolvedRecipeListItem]:
         """Return replacement candidates for one free-text ingredient line."""
         limit = max(1, limit)
+        offset = max(0, offset)
+        target_count = offset + limit
         candidates: list[ResolvedRecipeListItem] = []
         seen: set[tuple[str, str]] = set()
 
@@ -265,16 +286,20 @@ class RecipeSyncEngine:
                     source="часто использовался",
                 )
             )
-            if len(candidates) >= limit:
-                return candidates
+            if len(candidates) >= target_count:
+                return candidates[offset : offset + limit]
 
         clients = self._build_clients(group_id)
         try:
             first_client = next(iter(clients.values()))
             remote_candidates = await first_client.autocomplete_food(query)
-            remote_candidates.extend(await first_client.search_recipes(query))
+            search_pages = max(1, (target_count // 10) + 1)
+            for page in range(search_pages):
+                remote_candidates.extend(await first_client.search_recipes(query, page=page))
+
+            remote_resolved: list[ResolvedRecipeListItem] = []
             for remote in remote_candidates:
-                if len(candidates) >= limit:
+                if len(remote_resolved) >= target_count + 10:
                     break
                 try:
                     found = await first_client.resolve_food_detail(remote)
@@ -284,8 +309,7 @@ class RecipeSyncEngine:
                 remote_key = (found.food_id, normalize_title(found.title))
                 if remote_key in seen:
                     continue
-                seen.add(remote_key)
-                candidates.append(
+                remote_resolved.append(
                     ResolvedRecipeListItem(
                         requested_query=query,
                         grams=grams,
@@ -299,15 +323,25 @@ class RecipeSyncEngine:
                             portion_description="г",
                         ),
                         source="FatSecret",
+                        brand=found.brand or found.description,
                         energy_per_100g=found.energy_per_portion,
                         protein_per_100g=found.protein_per_portion,
                         fat_per_100g=found.fat_per_portion,
                         carbohydrate_per_100g=found.carbohydrate_per_portion,
                     )
                 )
+            remote_resolved.sort(key=lambda item: _ingredient_query_rank(query, item.ingredient.title))
+            for item in remote_resolved:
+                if len(candidates) >= target_count:
+                    break
+                remote_key = (item.ingredient.food_id, normalize_title(item.ingredient.title))
+                if remote_key in seen:
+                    continue
+                seen.add(remote_key)
+                candidates.append(item)
         finally:
             await self._close_clients(clients)
-        return candidates
+        return candidates[offset : offset + limit]
 
     async def _resolve_food_from_remote(self, client: FatSecretClient, query: str) -> FoodSearchResult | None:
         autocomplete = await client.autocomplete_food(query)

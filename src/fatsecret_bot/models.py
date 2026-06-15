@@ -93,6 +93,7 @@ class FoodSearchResult:
     food_id: str
     title: str
     description: str = ""
+    brand: str = ""
     default_portion_id: str = "0"
     energy_per_portion: Decimal | None = None
     carbohydrate_per_portion: Decimal | None = None
