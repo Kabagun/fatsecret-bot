@@ -245,6 +245,22 @@ def test_delete_recipe_removes_local_recipe_data(tmp_path) -> None:
         storage.close()
 
 
+def test_delete_unlinked_recipes_keeps_remote_mapped_recipes(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        stale_id = storage.create_recipe("Черновик", "", Decimal("1"), 0, 0, updated_by=11, group_id="g1")
+        mapped_id = storage.create_recipe("Омлет", "", Decimal("1"), 0, 0, updated_by=11, group_id="g1")
+        other_group_id = storage.create_recipe("Другое", "", Decimal("1"), 0, 0, updated_by=11, group_id="g2")
+        storage.set_remote_recipe_id(mapped_id, "tg11", "111", last_synced_version=1)
+
+        assert storage.delete_unlinked_recipes("g1") == 1
+        assert storage.get_recipe(stale_id) is None
+        assert storage.get_recipe(mapped_id) is not None
+        assert storage.get_recipe(other_group_id) is not None
+    finally:
+        storage.close()
+
+
 def test_delete_remote_recipe_id_removes_one_mapping(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

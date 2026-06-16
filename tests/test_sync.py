@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
 from fatsecret_bot.storage import Storage
-from fatsecret_bot.sync import RecipeSyncEngine
+from fatsecret_bot.sync import FatSecretError, RecipeSyncEngine, ResolvedRecipeListItem
 
 
 class FakeFatSecretClient:
@@ -60,6 +60,24 @@ class FakeSearchClient:
 
     async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
         return result
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeFailingCreateClient:
+    def __init__(self, account_key: str) -> None:
+        self.account = FatSecretAccountConfig(
+            key=account_key,
+            label=account_key,
+            username=f"{account_key}@example.com",
+            password="secret",
+            market="BY",
+            language="ru",
+        )
+
+    async def create_recipe(self, recipe: Recipe) -> str:
+        raise RuntimeError("create failed")
 
     async def close(self) -> None:
         return None
@@ -174,6 +192,43 @@ def test_recipe_list_candidates_ranks_remote_matches_before_raw_order(tmp_path) 
 
         assert len(candidates) == 1
         assert candidates[0].ingredient.title == "Куриное Филе"
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_deletes_local_recipe_when_every_account_fails(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": FakeFailingCreateClient("tg11"),
+            "tg22": FakeFailingCreateClient("tg22"),
+        }
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Филе",
+                grams=Decimal("100"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-1",
+                    title="Куриное Филе",
+                    portion_id="portion-1",
+                    amount=Decimal("100"),
+                    portion_description="г",
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        try:
+            asyncio.run(engine.create_recipe_from_list("group", "Тест", items, updated_by=11))
+        except FatSecretError as exc:
+            assert "Локальный черновик удален" in str(exc)
+        else:
+            raise AssertionError("expected FatSecretError")
+
+        assert storage.list_recipes("group") == []
     finally:
         storage.close()
 

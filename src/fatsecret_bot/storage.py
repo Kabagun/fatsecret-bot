@@ -772,6 +772,35 @@ class Storage:
         self._conn.commit()
         return True
 
+    def delete_unlinked_recipes(self, group_id: str | None = None) -> int:
+        """Delete local recipes that are not mapped to any FatSecret account."""
+        if group_id is None:
+            rows = self._conn.execute(
+                """
+                SELECT r.id
+                FROM recipes r
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM account_recipes ar WHERE ar.recipe_id = r.id
+                )
+                """
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT r.id
+                FROM recipes r
+                WHERE r.group_id = ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM account_recipes ar WHERE ar.recipe_id = r.id
+                    )
+                """,
+                (group_id,),
+            ).fetchall()
+        deleted = 0
+        for row in rows:
+            deleted += int(self.delete_recipe(row["id"]))
+        return deleted
+
     def add_ingredient(
         self,
         recipe_id: str,

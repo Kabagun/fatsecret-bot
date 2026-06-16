@@ -358,6 +358,7 @@ class RecipeSyncEngine:
         updated_by: int,
     ) -> RecipeCreateResult:
         """Create a recipe from a validated ingredient list on every FatSecret account in a group."""
+        clients = self._build_clients(group_id)
         recipe_id = self.storage.create_recipe(
             title=title,
             description="",
@@ -382,9 +383,9 @@ class RecipeSyncEngine:
         self.storage.replace_ingredients(recipe_id, ingredients)
         recipe = self.storage.get_recipe(recipe_id)
         if recipe is None:
+            await self._close_clients(clients)
             raise FatSecretError("Не удалось создать локальный рецепт.")
 
-        clients = self._build_clients(group_id)
         results: list[AccountSyncResult] = []
         try:
             for account_key, client in clients.items():
@@ -406,6 +407,13 @@ class RecipeSyncEngine:
                     results.append(AccountSyncResult(account_key, recipe.remote_ids.get(account_key), False, str(exc)))
         finally:
             await self._close_clients(clients)
+        if not self.storage.remote_ids(recipe.id):
+            self.storage.delete_recipe(recipe.id)
+            details = "; ".join(result.message for result in results) or "FatSecret не вернул remote id"
+            raise FatSecretError(
+                "FatSecret не создал рецепт ни в одном подключенном аккаунте. "
+                f"Локальный черновик удален. {details}"
+            )
         return RecipeCreateResult(recipe_id=recipe_id, results=results)
 
     async def hydrate_recipe_from_remote(self, recipe_id: str) -> Recipe | None:
