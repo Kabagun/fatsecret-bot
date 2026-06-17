@@ -417,12 +417,22 @@ class RecipeSyncEngine:
             if not search_query.strip():
                 continue
             try:
-                results = await client.search_recipes(search_query, page=0)
+                results = _dedupe_food_results(
+                    [
+                        *await client.search_recipes(search_query, page=0),
+                        *await client.autocomplete_food(search_query),
+                    ]
+                )
             except Exception:  # noqa: BLE001 - keep local candidate usable on lookup failure.
                 logger.debug("local food metadata lookup failed for %s", search_query, exc_info=True)
                 continue
             for result in results:
-                if result.food_id == ingredient.food_id:
+                if result.food_id != ingredient.food_id:
+                    continue
+                try:
+                    return await client.resolve_food_detail(result)
+                except Exception:  # noqa: BLE001 - search metadata is still better than local-only data.
+                    logger.debug("local food detail lookup failed for %s", result.title, exc_info=True)
                     return result
         return None
 
@@ -460,7 +470,9 @@ class RecipeSyncEngine:
                     local_metadata = await self._local_food_metadata(first_client, local, query)
                 except FatSecretError:
                     first_client = None
-                if local_portion_id == "0" and local_metadata is not None:
+                if first_client is not None and local_metadata is None:
+                    local = None
+                elif local_portion_id == "0" and local_metadata is not None:
                     local_portion_id = local_metadata.default_portion_id or local_portion_id
                     resolved_description = local_metadata.default_portion_description
                     if not resolved_description and _bare_weight_portion_description(local_portion_description):
@@ -476,35 +488,36 @@ class RecipeSyncEngine:
                     local_portion_description = "100г"
                 else:
                     local_portion_description = local.portion_description or "г"
-                protein = local_metadata.protein_per_portion if local_metadata is not None else None
-                fat = local_metadata.fat_per_portion if local_metadata is not None else None
-                carbohydrate = local_metadata.carbohydrate_per_portion if local_metadata is not None else None
-                seen.add(local_key)
-                local_candidates.append(
-                    ResolvedRecipeListItem(
-                        requested_query=query,
-                        grams=grams,
-                        ingredient=Ingredient(
-                            id=str(uuid.uuid4()),
-                            recipe_id="",
-                            food_id=local.food_id,
-                            title=local.title,
-                            portion_id=local_portion_id,
-                            amount=_amount_for_grams(grams, local_portion_description),
-                            portion_description=local_portion_description,
-                        ),
-                        source="часто использовался",
-                        brand=local_metadata.brand if local_metadata is not None else "",
-                        energy_per_100g=(
-                            _correct_energy(local_metadata.energy_per_portion, protein, fat, carbohydrate)
-                            if local_metadata is not None
-                            else None
-                        ),
-                        protein_per_100g=protein,
-                        fat_per_100g=fat,
-                        carbohydrate_per_100g=carbohydrate,
+                if local is not None:
+                    protein = local_metadata.protein_per_portion if local_metadata is not None else None
+                    fat = local_metadata.fat_per_portion if local_metadata is not None else None
+                    carbohydrate = local_metadata.carbohydrate_per_portion if local_metadata is not None else None
+                    seen.add(local_key)
+                    local_candidates.append(
+                        ResolvedRecipeListItem(
+                            requested_query=query,
+                            grams=grams,
+                            ingredient=Ingredient(
+                                id=str(uuid.uuid4()),
+                                recipe_id="",
+                                food_id=local.food_id,
+                                title=local.title,
+                                portion_id=local_portion_id,
+                                amount=_amount_for_grams(grams, local_portion_description),
+                                portion_description=local_portion_description,
+                            ),
+                            source="часто использовался",
+                            brand=local_metadata.brand if local_metadata is not None else "",
+                            energy_per_100g=(
+                                _correct_energy(local_metadata.energy_per_portion, protein, fat, carbohydrate)
+                                if local_metadata is not None
+                                else None
+                            ),
+                            protein_per_100g=protein,
+                            fat_per_100g=fat,
+                            carbohydrate_per_100g=carbohydrate,
+                        )
                     )
-                )
 
             candidates = local_candidates[offset : offset + limit]
             remote_offset = max(0, offset - len(local_candidates))
