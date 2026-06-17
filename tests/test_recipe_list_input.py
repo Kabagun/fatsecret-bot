@@ -4,7 +4,12 @@ from decimal import Decimal
 
 from fatsecret_bot.models import Ingredient
 from fatsecret_bot.sync import ResolvedRecipeListItem
-from fatsecret_bot.telegram_bot import _format_resolved_item, _parse_recipe_list_lines
+from fatsecret_bot.telegram_bot import (
+    _format_recipe_list_draft,
+    _format_resolved_item,
+    _parse_recipe_list_lines,
+    _parse_recipe_steps,
+)
 
 
 def test_parse_recipe_list_lines_uses_last_number_as_grams() -> None:
@@ -59,3 +64,35 @@ def test_format_resolved_item_shows_macros_per_100g_and_brand() -> None:
     )
 
     assert _format_resolved_item(item) == "- Кетчуп (Махеевъ) | 100г: 96/1.2/0.1/25.2 | масса: 25г"
+
+
+def test_parse_recipe_steps_keeps_first_three_non_empty_lines() -> None:
+    assert _parse_recipe_steps("Смешать\n\nЗапечь\nПодать\nЛишнее") == ["Смешать", "Запечь", "Подать"]
+    assert _parse_recipe_steps("-") == []
+
+
+def test_format_recipe_list_draft_includes_steps() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="филе",
+        grams=Decimal("100"),
+        ingredient=Ingredient(
+            id="i1",
+            recipe_id="",
+            food_id="f1",
+            title="Куриное Филе",
+            portion_id="p1",
+            amount=Decimal("100"),
+            portion_description="г",
+        ),
+        source="FatSecret",
+        energy_per_100g=Decimal("110"),
+        protein_per_100g=Decimal("23"),
+        fat_per_100g=Decimal("2"),
+        carbohydrate_per_100g=Decimal("0"),
+    )
+
+    text = _format_recipe_list_draft("Тест", [item], ["Смешать", "Запечь"])
+
+    assert "<b>Шаги</b>" in text
+    assert "1. Смешать" in text
+    assert "2. Запечь" in text

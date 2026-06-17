@@ -152,6 +152,40 @@ def test_remote_hydration_update_does_not_bump_version(tmp_path) -> None:
         storage.close()
 
 
+def test_recipe_steps_are_stored_and_updated_from_remote(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe(
+            "Омлет",
+            "",
+            Decimal("2"),
+            5,
+            10,
+            updated_by=1,
+            steps=["Смешать", "Запечь"],
+        )
+        recipe = storage.get_recipe(recipe_id)
+
+        assert recipe is not None
+        assert recipe.steps == ["Смешать", "Запечь"]
+
+        storage.update_recipe_from_remote(
+            recipe_id,
+            "Омлет",
+            "remote",
+            Decimal("3"),
+            1,
+            2,
+            steps=["Нарезать", "Подать"],
+        )
+        updated = storage.get_recipe(recipe_id)
+
+        assert updated is not None
+        assert updated.steps == ["Нарезать", "Подать"]
+    finally:
+        storage.close()
+
+
 def test_fatsecret_account_upsert_replaces_user_account(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

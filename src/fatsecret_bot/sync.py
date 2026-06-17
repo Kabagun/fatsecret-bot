@@ -6,6 +6,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .fatsecret_client import FatSecretClient, FatSecretError
 from .models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
@@ -67,6 +68,7 @@ class ResolvedRecipeListItem:
 class RecipeListDraft:
     items: list[ResolvedRecipeListItem]
     unresolved: list[str]
+    steps: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -213,10 +215,15 @@ def _correct_energy(
     return energy
 
 
-def _sync_description(now: dt.datetime | None = None) -> str:
-    value = now or dt.datetime.now().astimezone()
+def _sync_description(now: dt.datetime | None = None, timezone: str = "Europe/Minsk") -> str:
+    try:
+        tz = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError:
+        tz = dt.datetime.now().astimezone().tzinfo
+    value = now or dt.datetime.now(tz)
     if value.tzinfo is None:
-        value = value.astimezone()
+        value = value.replace(tzinfo=tz)
+    value = value.astimezone(tz)
     return f"Последняя синхронизация: {value:%d.%m.%Y %H:%M}"
 
 
@@ -235,6 +242,11 @@ def _amount_for_grams(grams: Decimal, portion_description: str) -> Decimal:
     if unit_size is None or unit_size == 0:
         return grams
     return grams / unit_size
+
+
+def _bare_weight_portion_description(description: str) -> bool:
+    normalized = description.strip().casefold()
+    return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}
 
 
 def _copy_remote_ingredients(recipe_id: str, ingredients: list[Ingredient]) -> list[Ingredient]:
@@ -261,6 +273,7 @@ def _copy_recipe_from_remote(recipe_id: str, remote: Recipe) -> Recipe:
         portions=remote.portions,
         prep_time=remote.prep_time,
         cook_time=remote.cook_time,
+        steps=list(remote.steps),
         default_portion_id=remote.default_portion_id,
         default_portion_description=remote.default_portion_description,
     )
@@ -269,9 +282,10 @@ def _copy_recipe_from_remote(recipe_id: str, remote: Recipe) -> Recipe:
 
 
 class RecipeSyncEngine:
-    def __init__(self, storage: Storage, device: FatSecretDeviceConfig) -> None:
+    def __init__(self, storage: Storage, device: FatSecretDeviceConfig, timezone: str = "Europe/Minsk") -> None:
         self.storage = storage
         self.device = device
+        self.timezone = timezone
 
     async def close(self) -> None:
         return None
@@ -362,6 +376,37 @@ class RecipeSyncEngine:
             resolved.append(candidates[0])
         return RecipeListDraft(items=resolved, unresolved=unresolved)
 
+    async def _local_portion_metadata(
+        self,
+        client: FatSecretClient,
+        ingredient: Ingredient,
+        query: str,
+    ) -> tuple[str, str]:
+        portion_id = ingredient.portion_id or "0"
+        portion_description = ingredient.portion_description or "г"
+        if portion_id != "0":
+            return portion_id, portion_description
+        for search_query in (ingredient.title, query):
+            if not search_query.strip():
+                continue
+            try:
+                results = await client.search_recipes(search_query, page=0)
+            except Exception:  # noqa: BLE001 - keep local candidate usable on lookup failure.
+                logger.debug("local portion metadata lookup failed for %s", search_query, exc_info=True)
+                continue
+            for result in results:
+                if result.food_id != ingredient.food_id:
+                    continue
+                resolved_description = result.default_portion_description
+                if not resolved_description and _bare_weight_portion_description(portion_description):
+                    resolved_description = "100г"
+                resolved_description = resolved_description or portion_description
+                resolved_id = result.default_portion_id or portion_id
+                return resolved_id, resolved_description
+        if _bare_weight_portion_description(portion_description):
+            return portion_id, "100г"
+        return portion_id, portion_description
+
     async def recipe_list_candidates(
         self,
         group_id: str,
@@ -375,38 +420,52 @@ class RecipeSyncEngine:
         offset = max(0, offset)
         local_candidates: list[ResolvedRecipeListItem] = []
         seen: set[tuple[str, str]] = set()
+        clients: dict[str, FatSecretClient] | None = None
+
+        def get_first_client() -> FatSecretClient:
+            nonlocal clients
+            if clients is None:
+                clients = self._build_clients(group_id)
+            return next(iter(clients.values()))
 
         local = self._frequent_local_ingredient(group_id, query)
-        if local is not None:
-            local_key = (local.food_id, normalize_title(local.title))
-            local_portion_description = local.portion_description or "г"
-            seen.add(local_key)
-            local_candidates.append(
-                ResolvedRecipeListItem(
-                    requested_query=query,
-                    grams=grams,
-                    ingredient=Ingredient(
-                        id=str(uuid.uuid4()),
-                        recipe_id="",
-                        food_id=local.food_id,
-                        title=local.title,
-                        portion_id=local.portion_id or "0",
-                        amount=_amount_for_grams(grams, local_portion_description),
-                        portion_description=local_portion_description,
-                    ),
-                    source="часто использовался",
-                )
-            )
-
-        candidates = local_candidates[offset : offset + limit]
-        remote_offset = max(0, offset - len(local_candidates))
-        remote_limit = limit - len(candidates)
-        if remote_limit <= 0:
-            return candidates
-
-        clients = self._build_clients(group_id)
         try:
-            first_client = next(iter(clients.values()))
+            if local is not None:
+                local_key = (local.food_id, normalize_title(local.title))
+                if (local.portion_id or "0") == "0":
+                    local_portion_id, local_portion_description = await self._local_portion_metadata(
+                        get_first_client(),
+                        local,
+                        query,
+                    )
+                else:
+                    local_portion_id = local.portion_id or "0"
+                    local_portion_description = local.portion_description or "г"
+                seen.add(local_key)
+                local_candidates.append(
+                    ResolvedRecipeListItem(
+                        requested_query=query,
+                        grams=grams,
+                        ingredient=Ingredient(
+                            id=str(uuid.uuid4()),
+                            recipe_id="",
+                            food_id=local.food_id,
+                            title=local.title,
+                            portion_id=local_portion_id,
+                            amount=_amount_for_grams(grams, local_portion_description),
+                            portion_description=local_portion_description,
+                        ),
+                        source="часто использовался",
+                    )
+                )
+
+            candidates = local_candidates[offset : offset + limit]
+            remote_offset = max(0, offset - len(local_candidates))
+            remote_limit = limit - len(candidates)
+            if remote_limit <= 0:
+                return candidates
+
+            first_client = get_first_client()
             raw_target_count = remote_offset + remote_limit + 10
             remote_candidates: list[FoodSearchResult] = []
             variants = _query_variants(query)
@@ -474,7 +533,8 @@ class RecipeSyncEngine:
                 seen.add(remote_key)
                 candidates.append(item)
         finally:
-            await self._close_clients(clients)
+            if clients is not None:
+                await self._close_clients(clients)
         return candidates
 
     async def _resolve_food_from_remote(self, client: FatSecretClient, query: str) -> FoodSearchResult | None:
@@ -490,10 +550,11 @@ class RecipeSyncEngine:
         title: str,
         items: list[ResolvedRecipeListItem],
         updated_by: int,
+        steps: list[str] | None = None,
     ) -> RecipeCreateResult:
         """Create a recipe from a validated ingredient list on every FatSecret account in a group."""
         clients = self._build_clients(group_id)
-        description = _sync_description()
+        description = _sync_description(timezone=self.timezone)
         recipe_id = self.storage.create_recipe(
             title=title,
             description=description,
@@ -502,6 +563,7 @@ class RecipeSyncEngine:
             cook_time=0,
             updated_by=updated_by,
             group_id=group_id,
+            steps=steps or [],
         )
         ingredients = [
             Ingredient(
@@ -520,6 +582,7 @@ class RecipeSyncEngine:
         if recipe is None:
             await self._close_clients(clients)
             raise FatSecretError("Не удалось создать локальный рецепт.")
+        recipe.steps = list(steps or [])
 
         results: list[AccountSyncResult] = []
         try:
@@ -573,6 +636,7 @@ class RecipeSyncEngine:
                     portions=remote.portions,
                     prep_time=remote.prep_time,
                     cook_time=remote.cook_time,
+                    steps=remote.steps,
                 )
                 self.storage.replace_ingredients(recipe_id, remote.ingredients)
                 return self.storage.get_recipe(recipe_id)
@@ -608,7 +672,7 @@ class RecipeSyncEngine:
             source_remote = await source_client.get_recipe(source_remote_id)
             source_recipe = _copy_recipe_from_remote(recipe.id, source_remote)
             source_recipe.title = source_recipe.title or recipe.title
-            source_recipe.description = _sync_description()
+            source_recipe.description = _sync_description(timezone=self.timezone)
             source_recipe.remote_ids = dict(recipe.remote_ids)
             self.storage.update_recipe_from_remote(
                 recipe_id=recipe.id,
@@ -617,9 +681,11 @@ class RecipeSyncEngine:
                 portions=source_recipe.portions,
                 prep_time=source_recipe.prep_time,
                 cook_time=source_recipe.cook_time,
+                steps=source_recipe.steps,
             )
             self.storage.replace_ingredients(recipe.id, source_recipe.ingredients)
             recipe = self.storage.get_recipe(recipe.id) or source_recipe
+            recipe.steps = list(source_recipe.steps)
 
             for account_key, client in clients.items():
                 try:

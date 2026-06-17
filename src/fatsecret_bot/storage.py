@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import secrets
 import sqlite3
 import string
@@ -20,6 +21,23 @@ def normalize_title(title: str) -> str:
 
 def _now() -> str:
     return dt.datetime.now(dt.UTC).isoformat()
+
+
+def _steps_to_json(steps: list[str] | None) -> str:
+    clean_steps = [step.strip() for step in steps or [] if step.strip()]
+    return json.dumps(clean_steps[:3], ensure_ascii=False)
+
+
+def _steps_from_json(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(step).strip() for step in data if str(step).strip()][:3]
 
 
 def _new_invite_code() -> str:
@@ -121,6 +139,7 @@ class Storage:
         )
         self._ensure_column("telegram_users", "active_group_id", "TEXT")
         self._ensure_column("recipes", "group_id", "TEXT")
+        self._ensure_column("recipes", "steps", "TEXT NOT NULL DEFAULT '[]'")
         self._conn.execute("DROP INDEX IF EXISTS idx_recipes_normalized_title")
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_group_title ON recipes(group_id, normalized_title)"
@@ -613,15 +632,16 @@ class Storage:
         cook_time: int,
         updated_by: int | None,
         group_id: str | None = None,
+        steps: list[str] | None = None,
     ) -> str:
         recipe_id = str(uuid.uuid4())
         self._conn.execute(
             """
             INSERT INTO recipes(
                 id, title, normalized_title, description, portions, prep_time,
-                cook_time, version, group_id, updated_by, updated_at
+                cook_time, version, group_id, updated_by, updated_at, steps
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
             """,
             (
                 recipe_id,
@@ -634,6 +654,7 @@ class Storage:
                 group_id,
                 updated_by,
                 _now(),
+                _steps_to_json(steps),
             ),
         )
         self._conn.commit()
@@ -679,25 +700,47 @@ class Storage:
         portions: Decimal,
         prep_time: int,
         cook_time: int,
+        steps: list[str] | None = None,
     ) -> None:
-        self._conn.execute(
-            """
-            UPDATE recipes
-            SET title = ?, normalized_title = ?, description = ?, portions = ?,
-                prep_time = ?, cook_time = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                title,
-                normalize_title(title),
-                description,
-                str(portions),
-                prep_time,
-                cook_time,
-                _now(),
-                recipe_id,
-            ),
-        )
+        if steps is None:
+            self._conn.execute(
+                """
+                UPDATE recipes
+                SET title = ?, normalized_title = ?, description = ?, portions = ?,
+                    prep_time = ?, cook_time = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    title,
+                    normalize_title(title),
+                    description,
+                    str(portions),
+                    prep_time,
+                    cook_time,
+                    _now(),
+                    recipe_id,
+                ),
+            )
+        else:
+            self._conn.execute(
+                """
+                UPDATE recipes
+                SET title = ?, normalized_title = ?, description = ?, portions = ?,
+                    prep_time = ?, cook_time = ?, steps = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    title,
+                    normalize_title(title),
+                    description,
+                    str(portions),
+                    prep_time,
+                    cook_time,
+                    _steps_to_json(steps),
+                    _now(),
+                    recipe_id,
+                ),
+            )
         self._conn.commit()
 
     def get_recipe(self, recipe_id: str) -> Recipe | None:
@@ -711,6 +754,7 @@ class Storage:
             portions=Decimal(row["portions"]),
             prep_time=int(row["prep_time"]),
             cook_time=int(row["cook_time"]),
+            steps=_steps_from_json(row["steps"]),
             default_portion_id="0",
             version=int(row["version"]),
             group_id=row["group_id"],

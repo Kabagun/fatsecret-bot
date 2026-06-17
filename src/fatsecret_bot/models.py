@@ -70,6 +70,7 @@ class Recipe:
     portions: Decimal = Decimal("1")
     prep_time: int = 0
     cook_time: int = 0
+    steps: list[str] = field(default_factory=list)
     default_portion_id: str = "0"
     default_portion_description: str = ""
     version: int = 1

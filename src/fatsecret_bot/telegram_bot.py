@@ -57,12 +57,19 @@ def _format_recipe(recipe: Recipe) -> str:
     if not ingredients:
         ingredients = "Ингредиентов пока нет."
     description = f"\n\n{html.escape(recipe.description)}" if recipe.description else ""
+    steps = "\n".join(
+        f"{index}. {html.escape(step)}"
+        for index, step in enumerate(recipe.steps, start=1)
+        if step.strip()
+    )
+    steps_text = f"\n\n<b>Шаги</b>\n{steps}" if steps else ""
     return (
         f"<b>{html.escape(recipe.title)}</b>\n"
         f"Порций: {_format_decimal_plain(recipe.portions)}; "
         f"подготовка: {recipe.prep_time} мин; готовка: {recipe.cook_time} мин"
         f"{description}\n\n"
         f"<b>Ингредиенты</b>\n{ingredients}"
+        f"{steps_text}"
     )
 
 
@@ -125,36 +132,15 @@ def _recipe_actions_keyboard(
     page_action: str = "list",
     total_pages: int = 1,
 ) -> InlineKeyboardMarkup:
-    total_pages = max(1, total_pages)
-    page = min(max(0, page), total_pages - 1)
     page_action = page_action if page_action in {"list", "searchpage"} else "list"
-    buttons: list[list[InlineKeyboardButton]] = []
-    nav: list[InlineKeyboardButton] = []
-    if total_pages > 1:
-        nav.append(
-            InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}" if page > 0 else "noop:0")
-        )
-        nav.append(
-            InlineKeyboardButton(
-                "Дальше",
-                callback_data=f"{page_action}:{page + 1}" if page + 1 < total_pages else "noop:0",
-            )
-        )
-        buttons.append(nav)
-    buttons.append(
+    page = max(0, page)
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("Поиск", callback_data="search:0"),
-            InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0"),
+            [InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")],
+            [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}")],
+            [InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")],
         ]
     )
-    buttons.append([InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")])
-    buttons.append(
-        [
-            InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}"),
-            InlineKeyboardButton("В меню", callback_data="menu:0"),
-        ]
-    )
-    return InlineKeyboardMarkup(buttons)
 
 
 def _recipe_owner_text(recipe: Recipe, account_labels: dict[str, str]) -> str:
@@ -203,6 +189,13 @@ def _parse_recipe_list_lines(text: str) -> tuple[list[RecipeListItem], list[str]
     return items, bad_lines
 
 
+def _parse_recipe_steps(text: str) -> list[str]:
+    value = text.strip()
+    if value == "-":
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()][:3]
+
+
 def _format_decimal(value: Decimal | None, digits: int = 1) -> str:
     if value is None:
         return "-"
@@ -244,11 +237,16 @@ def _sum_known_macros(values: list[Decimal | None]) -> Decimal | None:
     return sum(known, Decimal("0"))
 
 
-def _format_recipe_list_draft(title: str, items: list[ResolvedRecipeListItem]) -> str:
+def _format_recipe_list_draft(
+    title: str,
+    items: list[ResolvedRecipeListItem],
+    steps: list[str] | None = None,
+) -> str:
     energy = _sum_known_macros([_scaled_macro(item.energy_per_100g, item.grams) for item in items])
     protein = _sum_known_macros([_scaled_macro(item.protein_per_100g, item.grams) for item in items])
     fat = _sum_known_macros([_scaled_macro(item.fat_per_100g, item.grams) for item in items])
     carbs = _sum_known_macros([_scaled_macro(item.carbohydrate_per_100g, item.grams) for item in items])
+    steps = steps or []
     lines = [
         f"<b>Рецепт: {html.escape(title)}</b>",
         f"Итого ккал/Б/Ж/У: {_format_decimal(energy, 0)}/{_format_decimal(protein)}/{_format_decimal(fat)}/{_format_decimal(carbs)}",
@@ -256,10 +254,12 @@ def _format_recipe_list_draft(title: str, items: list[ResolvedRecipeListItem]) -
         "<b>Ингредиенты</b>",
         *(_format_resolved_item(item) for item in items),
     ]
+    if steps:
+        lines.extend(["", "<b>Шаги</b>", *(f"{index}. {html.escape(step)}" for index, step in enumerate(steps, start=1))])
     return "\n".join(lines)
 
 
-def _recipe_list_draft_keyboard(items: list[ResolvedRecipeListItem]) -> InlineKeyboardMarkup:
+def _recipe_list_draft_keyboard(items: list[ResolvedRecipeListItem], steps: list[str] | None = None) -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(
@@ -270,6 +270,9 @@ def _recipe_list_draft_keyboard(items: list[ResolvedRecipeListItem]) -> InlineKe
         for index, item in enumerate(items)
     ]
     buttons.append([InlineKeyboardButton("Изменить имя", callback_data="recipe_list_rename:0")])
+    buttons.append(
+        [InlineKeyboardButton("Изменить шаги" if steps else "Шаги", callback_data="recipe_list_steps:0")]
+    )
     buttons.append([InlineKeyboardButton("Создать рецепт", callback_data="recipe_list_confirm:0")])
     buttons.append([InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")])
     return InlineKeyboardMarkup(buttons)
@@ -644,12 +647,7 @@ class TelegramRecipeBot:
                 InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0"),
             ]
         )
-        buttons.append(
-            [
-                InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}"),
-                InlineKeyboardButton("В меню", callback_data="menu:0"),
-            ]
-        )
+        buttons.append([InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}")])
         return InlineKeyboardMarkup(buttons)
 
     def _filter_recipes(self, query: str, group_id: str) -> list[Recipe]:
@@ -821,6 +819,8 @@ class TelegramRecipeBot:
             await self._show_recipe_list_replacements(query, context, int(value or "0"))
         elif action == "recipe_list_rename":
             await self._start_recipe_list_rename(query, context)
+        elif action == "recipe_list_steps":
+            await self._start_recipe_list_steps(query, context)
         elif action == "recipe_list_back":
             await self._edit_recipe_list_draft(query, context)
         elif action == "recipe_list_cancel":
@@ -1435,6 +1435,8 @@ class TelegramRecipeBot:
             await self._handle_recipe_list_items(update, context, text)
         elif mode == "recipe_list_rename":
             await self._handle_recipe_list_rename(update, context, text)
+        elif mode == "recipe_list_steps":
+            await self._handle_recipe_list_steps(update, context, text)
         elif mode == "recipe_list_replace_query":
             await self._handle_recipe_list_replace_query(update, context, text)
         elif mode == "group_create":
@@ -1694,6 +1696,26 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _start_recipe_list_steps(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        draft_items = context.user_data.get("recipe_list_draft")
+        if not title or not isinstance(draft_items, list):
+            await query.edit_message_text(
+                "Черновик устарел. Начни создание заново из списка рецептов.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            )
+            return
+        context.user_data["mode"] = "recipe_list_steps"
+        await query.edit_message_text(
+            "Пришли шаги приготовления, каждый шаг с новой строки.\n"
+            "Сохраню первые 3 шага в FatSecret.\n\n"
+            "Отправь <code>-</code>, чтобы очистить шаги.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
     async def _handle_recipe_list_rename(
         self,
         update: Update,
@@ -1711,9 +1733,32 @@ class TelegramRecipeBot:
             return
         context.user_data["recipe_list_title"] = title
         context.user_data["mode"] = "recipe_list_confirm"
+        steps = context.user_data.get("recipe_list_steps")
+        steps = steps if isinstance(steps, list) else []
         await update.effective_message.reply_text(
-            _format_recipe_list_draft(title, draft_items),
-            reply_markup=_recipe_list_draft_keyboard(draft_items),
+            _format_recipe_list_draft(title, draft_items, steps),
+            reply_markup=_recipe_list_draft_keyboard(draft_items, steps),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _handle_recipe_list_steps(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        draft_items = context.user_data.get("recipe_list_draft")
+        if not title or not isinstance(draft_items, list):
+            context.user_data.clear()
+            await update.effective_message.reply_text("Черновик устарел. Начни создание заново из списка рецептов.")
+            return
+        steps = _parse_recipe_steps(text)
+        context.user_data["recipe_list_steps"] = steps
+        context.user_data["mode"] = "recipe_list_confirm"
+        await update.effective_message.reply_text(
+            _format_recipe_list_draft(title, draft_items, steps),
+            reply_markup=_recipe_list_draft_keyboard(draft_items, steps),
             parse_mode=ParseMode.HTML,
         )
 
@@ -1756,9 +1801,10 @@ class TelegramRecipeBot:
             return
         context.user_data["recipe_list_draft"] = draft.items
         context.user_data["mode"] = "recipe_list_confirm"
+        context.user_data["recipe_list_steps"] = []
         await status.edit_text(
-            _format_recipe_list_draft(title, draft.items),
-            reply_markup=_recipe_list_draft_keyboard(draft.items),
+            _format_recipe_list_draft(title, draft.items, []),
+            reply_markup=_recipe_list_draft_keyboard(draft.items, []),
             parse_mode=ParseMode.HTML,
         )
 
@@ -1777,9 +1823,11 @@ class TelegramRecipeBot:
         context.user_data.pop("recipe_list_candidates_cache", None)
         context.user_data.pop("recipe_list_candidates_exhausted", None)
         context.user_data.pop("recipe_list_replace_query", None)
+        steps = context.user_data.get("recipe_list_steps")
+        steps = steps if isinstance(steps, list) else []
         await query.edit_message_text(
-            _format_recipe_list_draft(title, draft_items),
-            reply_markup=_recipe_list_draft_keyboard(draft_items),
+            _format_recipe_list_draft(title, draft_items, steps),
+            reply_markup=_recipe_list_draft_keyboard(draft_items, steps),
             parse_mode=ParseMode.HTML,
         )
 
@@ -1974,12 +2022,20 @@ class TelegramRecipeBot:
         title = str(context.user_data.get("recipe_list_title") or "").strip()
         group_id = context.user_data.get("group_id")
         draft_items = context.user_data.get("recipe_list_draft")
+        steps = context.user_data.get("recipe_list_steps")
         if not title or not group_id or not isinstance(draft_items, list):
             await query.edit_message_text("Черновик устарел. Начни создание заново из списка рецептов.")
             return
+        steps = steps if isinstance(steps, list) else []
         await query.edit_message_text("Создаю рецепт в FatSecret аккаунтах группы...")
         try:
-            created = await self.sync_engine.create_recipe_from_list(str(group_id), title, draft_items, telegram_id)
+            created = await self.sync_engine.create_recipe_from_list(
+                str(group_id),
+                title,
+                draft_items,
+                telegram_id,
+                steps=steps,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list create failed")
             await query.edit_message_text(

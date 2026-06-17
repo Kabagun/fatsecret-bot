@@ -7,7 +7,7 @@ from urllib.parse import parse_qs
 import httpx
 
 from fatsecret_bot.fatsecret_client import FatSecretClient, FatSecretError, parse_recipe_initial_save_response
-from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession, Ingredient
+from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession, Ingredient, Recipe
 
 
 def _client() -> FatSecretClient:
@@ -182,3 +182,48 @@ def test_add_ingredient_sends_prepared_portion_amount() -> None:
     form = parse_qs(requests[0].content.decode())
     assert form["action"] == ["ingredientsave"]
     assert form["portionamount"] == ["3"]
+
+
+def test_save_recipe_meta_posts_recipe_steps() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="True")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+    )
+    client._session = FatSecretSession(server_id="server", device_key="device", secret_key="secret")
+    try:
+        ok = asyncio.run(
+            client.save_recipe_meta(
+                Recipe(
+                    id="local",
+                    title="Омлет",
+                    description="desc",
+                    steps=["Смешать", "Запечь", "Подать", "Лишнее"],
+                ),
+                "recipe-1",
+            )
+        )
+    finally:
+        asyncio.run(http.aclose())
+
+    assert ok is True
+    form = parse_qs(requests[0].content.decode())
+    assert form["action"] == ["recipesave"]
+    assert form["step1"] == ["Смешать"]
+    assert form["step2"] == ["Запечь"]
+    assert form["step3"] == ["Подать"]

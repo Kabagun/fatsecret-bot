@@ -16,6 +16,7 @@ class BotConfig:
     db_path: Path
     default_market: str
     default_language: str
+    timezone: str
     device: FatSecretDeviceConfig
 
 
@@ -50,6 +51,7 @@ def load_config(env_file: str | Path = ".env") -> BotConfig:
 
     default_market = _getenv("FATSECRET_MKT", "BY")
     default_language = _getenv("FATSECRET_LANG", "ru")
+    timezone = _getenv("FATSECRET_BOT_TIMEZONE", "Europe/Minsk")
     db_path = Path(_getenv("FATSECRET_BOT_DB_PATH", "temp/state/fatsecret_bot.sqlite3"))
 
     device = FatSecretDeviceConfig(
@@ -71,5 +73,6 @@ def load_config(env_file: str | Path = ".env") -> BotConfig:
         db_path=db_path,
         default_market=default_market,
         default_language=default_language,
+        timezone=timezone,
         device=device,
     )

@@ -118,6 +118,10 @@ def _form_decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
 
+def _recipe_step(recipe: Recipe, index: int) -> str:
+    return recipe.steps[index] if index < len(recipe.steps) else ""
+
+
 def _looks_like_true(text: str) -> bool:
     normalized = text.strip().lower()
     if normalized in {"true", "1", "ok", "yes"}:
@@ -266,9 +270,9 @@ class FatSecretClient:
             "preptime": str(recipe.prep_time),
             "cooktime": str(recipe.cook_time),
             "osharing": "false",
-            "step1": "",
-            "step2": "",
-            "step3": "",
+            "step1": _recipe_step(recipe, 0),
+            "step2": _recipe_step(recipe, 1),
+            "step3": _recipe_step(recipe, 2),
             "fl": "7",
         }
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
@@ -416,6 +420,15 @@ class FatSecretClient:
             portions=_decimal(_text(root, "servings"), Decimal("1")) or Decimal("1"),
             prep_time=_int(_text(root, "preparationtimemin")),
             cook_time=_int(_text(root, "cookingtimemin")),
+            steps=[
+                step
+                for step in (
+                    _text(root, "step1"),
+                    _text(root, "step2"),
+                    _text(root, "step3"),
+                )
+                if step
+            ],
             default_portion_id=_text(root, "defaultPortionID", "0"),
             default_portion_description=_text(root, "defaultPortionDescription"),
         )

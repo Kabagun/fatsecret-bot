@@ -17,7 +17,7 @@ def main() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     config = load_config()
     storage = Storage(config.db_path)
-    sync_engine = RecipeSyncEngine(storage, config.device)
+    sync_engine = RecipeSyncEngine(storage, config.device, timezone=config.timezone)
     bot = TelegramRecipeBot(
         token=config.telegram_token,
         allowed_user_ids=config.allowed_user_ids,

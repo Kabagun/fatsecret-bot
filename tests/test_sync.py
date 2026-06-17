@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 from decimal import Decimal
 
 from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
 from fatsecret_bot.storage import Storage
-from fatsecret_bot.sync import FatSecretError, RecipeSyncEngine, ResolvedRecipeListItem
+from fatsecret_bot.sync import FatSecretError, RecipeSyncEngine, ResolvedRecipeListItem, _sync_description
 
 
 class FakeFatSecretClient:
@@ -46,7 +47,11 @@ class FakeFatSecretClient:
 
 
 class FakeSearchClient:
-    def __init__(self, results: list[FoodSearchResult]) -> None:
+    def __init__(
+        self,
+        results: list[FoodSearchResult],
+        search_results: list[FoodSearchResult] | None = None,
+    ) -> None:
         self.account = FatSecretAccountConfig(
             key="search",
             label="search",
@@ -56,12 +61,13 @@ class FakeSearchClient:
             language="ru",
         )
         self.results = results
+        self.search_results = search_results if search_results is not None else []
 
     async def autocomplete_food(self, query: str) -> list[FoodSearchResult]:
         return list(self.results)
 
     async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
-        return []
+        return list(self.search_results)
 
     async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
         return result
@@ -205,6 +211,36 @@ def test_recipe_list_candidates_prefers_frequent_local_shorter_tie(tmp_path) -> 
         assert candidates[0].ingredient.amount == Decimal("300")
         assert candidates[0].ingredient.portion_description == "г"
         assert candidates[0].source == "часто использовался"
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_repairs_local_zero_portion_with_search_metadata(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        recipe_id = storage.create_recipe("A", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
+        storage.add_ingredient(recipe_id, "food-oil", "Масло Растительное", "0", Decimal("10"), "г")
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="food-oil",
+                    title="Масло Растительное",
+                    default_portion_id="0",
+                    default_portion_description="100г",
+                )
+            ],
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "масло", Decimal("10"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.portion_description == "100г"
+        assert candidates[0].ingredient.amount == Decimal("0.1")
     finally:
         storage.close()
 
@@ -363,12 +399,27 @@ def test_create_recipe_from_list_uses_last_sync_description(tmp_path) -> None:
             )
         ]
 
-        asyncio.run(engine.create_recipe_from_list("group", "Тест", items, updated_by=11))
+        asyncio.run(
+            engine.create_recipe_from_list(
+                "group",
+                "Тест",
+                items,
+                updated_by=11,
+                steps=["Смешать", "Запечь"],
+            )
+        )
 
         assert client.created_recipe is not None
         assert client.created_recipe.description.startswith("Последняя синхронизация: ")
+        assert client.created_recipe.steps == ["Смешать", "Запечь"]
     finally:
         storage.close()
+
+
+def test_sync_description_uses_configured_timezone() -> None:
+    value = _sync_description(dt.datetime(2026, 6, 17, 12, 50, tzinfo=dt.UTC), timezone="Europe/Minsk")
+
+    assert value == "Последняя синхронизация: 17.06.2026 15:50"
 
 
 def test_sync_recipe_updates_source_description_with_last_sync(tmp_path) -> None:

@@ -16,6 +16,7 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
         prep_time=30,
         cook_time=10,
         remote_ids={"tg1": "123"},
+        steps=["Смешать", "Запечь"],
         ingredients=[
             Ingredient(
                 id="i1",
@@ -54,20 +55,24 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     assert "- Яичный Белок: 125.25г" in text
     assert "- Соус: 0.06 порции" in text
     assert "- Кетчуп: 300г" in text
+    assert "<b>Шаги</b>" in text
+    assert "1. Смешать" in text
 
 
-def test_recipe_actions_keyboard_uses_navigation_without_page_label() -> None:
+def test_recipe_actions_keyboard_keeps_only_recipe_actions_and_list_return() -> None:
     keyboard = _recipe_actions_keyboard("recipe-1", page=1, page_action="list", total_pages=3)
     rows = keyboard.inline_keyboard
 
-    assert [button.text for button in rows[0]] == ["Назад", "Дальше"]
-    assert all("/" not in button.text for button in rows[0])
+    assert [button.text for button in rows[0]] == ["Синхронизировать"]
+    assert [button.text for button in rows[1]] == ["Удалить в FatSecret"]
+    assert [button.text for button in rows[2]] == ["К списку"]
+    assert rows[2][0].callback_data == "list:1"
     flat_texts = [button.text for row in rows for button in row]
-    assert "Поиск" in flat_texts
-    assert "Создать из списка" in flat_texts
-    assert "Синхронизировать" in flat_texts
-    assert "Удалить в FatSecret" in flat_texts
-    assert "В меню" in flat_texts
+    assert "Назад" not in flat_texts
+    assert "Дальше" not in flat_texts
+    assert "Поиск" not in flat_texts
+    assert "Создать из списка" not in flat_texts
+    assert "В меню" not in flat_texts
 
 
 def test_recipe_actions_keyboard_keeps_actions_without_navigation() -> None:
@@ -96,7 +101,7 @@ def test_recipe_list_keyboard_keeps_recipe_buttons_navigation_and_actions_inline
     assert "Поиск" in flat_texts
     assert "Создать из списка" in flat_texts
     assert "Удалить несколько" in flat_texts
-    assert "В меню" in flat_texts
+    assert "В меню" not in flat_texts
 
 
 def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path) -> None:
