@@ -5,7 +5,7 @@ from urllib.parse import parse_qs
 
 import httpx
 
-from fatsecret_bot.fatsecret_client import FatSecretClient, parse_recipe_initial_save_response
+from fatsecret_bot.fatsecret_client import FatSecretClient, FatSecretError, parse_recipe_initial_save_response
 from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession
 
 
@@ -70,6 +70,16 @@ def test_parse_recipe_ingredients() -> None:
 def test_parse_recipe_initial_save_response() -> None:
     assert parse_recipe_initial_save_response("SUCCESS:129226840") == "129226840"
     assert parse_recipe_initial_save_response("129226840") == "129226840"
+
+
+def test_parse_recipe_initial_save_response_explains_rejected_save() -> None:
+    try:
+        parse_recipe_initial_save_response("Невозможно сохранить. Пожалуйста, попробуйте еще раз позже.")
+    except FatSecretError as exc:
+        assert "FatSecret отклонил создание рецепта на первом шаге" in str(exc)
+        assert "другое имя" in str(exc)
+    else:
+        raise AssertionError("expected FatSecretError")
 
 
 def test_delete_recipe_posts_recipedelete_form() -> None:

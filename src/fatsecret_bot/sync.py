@@ -110,21 +110,104 @@ def _ingredient_needs_update(target: Ingredient, source: Ingredient) -> bool:
     )
 
 
-def _ingredient_query_rank(query: str, title: str) -> tuple[int, int, int, int, int, str]:
+def _rank_text(query: str, title: str, search_text: str) -> tuple[int, int, int, int, int, int, str]:
     normalized_query = normalize_title(query)
     normalized_title = normalize_title(title)
+    normalized_search_text = normalize_title(search_text)
     terms = normalized_query.split()
     words = set(normalized_title.split())
     all_terms_as_words = all(term in words for term in terms)
     all_terms_present = all(term in normalized_title for term in terms)
+    missing_terms = sum(1 for term in terms if term not in normalized_search_text)
+    title_missing_terms = sum(1 for term in terms if term not in normalized_title)
     return (
+        missing_terms,
         0 if normalized_title == normalized_query else 1,
-        0 if all_terms_as_words else 1,
+        title_missing_terms,
         0 if all_terms_present else 1,
+        0 if all_terms_as_words else 1,
         len(normalized_title.split()),
         len(normalized_title),
         normalized_title,
     )
+
+
+def _ingredient_query_rank(query: str, title: str) -> tuple[int, int, int, int, int, int, str]:
+    return _rank_text(query, title, title)
+
+
+def _food_search_text(result: FoodSearchResult) -> str:
+    raw_values: list[str] = []
+    for value in result.raw.values():
+        if isinstance(value, (str, int, float, Decimal)):
+            raw_values.append(str(value))
+        elif isinstance(value, dict):
+            raw_values.extend(str(item) for item in value.values() if isinstance(item, (str, int, float, Decimal)))
+    return " ".join([result.title, result.brand, result.description, *raw_values])
+
+
+def _resolved_search_text(item: ResolvedRecipeListItem) -> str:
+    return " ".join([item.ingredient.title, item.brand])
+
+
+def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int, int, int, int, int, int, str]:
+    return _rank_text(query, result.title, _food_search_text(result))
+
+
+def _resolved_candidate_rank(query: str, item: ResolvedRecipeListItem) -> tuple[int, int, int, int, int, int, str]:
+    return _rank_text(query, item.ingredient.title, _resolved_search_text(item))
+
+
+def _query_variants(query: str) -> list[str]:
+    normalized = query.strip()
+    terms = normalized.split()
+    variants: list[str] = []
+    for candidate in [
+        normalized,
+        " ".join(terms[1:]) if len(terms) > 2 else "",
+        " ".join(terms[-2:]) if len(terms) > 1 else "",
+        *(term for term in terms if len(term) > 2),
+    ]:
+        candidate = candidate.strip()
+        if candidate and candidate.casefold() not in {item.casefold() for item in variants}:
+            variants.append(candidate)
+    return variants[:4] or [normalized]
+
+
+def _dedupe_food_results(results: list[FoodSearchResult]) -> list[FoodSearchResult]:
+    deduped: list[FoodSearchResult] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in results:
+        key = (item.food_id, normalize_title(item.title), normalize_title(item.brand or item.description))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _macro_energy(
+    protein: Decimal | None,
+    fat: Decimal | None,
+    carbohydrate: Decimal | None,
+) -> Decimal | None:
+    if protein is None or fat is None or carbohydrate is None:
+        return None
+    return protein * Decimal("4") + fat * Decimal("9") + carbohydrate * Decimal("4")
+
+
+def _correct_energy(
+    energy: Decimal | None,
+    protein: Decimal | None,
+    fat: Decimal | None,
+    carbohydrate: Decimal | None,
+) -> Decimal | None:
+    calculated = _macro_energy(protein, fat, carbohydrate)
+    if energy is None:
+        return calculated
+    if calculated is not None and calculated > 0 and energy < calculated * Decimal("0.5"):
+        return calculated
+    return energy
 
 
 def _copy_remote_ingredients(recipe_id: str, ingredients: list[Ingredient]) -> list[Ingredient]:
@@ -262,15 +345,14 @@ class RecipeSyncEngine:
         """Return replacement candidates for one free-text ingredient line."""
         limit = max(1, limit)
         offset = max(0, offset)
-        target_count = offset + limit
-        candidates: list[ResolvedRecipeListItem] = []
+        local_candidates: list[ResolvedRecipeListItem] = []
         seen: set[tuple[str, str]] = set()
 
         local = self._frequent_local_ingredient(group_id, query)
         if local is not None:
             local_key = (local.food_id, normalize_title(local.title))
             seen.add(local_key)
-            candidates.append(
+            local_candidates.append(
                 ResolvedRecipeListItem(
                     requested_query=query,
                     grams=grams,
@@ -286,20 +368,39 @@ class RecipeSyncEngine:
                     source="часто использовался",
                 )
             )
-            if len(candidates) >= target_count:
-                return candidates[offset : offset + limit]
+
+        candidates = local_candidates[offset : offset + limit]
+        remote_offset = max(0, offset - len(local_candidates))
+        remote_limit = limit - len(candidates)
+        if remote_limit <= 0:
+            return candidates
 
         clients = self._build_clients(group_id)
         try:
             first_client = next(iter(clients.values()))
-            remote_candidates = await first_client.autocomplete_food(query)
-            search_pages = max(1, (target_count // 10) + 1)
+            raw_target_count = remote_offset + remote_limit + 10
+            remote_candidates: list[FoodSearchResult] = []
+            variants = _query_variants(query)
+            for variant in variants:
+                remote_candidates.extend(await first_client.autocomplete_food(variant))
+
+            search_pages = max(1, (raw_target_count // 10) + 1)
             for page in range(search_pages):
                 remote_candidates.extend(await first_client.search_recipes(query, page=page))
 
+            if len(_dedupe_food_results(remote_candidates)) < raw_target_count:
+                for variant in variants[1:]:
+                    remote_candidates.extend(await first_client.search_recipes(variant, page=0))
+                    if len(_dedupe_food_results(remote_candidates)) >= raw_target_count:
+                        break
+
+            remote_candidates = _dedupe_food_results(remote_candidates)
+            remote_candidates.sort(key=lambda item: _food_result_rank(query, item))
+            remote_candidates = remote_candidates[remote_offset : remote_offset + remote_limit + 5]
+
             remote_resolved: list[ResolvedRecipeListItem] = []
             for remote in remote_candidates:
-                if len(remote_resolved) >= target_count + 10:
+                if len(remote_resolved) >= remote_limit:
                     break
                 try:
                     found = await first_client.resolve_food_detail(remote)
@@ -309,6 +410,9 @@ class RecipeSyncEngine:
                 remote_key = (found.food_id, normalize_title(found.title))
                 if remote_key in seen:
                     continue
+                protein = found.protein_per_portion
+                fat = found.fat_per_portion
+                carbohydrate = found.carbohydrate_per_portion
                 remote_resolved.append(
                     ResolvedRecipeListItem(
                         requested_query=query,
@@ -324,15 +428,15 @@ class RecipeSyncEngine:
                         ),
                         source="FatSecret",
                         brand=found.brand or found.description,
-                        energy_per_100g=found.energy_per_portion,
-                        protein_per_100g=found.protein_per_portion,
-                        fat_per_100g=found.fat_per_portion,
-                        carbohydrate_per_100g=found.carbohydrate_per_portion,
+                        energy_per_100g=_correct_energy(found.energy_per_portion, protein, fat, carbohydrate),
+                        protein_per_100g=protein,
+                        fat_per_100g=fat,
+                        carbohydrate_per_100g=carbohydrate,
                     )
                 )
-            remote_resolved.sort(key=lambda item: _ingredient_query_rank(query, item.ingredient.title))
+            remote_resolved.sort(key=lambda item: _resolved_candidate_rank(query, item))
             for item in remote_resolved:
-                if len(candidates) >= target_count:
+                if len(candidates) >= limit:
                     break
                 remote_key = (item.ingredient.food_id, normalize_title(item.ingredient.title))
                 if remote_key in seen:
@@ -341,7 +445,7 @@ class RecipeSyncEngine:
                 candidates.append(item)
         finally:
             await self._close_clients(clients)
-        return candidates[offset : offset + limit]
+        return candidates
 
     async def _resolve_food_from_remote(self, client: FatSecretClient, query: str) -> FoodSearchResult | None:
         autocomplete = await client.autocomplete_food(query)

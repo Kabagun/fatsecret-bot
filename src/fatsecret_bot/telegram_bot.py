@@ -23,7 +23,7 @@ from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 logger = logging.getLogger(__name__)
 RECIPES_PAGE_SIZE = 8
 RECIPE_LIST_CANDIDATES_PAGE_SIZE = 10
-RECIPE_LIST_CANDIDATES_PREFETCH_PAGES = 5
+RECIPE_LIST_CANDIDATES_PREFETCH_PAGES = 2
 RECIPE_LIST_CANDIDATES_PREFETCH_SIZE = RECIPE_LIST_CANDIDATES_PAGE_SIZE * RECIPE_LIST_CANDIDATES_PREFETCH_PAGES
 MAIN_BUTTONS = {"Рецепты", "Группы", "Аккаунты"}
 RECIPE_LIST_LINE_RE = re.compile(r"^(?P<name>.+?)\s+(?P<grams>\d+(?:[,.]\d+)?)$")
@@ -80,15 +80,42 @@ def _format_ingredient_amount(amount: Decimal, portion_description: str) -> str:
     return f"{number} {unit}"
 
 
-def _recipe_actions_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
+def _parse_open_recipe_value(value: str) -> tuple[str, int, str]:
+    recipe_id, _, rest = value.partition(":")
+    raw_page, _, raw_page_action = rest.partition(":")
+    try:
+        page = max(0, int(raw_page or "0"))
+    except ValueError:
+        page = 0
+    page_action = raw_page_action if raw_page_action in {"list", "searchpage"} else "list"
+    return recipe_id, page, page_action
+
+
+def _recipe_actions_keyboard(
+    recipe_id: str,
+    page: int = 0,
+    page_action: str = "list",
+    total_pages: int = 1,
+) -> InlineKeyboardMarkup:
+    total_pages = max(1, total_pages)
+    page = min(max(0, page), total_pages - 1)
+    page_action = page_action if page_action in {"list", "searchpage"} else "list"
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"{page_action}:{page}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton("Дальше", callback_data=f"{page_action}:{page + 1}"))
     return InlineKeyboardMarkup(
         [
+            nav,
             [
-                InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}"),
-                InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}"),
+                InlineKeyboardButton("Поиск", callback_data="search:0"),
+                InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0"),
             ],
+            [InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")],
             [
-                InlineKeyboardButton("К списку", callback_data="list:0"),
+                InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}"),
                 InlineKeyboardButton("В меню", callback_data="menu:0"),
             ],
         ]
@@ -546,7 +573,12 @@ class TelegramRecipeBot:
         start = page * RECIPES_PAGE_SIZE
         current = recipes[start : start + RECIPES_PAGE_SIZE]
         buttons = [
-            [InlineKeyboardButton(_recipe_list_button_text(recipe, account_labels), callback_data=f"open:{recipe.id}")]
+            [
+                InlineKeyboardButton(
+                    _recipe_list_button_text(recipe, account_labels),
+                    callback_data=f"open:{recipe.id}:{page}:{page_action}",
+                )
+            ]
             for recipe in current
         ]
         nav: list[InlineKeyboardButton] = []
@@ -605,8 +637,8 @@ class TelegramRecipeBot:
         action, _, value = query.data.partition(":")
 
         if action == "open":
-            context.user_data.clear()
-            await self._open_recipe(query, value)
+            context.user_data.pop("mode", None)
+            await self._open_recipe(query, context, value)
         elif action == "menu":
             context.user_data.clear()
             await query.edit_message_text("Главное меню. Выбери действие на клавиатуре снизу.")
@@ -852,7 +884,26 @@ class TelegramRecipeBot:
             return
         await query.edit_message_text(f"Готово. Импортировано/смёржено записей: {imported}.")
 
-    async def _open_recipe(self, query, recipe_id: str) -> None:
+    def _recipe_detail_page_count(
+        self,
+        telegram_id: int,
+        context: ContextTypes.DEFAULT_TYPE,
+        page_action: str,
+    ) -> tuple[int, str]:
+        group = self.storage.active_group_for_user(telegram_id)
+        if group is None:
+            return 1, "list"
+        if page_action == "searchpage":
+            search_query = str(context.user_data.get("recipe_search_query") or "").strip()
+            group_id = context.user_data.get("group_id")
+            if search_query and group_id == group.id:
+                recipes = self._filter_recipes(search_query, group.id)
+                return max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE), "searchpage"
+        recipes = self.storage.list_recipes(group.id)
+        return max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE), "list"
+
+    async def _open_recipe(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
+        recipe_id, page, page_action = _parse_open_recipe_value(value)
         local_recipe = self.storage.get_recipe(recipe_id)
         if not await self._require_recipe_in_active_group(query, local_recipe):
             return
@@ -860,9 +911,10 @@ class TelegramRecipeBot:
         if recipe is None:
             await query.edit_message_text("Рецепт не найден.")
             return
+        total_pages, page_action = self._recipe_detail_page_count(query.from_user.id, context, page_action)
         await query.edit_message_text(
             _format_recipe(recipe),
-            reply_markup=_recipe_actions_keyboard(recipe.id),
+            reply_markup=_recipe_actions_keyboard(recipe.id, page, page_action, total_pages),
             parse_mode=ParseMode.HTML,
         )
 
@@ -1706,7 +1758,18 @@ class TelegramRecipeBot:
             created = await self.sync_engine.create_recipe_from_list(str(group_id), title, draft_items, telegram_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list create failed")
-            await query.edit_message_text(f"Ошибка создания рецепта: {exc}")
+            await query.edit_message_text(
+                f"Ошибка создания рецепта: {exc}",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton("Изменить имя", callback_data="recipe_list_rename:0"),
+                            InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0"),
+                        ],
+                        [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
+                    ]
+                ),
+            )
             return
         context.user_data.clear()
         account_labels = self._account_labels_for_group(str(group_id))

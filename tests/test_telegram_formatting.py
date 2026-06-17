@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from fatsecret_bot.models import Ingredient, Recipe
-from fatsecret_bot.telegram_bot import _format_recipe
+from fatsecret_bot.telegram_bot import _format_recipe, _recipe_actions_keyboard
 
 
 def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
@@ -43,3 +43,12 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     assert "Порций: 2;" in text
     assert "- Яичный Белок: 125.25г" in text
     assert "- Соус: 0.06 порции" in text
+
+
+def test_recipe_actions_keyboard_starts_with_list_navigation() -> None:
+    keyboard = _recipe_actions_keyboard("recipe-1", page=1, page_action="list", total_pages=3)
+    rows = keyboard.inline_keyboard
+
+    assert [button.text for button in rows[0]] == ["Назад", "2/3", "Дальше"]
+    assert [button.text for button in rows[1]] == ["Поиск", "Создать из списка"]
+    assert [button.text for button in rows[-1]] == ["Удалить в FatSecret", "В меню"]

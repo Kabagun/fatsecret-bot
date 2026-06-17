@@ -40,6 +40,8 @@ class FatSecretSession:
 class RecipeSummary:
     remote_id: str
     title: str
+    description: str = ""
+    brand: str = ""
     energy_per_portion: Decimal | None = None
     carbohydrate_per_portion: Decimal | None = None
     protein_per_portion: Decimal | None = None

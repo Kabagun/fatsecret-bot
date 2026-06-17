@@ -196,6 +196,70 @@ def test_recipe_list_candidates_ranks_remote_matches_before_raw_order(tmp_path) 
         storage.close()
 
 
+def test_recipe_list_candidates_ranks_brand_and_description_matches(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(food_id="food-chips", title="Чипсы", brand="Махеев"),
+                FoodSearchResult(food_id="food-ketchup", title="Кетчуп Русский", brand="Махеев"),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "махеев русский", Decimal("25"), limit=1))
+
+        assert len(candidates) == 1
+        assert candidates[0].ingredient.title == "Кетчуп Русский"
+        assert candidates[0].brand == "Махеев"
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_corrects_inconsistent_energy_from_macros(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(
+                    food_id="food-ketchup",
+                    title="Кетчуп",
+                    energy_per_portion=Decimal("7"),
+                    protein_per_portion=Decimal("1"),
+                    fat_per_portion=Decimal("0.1"),
+                    carbohydrate_per_portion=Decimal("17"),
+                ),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "кетчуп", Decimal("25"), limit=1))
+
+        assert candidates[0].energy_per_100g == Decimal("72.9")
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_offset_returns_requested_remote_page(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [FoodSearchResult(food_id=f"food-{index}", title=f"Филе {index:02d}") for index in range(6)]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(
+            engine.recipe_list_candidates("group", "Филе", Decimal("100"), limit=2, offset=3)
+        )
+
+        assert [item.ingredient.title for item in candidates] == ["Филе 03", "Филе 04"]
+    finally:
+        storage.close()
+
+
 def test_create_recipe_from_list_deletes_local_recipe_when_every_account_fails(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

@@ -81,6 +81,11 @@ def parse_recipe_initial_save_response(text: str) -> str:
             return remote_id
     if normalized.isdigit():
         return normalized
+    if "невозможно сохранить" in normalized.casefold():
+        raise FatSecretError(
+            "FatSecret отклонил создание рецепта на первом шаге: "
+            "«Невозможно сохранить». Чаще всего помогает другое имя рецепта или повтор позже."
+        )
     raise FatSecretError(f"unexpected recipe create response: {normalized[:120]}")
 
 
@@ -148,6 +153,8 @@ class FatSecretClient:
                 FoodSearchResult(
                     food_id=item.remote_id,
                     title=item.title,
+                    description=item.description,
+                    brand=item.brand,
                     energy_per_portion=item.energy_per_portion,
                     carbohydrate_per_portion=item.carbohydrate_per_portion,
                     protein_per_portion=item.protein_per_portion,
@@ -318,6 +325,14 @@ class FatSecretClient:
                 RecipeSummary(
                     remote_id=remote_id,
                     title=title,
+                    description=_text(node, "description") or _text(node, "shortDescription"),
+                    brand=(
+                        _text(node, "brand")
+                        or _text(node, "brandName")
+                        or _text(node, "brand_name")
+                        or _text(node, "manufacturer")
+                        or _text(node, "manufacturerName")
+                    ),
                     energy_per_portion=_decimal(_text(node, "energyPerPortion"), None),
                     carbohydrate_per_portion=_decimal(_text(node, "carbohydratePerPortion"), None),
                     protein_per_portion=_decimal(_text(node, "proteinPerPortion"), None),
