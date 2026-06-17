@@ -6,7 +6,7 @@ import secrets
 import sqlite3
 import string
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .models import FatSecretAccountConfig, Ingredient, Recipe, RecipeGroup, RecipeGroupMember, RecipeSummary
@@ -38,6 +38,15 @@ def _steps_from_json(value: str | None) -> list[str]:
     if not isinstance(data, list):
         return []
     return [str(step).strip() for step in data if str(step).strip()][:3]
+
+
+def _decimal_to_text(value: Decimal) -> str:
+    return format(value.normalize(), "f")
+
+
+def _bare_weight_portion_description(description: str) -> bool:
+    normalized = description.strip().casefold()
+    return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}
 
 
 def _new_invite_code() -> str:
@@ -145,6 +154,7 @@ class Storage:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_group_title ON recipes(group_id, normalized_title)"
         )
         self._backfill_default_group()
+        self._normalize_zero_portion_gram_ingredients()
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -210,6 +220,30 @@ class Storage:
             WHERE active_group_id IS NULL
             """
         )
+
+    def _normalize_zero_portion_gram_ingredients(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT id, amount, portion_description
+            FROM ingredients
+            WHERE portion_id = '0'
+            """
+        ).fetchall()
+        for row in rows:
+            if not _bare_weight_portion_description(row["portion_description"]):
+                continue
+            try:
+                amount = Decimal(row["amount"])
+            except InvalidOperation:
+                continue
+            self._conn.execute(
+                """
+                UPDATE ingredients
+                SET amount = ?, portion_description = '100г'
+                WHERE id = ?
+                """,
+                (_decimal_to_text(amount / Decimal("100")), row["id"]),
+            )
 
     def _unique_invite_code(self) -> str:
         while True:

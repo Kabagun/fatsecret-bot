@@ -186,6 +186,26 @@ def test_recipe_steps_are_stored_and_updated_from_remote(tmp_path) -> None:
         storage.close()
 
 
+def test_migration_normalizes_legacy_zero_portion_gram_ingredients(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    storage = Storage(db_path)
+    try:
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("1"), 0, 0, updated_by=1)
+        storage.add_ingredient(recipe_id, "food-turmeric", "Куркума", "0", Decimal("5"), "г")
+    finally:
+        storage.close()
+
+    storage = Storage(db_path)
+    try:
+        recipe = storage.get_recipe(recipe_id)
+
+        assert recipe is not None
+        assert recipe.ingredients[0].amount == Decimal("0.05")
+        assert recipe.ingredients[0].portion_description == "100г"
+    finally:
+        storage.close()
+
+
 def test_fatsecret_account_upsert_replaces_user_account(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

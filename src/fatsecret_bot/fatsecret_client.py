@@ -118,6 +118,17 @@ def _form_decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
 
+def _bare_weight_portion_description(description: str) -> bool:
+    normalized = description.strip().casefold()
+    return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}
+
+
+def _ingredient_portion_amount(ingredient: Ingredient) -> Decimal:
+    if (ingredient.portion_id or "0") == "0" and _bare_weight_portion_description(ingredient.portion_description):
+        return ingredient.amount / Decimal("100")
+    return ingredient.amount
+
+
 def _recipe_step(recipe: Recipe, index: int) -> str:
     return recipe.steps[index] if index < len(recipe.steps) else ""
 
@@ -287,7 +298,7 @@ class FatSecretClient:
             "iid": ingredient.remote_ingredient_id or "0",
             "entryname": ingredient.title,
             "portionid": ingredient.portion_id or "0",
-            "portionamount": _form_decimal(ingredient.amount),
+            "portionamount": _form_decimal(_ingredient_portion_amount(ingredient)),
         }
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
         return _looks_like_true(response.text)

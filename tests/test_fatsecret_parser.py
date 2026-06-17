@@ -184,6 +184,51 @@ def test_add_ingredient_sends_prepared_portion_amount() -> None:
     assert form["portionamount"] == ["3"]
 
 
+def test_add_ingredient_converts_legacy_zero_portion_grams() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="True")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+    )
+    client._session = FatSecretSession(server_id="server", device_key="device", secret_key="secret")
+    try:
+        ok = asyncio.run(
+            client.add_ingredient(
+                "recipe-1",
+                Ingredient(
+                    id="ingredient-1",
+                    recipe_id="recipe-1",
+                    food_id="food-1",
+                    title="Куркума",
+                    portion_id="0",
+                    amount=Decimal("5"),
+                    portion_description="г",
+                ),
+            )
+        )
+    finally:
+        asyncio.run(http.aclose())
+
+    assert ok is True
+    form = parse_qs(requests[0].content.decode())
+    assert form["portionamount"] == ["0.05"]
+
+
 def test_save_recipe_meta_posts_recipe_steps() -> None:
     requests: list[httpx.Request] = []
 
