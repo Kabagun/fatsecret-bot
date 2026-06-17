@@ -103,7 +103,7 @@ def _recipe_actions_keyboard(
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"{page_action}:{page}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop:0"))
     if page + 1 < total_pages:
         nav.append(InlineKeyboardButton("Дальше", callback_data=f"{page_action}:{page + 1}"))
     return InlineKeyboardMarkup(
@@ -253,7 +253,7 @@ def _recipe_list_candidate_keyboard(
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(InlineKeyboardButton("Назад", callback_data=f"recipe_list_cpage:{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page + 1}", callback_data=f"recipe_list_cpage:{page}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}", callback_data="noop:0"))
     if has_next:
         nav.append(InlineKeyboardButton("Дальше", callback_data=f"recipe_list_cpage:{page + 1}"))
     buttons.append(nav)
@@ -584,7 +584,7 @@ class TelegramRecipeBot:
         nav: list[InlineKeyboardButton] = []
         if page > 0:
             nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
-        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"{page_action}:{page}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop:0"))
         if page + 1 < total_pages:
             nav.append(InlineKeyboardButton("Дальше", callback_data=f"{page_action}:{page + 1}"))
         if nav:
@@ -639,6 +639,8 @@ class TelegramRecipeBot:
         if action == "open":
             context.user_data.pop("mode", None)
             await self._open_recipe(query, context, value)
+        elif action == "noop":
+            return
         elif action == "menu":
             context.user_data.clear()
             await query.edit_message_text("Главное меню. Выбери действие на клавиатуре снизу.")

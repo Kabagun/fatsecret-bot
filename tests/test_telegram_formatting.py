@@ -50,5 +50,6 @@ def test_recipe_actions_keyboard_starts_with_list_navigation() -> None:
     rows = keyboard.inline_keyboard
 
     assert [button.text for button in rows[0]] == ["Назад", "2/3", "Дальше"]
+    assert rows[0][1].callback_data == "noop:0"
     assert [button.text for button in rows[1]] == ["Поиск", "Создать из списка"]
     assert [button.text for button in rows[-1]] == ["Удалить в FatSecret", "В меню"]
