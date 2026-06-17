@@ -427,7 +427,7 @@ class RecipeSyncEngine:
                             portion_description="г",
                         ),
                         source="FatSecret",
-                        brand=found.brand or found.description,
+                        brand=found.brand,
                         energy_per_100g=_correct_energy(found.energy_per_portion, protein, fat, carbohydrate),
                         protein_per_100g=protein,
                         fat_per_100g=fat,
@@ -465,7 +465,7 @@ class RecipeSyncEngine:
         clients = self._build_clients(group_id)
         recipe_id = self.storage.create_recipe(
             title=title,
-            description="",
+            description="Создано через Telegram бот.",
             portions=Decimal("1"),
             prep_time=0,
             cook_time=0,

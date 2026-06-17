@@ -26,6 +26,7 @@ RECIPE_LIST_CANDIDATES_PAGE_SIZE = 10
 RECIPE_LIST_CANDIDATES_PREFETCH_PAGES = 2
 RECIPE_LIST_CANDIDATES_PREFETCH_SIZE = RECIPE_LIST_CANDIDATES_PAGE_SIZE * RECIPE_LIST_CANDIDATES_PREFETCH_PAGES
 MAIN_BUTTONS = {"Рецепты", "Группы", "Аккаунты"}
+LIST_WIDTH_LINE = "--------------------------------"
 RECIPE_KEYBOARD_BUTTONS = {
     "Поиск",
     "Создать из списка",
@@ -126,10 +127,16 @@ def _recipe_actions_keyboard(
     page = min(max(0, page), total_pages - 1)
     page_action = page_action if page_action in {"list", "searchpage"} else "list"
     nav: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
-    if page + 1 < total_pages:
-        nav.append(InlineKeyboardButton("Дальше", callback_data=f"{page_action}:{page + 1}"))
+    if total_pages > 1:
+        nav.append(
+            InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}" if page > 0 else "noop:0")
+        )
+        nav.append(
+            InlineKeyboardButton(
+                "Дальше",
+                callback_data=f"{page_action}:{page + 1}" if page + 1 < total_pages else "noop:0",
+            )
+        )
     return InlineKeyboardMarkup([nav]) if nav else None
 
 
@@ -145,6 +152,10 @@ def _recipe_owner_text(recipe: Recipe, account_labels: dict[str, str]) -> str:
 def _recipe_list_button_text(recipe: Recipe, account_labels: dict[str, str], prefix: str = "") -> str:
     text = f"{prefix}{recipe.title} - {_recipe_owner_text(recipe, account_labels)}"
     return text[:90]
+
+
+def _recipe_list_message(title: str) -> str:
+    return f"{title}\n{LIST_WIDTH_LINE}"
 
 
 def _default_account_label(username: str) -> str:
@@ -262,11 +273,9 @@ def _recipe_list_candidate_keyboard(
         for index, item in enumerate(candidates)
     ]
     nav: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("Назад", callback_data=f"recipe_list_cpage:{page - 1}"))
-    if has_next:
-        nav.append(InlineKeyboardButton("Дальше", callback_data=f"recipe_list_cpage:{page + 1}"))
-    if nav:
+    if page > 0 or has_next:
+        nav.append(InlineKeyboardButton("Назад", callback_data=f"recipe_list_cpage:{page - 1}" if page > 0 else "noop:0"))
+        nav.append(InlineKeyboardButton("Дальше", callback_data=f"recipe_list_cpage:{page + 1}" if has_next else "noop:0"))
         buttons.append(nav)
     buttons.append([InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")])
     return InlineKeyboardMarkup(buttons)
@@ -554,10 +563,7 @@ class TelegramRecipeBot:
         context.user_data["recipe_list_page"] = page
         context.user_data["group_id"] = group.id
         if context.user_data.get("reply_keyboard") != "recipes":
-            await update.effective_message.reply_text(
-                "Кнопки рецептов снизу.",
-                reply_markup=RECIPES_KEYBOARD,
-            )
+            await update.effective_message.reply_text("Режим рецептов.", reply_markup=RECIPES_KEYBOARD)
             context.user_data["reply_keyboard"] = "recipes"
         if not recipes:
             await update.effective_message.reply_text(
@@ -565,7 +571,7 @@ class TelegramRecipeBot:
             )
             return
         await update.effective_message.reply_text(
-            "Общий список рецептов:",
+            _recipe_list_message("Общий список рецептов:"),
             reply_markup=self._recipe_list_keyboard(recipes, page, "list", self._account_labels_for_group(group.id)),
         )
 
@@ -595,11 +601,16 @@ class TelegramRecipeBot:
             for recipe in current
         ]
         nav: list[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
-        if page + 1 < total_pages:
-            nav.append(InlineKeyboardButton("Дальше", callback_data=f"{page_action}:{page + 1}"))
-        if nav:
+        if total_pages > 1:
+            nav.append(
+                InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}" if page > 0 else "noop:0")
+            )
+            nav.append(
+                InlineKeyboardButton(
+                    "Дальше",
+                    callback_data=f"{page_action}:{page + 1}" if page + 1 < total_pages else "noop:0",
+                )
+            )
             buttons.append(nav)
         return InlineKeyboardMarkup(buttons)
 
@@ -738,7 +749,9 @@ class TelegramRecipeBot:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
             )
         elif action == "list":
-            context.user_data.clear()
+            context.user_data.pop("mode", None)
+            context.user_data.pop("current_recipe_id", None)
+            context.user_data.pop("recipe_page_action", None)
             await self._edit_recipe_list(query, int(value or "0"), context)
         elif action == "search":
             context.user_data.clear()
@@ -839,13 +852,13 @@ class TelegramRecipeBot:
             context.user_data["recipe_list_page"] = page
             context.user_data["group_id"] = group.id
             if context.user_data.get("reply_keyboard") != "recipes" and query.message is not None:
-                await query.message.reply_text("Кнопки рецептов снизу.", reply_markup=RECIPES_KEYBOARD)
+                await query.message.reply_text("Режим рецептов.", reply_markup=RECIPES_KEYBOARD)
                 context.user_data["reply_keyboard"] = "recipes"
         if not recipes:
             await query.edit_message_text("Рецептов пока нет.")
             return
         await query.edit_message_text(
-            "Общий список рецептов:",
+            _recipe_list_message("Общий список рецептов:"),
             reply_markup=self._recipe_list_keyboard(recipes, page, "list", self._account_labels_for_group(group.id)),
         )
 
@@ -870,10 +883,10 @@ class TelegramRecipeBot:
             )
             return
         if context.user_data.get("reply_keyboard") != "recipes" and query.message is not None:
-            await query.message.reply_text("Кнопки рецептов снизу.", reply_markup=RECIPES_KEYBOARD)
+            await query.message.reply_text("Режим рецептов.", reply_markup=RECIPES_KEYBOARD)
             context.user_data["reply_keyboard"] = "recipes"
         await query.edit_message_text(
-            f"Найдено рецептов: {len(recipes)}",
+            _recipe_list_message(f"Найдено рецептов: {len(recipes)}"),
             reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage", self._account_labels_for_group(group_id)),
         )
 
@@ -927,7 +940,7 @@ class TelegramRecipeBot:
         context.user_data["recipe_list_page"] = page
         context.user_data["recipe_page_action"] = page_action
         if context.user_data.get("reply_keyboard") != "recipe_detail" and query.message is not None:
-            await query.message.reply_text("Кнопки рецепта снизу.", reply_markup=RECIPE_DETAIL_KEYBOARD)
+            await query.message.reply_text("Режим рецепта.", reply_markup=RECIPE_DETAIL_KEYBOARD)
             context.user_data["reply_keyboard"] = "recipe_detail"
         await query.edit_message_text(
             _format_recipe(recipe),
@@ -1226,11 +1239,11 @@ class TelegramRecipeBot:
             for recipe in current
         ]
         nav: list[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("Назад", callback_data=f"batchdel:{page - 1}"))
-        if page + 1 < total_pages:
-            nav.append(InlineKeyboardButton("Дальше", callback_data=f"batchdel:{page + 1}"))
-        if nav:
+        if total_pages > 1:
+            nav.append(InlineKeyboardButton("Назад", callback_data=f"batchdel:{page - 1}" if page > 0 else "noop:0"))
+            nav.append(
+                InlineKeyboardButton("Дальше", callback_data=f"batchdel:{page + 1}" if page + 1 < total_pages else "noop:0")
+            )
             buttons.append(nav)
         if selected:
             buttons.append([InlineKeyboardButton(f"Удалить выбранные: {len(selected)}", callback_data=f"bdconfirm:{page}")])

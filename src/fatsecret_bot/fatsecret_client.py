@@ -56,13 +56,23 @@ def _strip_tags(value: str) -> str:
     return re.sub(r"<[^>]+>", "", value).strip()
 
 
+def _clean_food_text(value: Any) -> str:
+    text = _strip_tags(str(value or ""))
+    if "S#E{P<A*R*A>T}O" in text or "mtypeS#E" in text:
+        return ""
+    if text.casefold().startswith("includes:"):
+        return ""
+    return text
+
+
 def _food_brand(data: dict[str, Any]) -> str:
     for key in ("brand", "brandName", "brand_name", "manufacturer", "manufacturerName", "company", "owner"):
         value = data.get(key)
         if isinstance(value, dict):
             value = value.get("name") or value.get("title") or value.get("value")
-        if value:
-            return _strip_tags(str(value))
+        cleaned = _clean_food_text(value)
+        if cleaned:
+            return cleaned
     return ""
 
 
@@ -325,13 +335,13 @@ class FatSecretClient:
                 RecipeSummary(
                     remote_id=remote_id,
                     title=title,
-                    description=_text(node, "description") or _text(node, "shortDescription"),
+                    description=_clean_food_text(_text(node, "description") or _text(node, "shortDescription")),
                     brand=(
-                        _text(node, "brand")
-                        or _text(node, "brandName")
-                        or _text(node, "brand_name")
-                        or _text(node, "manufacturer")
-                        or _text(node, "manufacturerName")
+                        _clean_food_text(_text(node, "brand"))
+                        or _clean_food_text(_text(node, "brandName"))
+                        or _clean_food_text(_text(node, "brand_name"))
+                        or _clean_food_text(_text(node, "manufacturer"))
+                        or _clean_food_text(_text(node, "manufacturerName"))
                     ),
                     energy_per_portion=_decimal(_text(node, "energyPerPortion"), None),
                     carbohydrate_per_portion=_decimal(_text(node, "carbohydratePerPortion"), None),
@@ -394,7 +404,7 @@ class FatSecretClient:
                     FoodSearchResult(
                         food_id=str(raw_id or ""),
                         title=_strip_tags(str(raw_title)),
-                        description=_strip_tags(str(item.get("description") or item.get("subtitle") or "")),
+                        description=_clean_food_text(item.get("description") or item.get("subtitle") or ""),
                         brand=_food_brand(item),
                         energy_per_portion=_decimal(
                             str(

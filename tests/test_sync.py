@@ -83,6 +83,34 @@ class FakeFailingCreateClient:
         return None
 
 
+class FakeCreateClient:
+    def __init__(self, account_key: str = "tg11") -> None:
+        self.account = FatSecretAccountConfig(
+            key=account_key,
+            label=account_key,
+            username=f"{account_key}@example.com",
+            password="secret",
+            market="BY",
+            language="ru",
+        )
+        self.created_recipe: Recipe | None = None
+        self.saved_ingredients: list[Ingredient] = []
+
+    async def create_recipe(self, recipe: Recipe) -> str:
+        self.created_recipe = recipe
+        return "remote-1"
+
+    async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
+        self.saved_ingredients.append(ingredient)
+        return True
+
+    async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
 def _device() -> FatSecretDeviceConfig:
     return FatSecretDeviceConfig(
         app_version="9.99",
@@ -242,6 +270,29 @@ def test_recipe_list_candidates_corrects_inconsistent_energy_from_macros(tmp_pat
         storage.close()
 
 
+def test_recipe_list_candidates_does_not_display_internal_metadata_as_brand(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(
+                    food_id="food-ketchup",
+                    title="Кетчуп",
+                    description="mtypeS#E{P<A*R*A>T}O!R1S#E{P<A*R*A>T}O!RmnameS#E{P<A*R*A>T}O",
+                ),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "кетчуп", Decimal("25"), limit=1))
+
+        assert candidates[0].ingredient.title == "Кетчуп"
+        assert candidates[0].brand == ""
+    finally:
+        storage.close()
+
+
 def test_recipe_list_candidates_offset_returns_requested_remote_page(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -256,6 +307,37 @@ def test_recipe_list_candidates_offset_returns_requested_remote_page(tmp_path) -
         )
 
         assert [item.ingredient.title for item in candidates] == ["Филе 03", "Филе 04"]
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_uses_non_empty_description(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeCreateClient()
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Филе",
+                grams=Decimal("100"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-1",
+                    title="Куриное Филе",
+                    portion_id="portion-1",
+                    amount=Decimal("100"),
+                    portion_description="г",
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        asyncio.run(engine.create_recipe_from_list("group", "Тест", items, updated_by=11))
+
+        assert client.created_recipe is not None
+        assert client.created_recipe.description == "Создано через Telegram бот."
     finally:
         storage.close()
 
