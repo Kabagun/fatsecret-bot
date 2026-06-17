@@ -245,6 +245,43 @@ def test_recipe_list_candidates_repairs_local_zero_portion_with_search_metadata(
         storage.close()
 
 
+def test_recipe_list_candidates_enriches_frequent_local_with_macros(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        recipe_id = storage.create_recipe("A", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
+        storage.add_ingredient(recipe_id, "food-chicken", "Куриное Филе", "portion-1", Decimal("300"), "г")
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="food-chicken",
+                    title="Куриное Филе",
+                    brand="",
+                    default_portion_id="portion-1",
+                    default_portion_description="100г",
+                    energy_per_portion=Decimal("110"),
+                    protein_per_portion=Decimal("23"),
+                    fat_per_portion=Decimal("2"),
+                    carbohydrate_per_portion=Decimal("0"),
+                )
+            ],
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "филе", Decimal("300"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].energy_per_100g == Decimal("110")
+        assert candidates[0].protein_per_100g == Decimal("23")
+        assert candidates[0].fat_per_100g == Decimal("2")
+        assert candidates[0].carbohydrate_per_100g == Decimal("0")
+    finally:
+        storage.close()
+
+
 def test_recipe_list_candidates_ranks_remote_matches_before_raw_order(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

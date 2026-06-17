@@ -8,6 +8,7 @@ from fatsecret_bot.telegram_bot import (
     _format_recipe_list_draft,
     _format_resolved_item,
     _parse_recipe_list_lines,
+    _parse_recipe_list_payload,
     _parse_recipe_steps,
 )
 
@@ -40,6 +41,28 @@ def test_parse_recipe_list_lines_reports_bad_lines() -> None:
 
     assert [(item.query, item.grams) for item in items] == [("Теос", Decimal("100"))]
     assert bad_lines == ["Филе сто", "Масло 0"]
+
+
+def test_parse_recipe_list_payload_splits_ingredients_and_steps() -> None:
+    items, bad_lines, steps = _parse_recipe_list_payload(
+        """
+        Филе 300
+        Куркума 5
+
+        Шаги:
+        1. Нарезать филе
+        2. Запечь
+        - Подать
+        4. Лишнее
+        """
+    )
+
+    assert bad_lines == []
+    assert [(item.query, item.grams) for item in items] == [
+        ("Филе", Decimal("300")),
+        ("Куркума", Decimal("5")),
+    ]
+    assert steps == ["Нарезать филе", "Запечь", "Подать"]
 
 
 def test_format_resolved_item_shows_macros_per_100g_and_brand() -> None:

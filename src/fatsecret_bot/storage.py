@@ -809,6 +809,43 @@ class Storage:
             ).fetchall()
         return [r for row in rows if (r := self.get_recipe(row["id"])) is not None]
 
+    def count_recipes(self, group_id: str | None = None) -> int:
+        """Return the number of locally cached recipes, optionally limited to one group."""
+        if group_id is None:
+            row = self._conn.execute("SELECT COUNT(*) AS c FROM recipes").fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM recipes WHERE group_id = ?",
+                (group_id,),
+            ).fetchone()
+        return int(row["c"])
+
+    def list_recipe_page(self, group_id: str | None, page: int, page_size: int) -> list[Recipe]:
+        """Return one ordered page of locally cached recipes."""
+        page = max(0, page)
+        page_size = max(1, page_size)
+        offset = page * page_size
+        if group_id is None:
+            rows = self._conn.execute(
+                """
+                SELECT id FROM recipes
+                ORDER BY normalized_title ASC
+                LIMIT ? OFFSET ?
+                """,
+                (page_size, offset),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT id FROM recipes
+                WHERE group_id = ?
+                ORDER BY normalized_title ASC
+                LIMIT ? OFFSET ?
+                """,
+                (group_id, page_size, offset),
+            ).fetchall()
+        return [r for row in rows if (r := self.get_recipe(row["id"])) is not None]
+
     def list_ingredients(self, recipe_id: str) -> list[Ingredient]:
         rows = self._conn.execute(
             """

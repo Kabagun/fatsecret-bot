@@ -407,6 +407,25 @@ class RecipeSyncEngine:
             return portion_id, "100г"
         return portion_id, portion_description
 
+    async def _local_food_metadata(
+        self,
+        client: FatSecretClient,
+        ingredient: Ingredient,
+        query: str,
+    ) -> FoodSearchResult | None:
+        for search_query in (ingredient.title, query):
+            if not search_query.strip():
+                continue
+            try:
+                results = await client.search_recipes(search_query, page=0)
+            except Exception:  # noqa: BLE001 - keep local candidate usable on lookup failure.
+                logger.debug("local food metadata lookup failed for %s", search_query, exc_info=True)
+                continue
+            for result in results:
+                if result.food_id == ingredient.food_id:
+                    return result
+        return None
+
     async def recipe_list_candidates(
         self,
         group_id: str,
@@ -432,15 +451,34 @@ class RecipeSyncEngine:
         try:
             if local is not None:
                 local_key = (local.food_id, normalize_title(local.title))
-                if (local.portion_id or "0") == "0":
+                local_portion_id = local.portion_id or "0"
+                local_portion_description = local.portion_description or "г"
+                first_client: FatSecretClient | None = None
+                local_metadata: FoodSearchResult | None = None
+                try:
+                    first_client = get_first_client()
+                    local_metadata = await self._local_food_metadata(first_client, local, query)
+                except FatSecretError:
+                    first_client = None
+                if local_portion_id == "0" and local_metadata is not None:
+                    local_portion_id = local_metadata.default_portion_id or local_portion_id
+                    resolved_description = local_metadata.default_portion_description
+                    if not resolved_description and _bare_weight_portion_description(local_portion_description):
+                        resolved_description = "100г"
+                    local_portion_description = resolved_description or local_portion_description
+                elif local_portion_id == "0" and first_client is not None:
                     local_portion_id, local_portion_description = await self._local_portion_metadata(
-                        get_first_client(),
+                        first_client,
                         local,
                         query,
                     )
+                elif local_portion_id == "0" and _bare_weight_portion_description(local_portion_description):
+                    local_portion_description = "100г"
                 else:
-                    local_portion_id = local.portion_id or "0"
                     local_portion_description = local.portion_description or "г"
+                protein = local_metadata.protein_per_portion if local_metadata is not None else None
+                fat = local_metadata.fat_per_portion if local_metadata is not None else None
+                carbohydrate = local_metadata.carbohydrate_per_portion if local_metadata is not None else None
                 seen.add(local_key)
                 local_candidates.append(
                     ResolvedRecipeListItem(
@@ -456,6 +494,15 @@ class RecipeSyncEngine:
                             portion_description=local_portion_description,
                         ),
                         source="часто использовался",
+                        brand=local_metadata.brand if local_metadata is not None else "",
+                        energy_per_100g=(
+                            _correct_energy(local_metadata.energy_per_portion, protein, fat, carbohydrate)
+                            if local_metadata is not None
+                            else None
+                        ),
+                        protein_per_100g=protein,
+                        fat_per_100g=fat,
+                        carbohydrate_per_100g=carbohydrate,
                     )
                 )
 

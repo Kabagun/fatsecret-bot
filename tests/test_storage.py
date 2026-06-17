@@ -41,6 +41,24 @@ def test_import_remote_recipe_is_group_scoped(tmp_path) -> None:
         storage.close()
 
 
+def test_count_recipes_and_list_recipe_page_are_group_scoped(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Дом")
+        other_group = storage.create_group(11, "Другое")
+        for index in range(5):
+            storage.create_recipe(f"Рецепт {index}", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
+        storage.create_recipe("Чужой", "", Decimal("1"), 0, 0, updated_by=11, group_id=other_group.id)
+
+        page = storage.list_recipe_page(group.id, page=1, page_size=2)
+
+        assert storage.count_recipes(group.id) == 5
+        assert [recipe.title for recipe in page] == ["Рецепт 2", "Рецепт 3"]
+    finally:
+        storage.close()
+
+
 def test_group_join_switch_and_group_scoped_accounts(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

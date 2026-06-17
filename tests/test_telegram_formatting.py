@@ -98,8 +98,8 @@ def test_recipe_list_keyboard_keeps_recipe_buttons_navigation_and_actions_inline
 
     assert "Дальше" in flat_texts
     assert "1/2" not in flat_texts
-    assert "Поиск" in flat_texts
-    assert "Создать из списка" in flat_texts
+    assert "Поиск" not in flat_texts
+    assert "Создать из списка" not in flat_texts
     assert "Удалить несколько" in flat_texts
     assert "В меню" not in flat_texts
 
