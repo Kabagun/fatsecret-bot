@@ -49,24 +49,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-RECIPES_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["Поиск", "Создать из списка"],
-        ["Удалить несколько", "В меню"],
-    ],
-    resize_keyboard=True,
-)
-
-RECIPE_DETAIL_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["Синхронизировать", "Удалить"],
-        ["Поиск", "Создать из списка"],
-        ["В меню"],
-    ],
-    resize_keyboard=True,
-)
-
-
 def _format_recipe(recipe: Recipe) -> str:
     ingredients = "\n".join(
         f"- {html.escape(item.title)}: {html.escape(_format_ingredient_amount(item.amount, item.portion_description))}"
@@ -142,10 +124,11 @@ def _recipe_actions_keyboard(
     page: int = 0,
     page_action: str = "list",
     total_pages: int = 1,
-) -> InlineKeyboardMarkup | None:
+) -> InlineKeyboardMarkup:
     total_pages = max(1, total_pages)
     page = min(max(0, page), total_pages - 1)
     page_action = page_action if page_action in {"list", "searchpage"} else "list"
+    buttons: list[list[InlineKeyboardButton]] = []
     nav: list[InlineKeyboardButton] = []
     if total_pages > 1:
         nav.append(
@@ -157,7 +140,21 @@ def _recipe_actions_keyboard(
                 callback_data=f"{page_action}:{page + 1}" if page + 1 < total_pages else "noop:0",
             )
         )
-    return InlineKeyboardMarkup([nav]) if nav else None
+        buttons.append(nav)
+    buttons.append(
+        [
+            InlineKeyboardButton("Поиск", callback_data="search:0"),
+            InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0"),
+        ]
+    )
+    buttons.append([InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")])
+    buttons.append(
+        [
+            InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}"),
+            InlineKeyboardButton("В меню", callback_data="menu:0"),
+        ]
+    )
+    return InlineKeyboardMarkup(buttons)
 
 
 def _recipe_owner_text(recipe: Recipe, account_labels: dict[str, str]) -> str:
@@ -404,6 +401,12 @@ class TelegramRecipeBot:
             return False
         return True
 
+    async def _ensure_main_keyboard(self, message, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if message is None or context.chat_data.get("reply_keyboard") == "main":
+            return
+        await message.reply_text("Основная клавиатура снизу.", reply_markup=MAIN_KEYBOARD)
+        context.chat_data["reply_keyboard"] = "main"
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
             return
@@ -419,6 +422,7 @@ class TelegramRecipeBot:
             "Готов. Создавай и редактируй рецепты в FatSecret, а здесь обновляй список и синхронизируй выбранный рецепт.",
             reply_markup=MAIN_KEYBOARD,
         )
+        context.chat_data["reply_keyboard"] = "main"
 
     def _groups_text(self, telegram_id: int) -> str:
         active = self.storage.active_group_for_user(telegram_id)
@@ -586,9 +590,7 @@ class TelegramRecipeBot:
         recipes = self.storage.list_recipes(group.id)
         context.user_data["recipe_list_page"] = page
         context.user_data["group_id"] = group.id
-        if context.user_data.get("reply_keyboard") != "recipes":
-            await update.effective_message.reply_text("Режим рецептов.", reply_markup=RECIPES_KEYBOARD)
-            context.user_data["reply_keyboard"] = "recipes"
+        await self._ensure_main_keyboard(update.effective_message, context)
         if not recipes:
             await update.effective_message.reply_text(
                 "Рецептов пока нет. Создай рецепт в FatSecret и обнови список командой /refresh.",
@@ -636,6 +638,18 @@ class TelegramRecipeBot:
                 )
             )
             buttons.append(nav)
+        buttons.append(
+            [
+                InlineKeyboardButton("Поиск", callback_data="search:0"),
+                InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0"),
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}"),
+                InlineKeyboardButton("В меню", callback_data="menu:0"),
+            ]
+        )
         return InlineKeyboardMarkup(buttons)
 
     def _filter_recipes(self, query: str, group_id: str) -> list[Recipe]:
@@ -679,6 +693,7 @@ class TelegramRecipeBot:
         elif action == "menu":
             context.user_data.clear()
             await query.edit_message_text("Главное меню. Выбери действие на клавиатуре снизу.")
+            await self._ensure_main_keyboard(query.message, context)
         elif action == "groups":
             context.user_data.clear()
             await query.edit_message_text(
@@ -874,9 +889,7 @@ class TelegramRecipeBot:
         if context is not None:
             context.user_data["recipe_list_page"] = page
             context.user_data["group_id"] = group.id
-            if context.user_data.get("reply_keyboard") != "recipes" and query.message is not None:
-                await query.message.reply_text("Режим рецептов.", reply_markup=RECIPES_KEYBOARD)
-                context.user_data["reply_keyboard"] = "recipes"
+            await self._ensure_main_keyboard(query.message, context)
         if not recipes:
             await query.edit_message_text("Рецептов пока нет.")
             return
@@ -905,9 +918,7 @@ class TelegramRecipeBot:
                 parse_mode=ParseMode.HTML,
             )
             return
-        if context.user_data.get("reply_keyboard") != "recipes" and query.message is not None:
-            await query.message.reply_text("Режим рецептов.", reply_markup=RECIPES_KEYBOARD)
-            context.user_data["reply_keyboard"] = "recipes"
+        await self._ensure_main_keyboard(query.message, context)
         await query.edit_message_text(
             _recipe_list_message(f"Найдено рецептов: {len(recipes)}"),
             reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage", self._account_labels_for_group(group_id)),
@@ -962,9 +973,7 @@ class TelegramRecipeBot:
         context.user_data["current_recipe_id"] = recipe.id
         context.user_data["recipe_list_page"] = page
         context.user_data["recipe_page_action"] = page_action
-        if context.user_data.get("reply_keyboard") != "recipe_detail" and query.message is not None:
-            await query.message.reply_text("Режим рецепта.", reply_markup=RECIPE_DETAIL_KEYBOARD)
-            context.user_data["reply_keyboard"] = "recipe_detail"
+        await self._ensure_main_keyboard(query.message, context)
         await query.edit_message_text(
             _format_recipe(recipe),
             reply_markup=_recipe_actions_keyboard(recipe.id, page, page_action, total_pages),
@@ -1094,13 +1103,15 @@ class TelegramRecipeBot:
                 self.storage.delete_recipe(recipe.id)
                 await update.effective_message.reply_text(
                     "Этот рецепт не был создан ни в одном FatSecret аккаунте, поэтому я удалил локальный черновик.",
-                    reply_markup=RECIPES_KEYBOARD,
+                    reply_markup=MAIN_KEYBOARD,
                 )
+                context.chat_data["reply_keyboard"] = "main"
                 return
             await update.effective_message.reply_text(
                 "Рецепт привязан только к FatSecret аккаунтам, которые сейчас не подключены к этой группе.",
-                reply_markup=RECIPE_DETAIL_KEYBOARD,
+                reply_markup=MAIN_KEYBOARD,
             )
+            context.chat_data["reply_keyboard"] = "main"
             return
         if len(source_keys) > 1:
             await update.effective_message.reply_text(
@@ -1210,12 +1221,12 @@ class TelegramRecipeBot:
             return
         recipes = self.storage.list_recipes(group.id)
         if not recipes:
-            await update.effective_message.reply_text("Рецептов пока нет.", reply_markup=RECIPES_KEYBOARD)
+            await update.effective_message.reply_text("Рецептов пока нет.", reply_markup=MAIN_KEYBOARD)
+            context.chat_data["reply_keyboard"] = "main"
             return
         context.user_data.clear()
         context.user_data["mode"] = "batch_delete"
         context.user_data["group_id"] = group.id
-        context.user_data["reply_keyboard"] = "recipes"
         selected = self._batch_delete_ids(context)
         await update.effective_message.reply_text(
             f"Выбери рецепты для удаления из FatSecret. Отмечено: {len(selected)}",
@@ -1363,6 +1374,7 @@ class TelegramRecipeBot:
                 "Главное меню. Выбери действие на клавиатуре снизу.",
                 reply_markup=MAIN_KEYBOARD,
             )
+            context.chat_data["reply_keyboard"] = "main"
             return
         if mode is not None and text.casefold() in {"отмена", "назад"}:
             await self._cancel_mode(update, context)
@@ -1389,11 +1401,11 @@ class TelegramRecipeBot:
             context.user_data.clear()
             context.user_data["mode"] = "recipe_search"
             context.user_data["group_id"] = group.id
-            context.user_data["reply_keyboard"] = "recipes"
             await update.effective_message.reply_text(
                 "Что искать в рецептах? Пришли часть названия или ингредиента.",
-                reply_markup=RECIPES_KEYBOARD,
+                reply_markup=MAIN_KEYBOARD,
             )
+            context.chat_data["reply_keyboard"] = "main"
             return
         if mode is None and text == "Создать из списка":
             group = await self._require_active_group(update)
@@ -1402,8 +1414,8 @@ class TelegramRecipeBot:
             context.user_data.clear()
             context.user_data["mode"] = "recipe_list_title"
             context.user_data["group_id"] = group.id
-            context.user_data["reply_keyboard"] = "recipes"
-            await update.effective_message.reply_text("Пришли название рецепта.", reply_markup=RECIPES_KEYBOARD)
+            await update.effective_message.reply_text("Пришли название рецепта.", reply_markup=MAIN_KEYBOARD)
+            context.chat_data["reply_keyboard"] = "main"
             return
         if mode is None and text == "Удалить несколько":
             page = int(context.user_data.get("recipe_list_page") or 0)

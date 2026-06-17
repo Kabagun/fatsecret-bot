@@ -63,16 +63,24 @@ def test_recipe_actions_keyboard_uses_navigation_without_page_label() -> None:
     assert [button.text for button in rows[0]] == ["Назад", "Дальше"]
     assert all("/" not in button.text for button in rows[0])
     flat_texts = [button.text for row in rows for button in row]
-    assert "Синхронизировать" not in flat_texts
-    assert "Удалить в FatSecret" not in flat_texts
-    assert "В меню" not in flat_texts
+    assert "Поиск" in flat_texts
+    assert "Создать из списка" in flat_texts
+    assert "Синхронизировать" in flat_texts
+    assert "Удалить в FatSecret" in flat_texts
+    assert "В меню" in flat_texts
 
 
-def test_recipe_actions_keyboard_is_absent_without_navigation() -> None:
-    assert _recipe_actions_keyboard("recipe-1", page=0, page_action="list", total_pages=1) is None
+def test_recipe_actions_keyboard_keeps_actions_without_navigation() -> None:
+    keyboard = _recipe_actions_keyboard("recipe-1", page=0, page_action="list", total_pages=1)
+    flat_texts = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "Назад" not in flat_texts
+    assert "Дальше" not in flat_texts
+    assert "Синхронизировать" in flat_texts
+    assert "Удалить в FatSecret" in flat_texts
 
 
-def test_recipe_list_keyboard_keeps_only_recipe_buttons_and_navigation_inline() -> None:
+def test_recipe_list_keyboard_keeps_recipe_buttons_navigation_and_actions_inline() -> None:
     recipes = [
         Recipe(id=f"recipe-{index}", title=f"Рецепт {index}", remote_ids={"tg1": "remote"})
         for index in range(9)
@@ -85,10 +93,10 @@ def test_recipe_list_keyboard_keeps_only_recipe_buttons_and_navigation_inline() 
 
     assert "Дальше" in flat_texts
     assert "1/2" not in flat_texts
-    assert "Поиск" not in flat_texts
-    assert "Создать из списка" not in flat_texts
-    assert "Удалить несколько" not in flat_texts
-    assert "В меню" not in flat_texts
+    assert "Поиск" in flat_texts
+    assert "Создать из списка" in flat_texts
+    assert "Удалить несколько" in flat_texts
+    assert "В меню" in flat_texts
 
 
 def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path) -> None:
