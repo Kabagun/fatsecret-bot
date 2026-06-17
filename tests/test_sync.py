@@ -22,6 +22,7 @@ class FakeFatSecretClient:
         self.delete_ok = delete_ok
         self.saved_ingredients: list[Ingredient] = []
         self.deleted_recipe_ids: list[str] = []
+        self.saved_meta: list[Recipe] = []
 
     async def get_recipe(self, remote_id: str) -> Recipe:
         assert remote_id == self.target.id
@@ -35,6 +36,10 @@ class FakeFatSecretClient:
     async def delete_recipe(self, remote_recipe_id: str) -> bool:
         self.deleted_recipe_ids.append(remote_recipe_id)
         return self.delete_ok
+
+    async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
+        self.saved_meta.append(recipe)
+        return True
 
     async def close(self) -> None:
         return None
@@ -311,7 +316,7 @@ def test_recipe_list_candidates_offset_returns_requested_remote_page(tmp_path) -
         storage.close()
 
 
-def test_create_recipe_from_list_uses_non_empty_description(tmp_path) -> None:
+def test_create_recipe_from_list_uses_last_sync_description(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         engine = RecipeSyncEngine(storage, _device())
@@ -337,7 +342,29 @@ def test_create_recipe_from_list_uses_non_empty_description(tmp_path) -> None:
         asyncio.run(engine.create_recipe_from_list("group", "Тест", items, updated_by=11))
 
         assert client.created_recipe is not None
-        assert client.created_recipe.description == "Создано через Telegram бот."
+        assert client.created_recipe.description.startswith("Последняя синхронизация: ")
+    finally:
+        storage.close()
+
+
+def test_sync_recipe_updates_source_description_with_last_sync(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Омлет", "старое описание", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+        storage.set_remote_recipe_id(recipe_id, "tg11", "111", last_synced_version=1)
+        engine = RecipeSyncEngine(storage, _device())
+        source = FakeFatSecretClient(
+            Recipe(id="111", title="Омлет", description="старое описание"),
+            account_key="tg11",
+        )
+        engine._build_clients = lambda group_id=None: {"tg11": source}  # type: ignore[method-assign]
+
+        results = asyncio.run(engine.sync_recipe_from_source(recipe_id, "tg11"))
+
+        assert results[0].ok is True
+        assert results[0].message == "источник; дата обновлена"
+        assert source.saved_meta[0].description.startswith("Последняя синхронизация: ")
+        assert storage.get_recipe(recipe_id).description.startswith("Последняя синхронизация: ")
     finally:
         storage.close()
 

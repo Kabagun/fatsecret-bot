@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import uuid
 from dataclasses import dataclass
@@ -208,6 +209,13 @@ def _correct_energy(
     if calculated is not None and calculated > 0 and energy < calculated * Decimal("0.5"):
         return calculated
     return energy
+
+
+def _sync_description(now: dt.datetime | None = None) -> str:
+    value = now or dt.datetime.now().astimezone()
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return f"Последняя синхронизация: {value:%d.%m.%Y %H:%M}"
 
 
 def _copy_remote_ingredients(recipe_id: str, ingredients: list[Ingredient]) -> list[Ingredient]:
@@ -463,9 +471,10 @@ class RecipeSyncEngine:
     ) -> RecipeCreateResult:
         """Create a recipe from a validated ingredient list on every FatSecret account in a group."""
         clients = self._build_clients(group_id)
+        description = _sync_description()
         recipe_id = self.storage.create_recipe(
             title=title,
-            description="Создано через Telegram бот.",
+            description=description,
             portions=Decimal("1"),
             prep_time=0,
             cook_time=0,
@@ -577,6 +586,7 @@ class RecipeSyncEngine:
             source_remote = await source_client.get_recipe(source_remote_id)
             source_recipe = _copy_recipe_from_remote(recipe.id, source_remote)
             source_recipe.title = source_recipe.title or recipe.title
+            source_recipe.description = _sync_description()
             source_recipe.remote_ids = dict(recipe.remote_ids)
             self.storage.update_recipe_from_remote(
                 recipe_id=recipe.id,
@@ -593,8 +603,11 @@ class RecipeSyncEngine:
                 try:
                     remote_id = recipe.remote_ids.get(account_key)
                     if account_key == source_account_key:
+                        ok = await client.save_recipe_meta(recipe, source_remote_id)
+                        if not ok:
+                            raise FatSecretError(f"{client.account.label}: source recipe metadata save returned false")
                         self.storage.mark_synced(recipe.id, account_key, source_remote_id, recipe.version)
-                        results.append(AccountSyncResult(account_key, source_remote_id, True, "источник"))
+                        results.append(AccountSyncResult(account_key, source_remote_id, True, "источник; дата обновлена"))
                         continue
                     remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
                     recipe.remote_ids[account_key] = remote_id
