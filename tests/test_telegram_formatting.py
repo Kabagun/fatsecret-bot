@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from fatsecret_bot.models import Ingredient, Recipe
+from fatsecret_bot.storage import Storage
 from fatsecret_bot.telegram_bot import TelegramRecipeBot, _format_recipe, _recipe_actions_keyboard
 
 
@@ -34,6 +35,15 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
                 amount=Decimal("0.060"),
                 portion_description="serving",
             ),
+            Ingredient(
+                id="i3",
+                recipe_id="local",
+                food_id="f3",
+                title="Кетчуп",
+                portion_id="0",
+                amount=Decimal("3"),
+                portion_description="100г",
+            ),
         ],
     )
 
@@ -43,6 +53,7 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     assert "Порций: 2;" in text
     assert "- Яичный Белок: 125.25г" in text
     assert "- Соус: 0.06 порции" in text
+    assert "- Кетчуп: 300г" in text
 
 
 def test_recipe_actions_keyboard_uses_navigation_without_page_label() -> None:
@@ -78,3 +89,30 @@ def test_recipe_list_keyboard_keeps_only_recipe_buttons_and_navigation_inline() 
     assert "Создать из списка" not in flat_texts
     assert "Удалить несколько" not in flat_texts
     assert "В меню" not in flat_texts
+
+
+def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        storage.upsert_fatsecret_account(11, "Каба", "one@example.com", "secret", "BY", "ru")
+        storage.register_user(22, "Two")
+        storage.join_group_by_code(22, group.invite_code)
+        storage.upsert_fatsecret_account(22, "Света", "two@example.com", "secret", "BY", "ru")
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+
+        keyboard = TelegramRecipeBot._accounts_keyboard(bot, 22, group)
+        flat_texts = [button.text for row in keyboard.inline_keyboard for button in row]
+        _, own_account = TelegramRecipeBot._active_group_account(bot, 22, "tg22")
+        _, other_account = TelegramRecipeBot._active_group_account(bot, 22, "tg11")
+
+        assert "Поменять ник: Света" in flat_texts
+        assert "Выйти: Света" in flat_texts
+        assert "Поменять ник: Каба" not in flat_texts
+        assert "Выйти: Каба" not in flat_texts
+        assert own_account is not None
+        assert other_account is None
+    finally:
+        storage.close()

@@ -316,6 +316,30 @@ def test_recipe_list_candidates_offset_returns_requested_remote_page(tmp_path) -
         storage.close()
 
 
+def test_recipe_list_candidates_keeps_remote_default_portion_description(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(
+                    food_id="food-ketchup",
+                    title="Кетчуп Русский",
+                    default_portion_id="0",
+                    default_portion_description="100г",
+                )
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "кетчуп русский", Decimal("25"), limit=1))
+
+        assert candidates[0].ingredient.portion_description == "100г"
+        assert candidates[0].ingredient.amount == Decimal("0.25")
+    finally:
+        storage.close()
+
+
 def test_create_recipe_from_list_uses_last_sync_description(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

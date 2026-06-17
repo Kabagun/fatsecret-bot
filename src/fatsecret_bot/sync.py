@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from .fatsecret_client import FatSecretClient, FatSecretError
 from .models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
 from .storage import Storage, normalize_title
 
 logger = logging.getLogger(__name__)
+PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,23 @@ def _sync_description(now: dt.datetime | None = None) -> str:
     return f"Последняя синхронизация: {value:%d.%m.%Y %H:%M}"
 
 
+def _portion_unit_size(description: str) -> Decimal | None:
+    match = PORTION_UNIT_RE.search(description.replace("\xa0", " "))
+    if not match:
+        return None
+    try:
+        return Decimal(match.group(1).replace(",", "."))
+    except InvalidOperation:
+        return None
+
+
+def _amount_for_grams(grams: Decimal, portion_description: str) -> Decimal:
+    unit_size = _portion_unit_size(portion_description)
+    if unit_size is None or unit_size == 0:
+        return grams
+    return grams / unit_size
+
+
 def _copy_remote_ingredients(recipe_id: str, ingredients: list[Ingredient]) -> list[Ingredient]:
     return [
         Ingredient(
@@ -243,6 +262,7 @@ def _copy_recipe_from_remote(recipe_id: str, remote: Recipe) -> Recipe:
         prep_time=remote.prep_time,
         cook_time=remote.cook_time,
         default_portion_id=remote.default_portion_id,
+        default_portion_description=remote.default_portion_description,
     )
     recipe.ingredients = _copy_remote_ingredients(recipe_id, remote.ingredients)
     return recipe
@@ -359,6 +379,7 @@ class RecipeSyncEngine:
         local = self._frequent_local_ingredient(group_id, query)
         if local is not None:
             local_key = (local.food_id, normalize_title(local.title))
+            local_portion_description = local.portion_description or "г"
             seen.add(local_key)
             local_candidates.append(
                 ResolvedRecipeListItem(
@@ -370,8 +391,8 @@ class RecipeSyncEngine:
                         food_id=local.food_id,
                         title=local.title,
                         portion_id=local.portion_id or "0",
-                        amount=grams,
-                        portion_description="г",
+                        amount=_amount_for_grams(grams, local_portion_description),
+                        portion_description=local_portion_description,
                     ),
                     source="часто использовался",
                 )
@@ -418,6 +439,7 @@ class RecipeSyncEngine:
                 remote_key = (found.food_id, normalize_title(found.title))
                 if remote_key in seen:
                     continue
+                portion_description = found.default_portion_description or "г"
                 protein = found.protein_per_portion
                 fat = found.fat_per_portion
                 carbohydrate = found.carbohydrate_per_portion
@@ -431,8 +453,8 @@ class RecipeSyncEngine:
                             food_id=found.food_id,
                             title=found.title,
                             portion_id=found.default_portion_id or "0",
-                            amount=grams,
-                            portion_description="г",
+                            amount=_amount_for_grams(grams, portion_description),
+                            portion_description=portion_description,
                         ),
                         source="FatSecret",
                         brand=found.brand,
@@ -488,7 +510,7 @@ class RecipeSyncEngine:
                 food_id=item.ingredient.food_id,
                 title=item.ingredient.title,
                 portion_id=item.ingredient.portion_id or "0",
-                amount=item.grams,
+                amount=item.ingredient.amount,
                 portion_description=item.ingredient.portion_description or "г",
             )
             for item in items

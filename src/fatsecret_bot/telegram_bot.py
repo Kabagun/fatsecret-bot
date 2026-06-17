@@ -27,6 +27,10 @@ RECIPE_LIST_CANDIDATES_PREFETCH_PAGES = 2
 RECIPE_LIST_CANDIDATES_PREFETCH_SIZE = RECIPE_LIST_CANDIDATES_PAGE_SIZE * RECIPE_LIST_CANDIDATES_PREFETCH_PAGES
 MAIN_BUTTONS = {"Рецепты", "Группы", "Аккаунты"}
 LIST_WIDTH_LINE = "--------------------------------"
+PORTION_DESCRIPTION_RE = re.compile(
+    r"^\s*(?P<size>\d+(?:[\.,]\d+)?)\s*(?P<unit>г|гр|g|gram|грам|мл|ml)\b",
+    re.IGNORECASE,
+)
 RECIPE_KEYBOARD_BUTTONS = {
     "Поиск",
     "Создать из списка",
@@ -84,6 +88,18 @@ def _format_decimal_plain(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
 
+def _portion_description_unit(portion_description: str) -> tuple[Decimal, str] | None:
+    match = PORTION_DESCRIPTION_RE.search(portion_description.replace("\xa0", " "))
+    if match is None:
+        return None
+    try:
+        size = Decimal(match.group("size").replace(",", "."))
+    except InvalidOperation:
+        return None
+    unit = "мл" if match.group("unit").casefold() in {"мл", "ml"} else "г"
+    return size, unit
+
+
 def _format_ingredient_unit(amount: Decimal, portion_description: str) -> str:
     unit = portion_description.strip()
     normalized = unit.casefold()
@@ -97,6 +113,10 @@ def _format_ingredient_unit(amount: Decimal, portion_description: str) -> str:
 
 
 def _format_ingredient_amount(amount: Decimal, portion_description: str) -> str:
+    portion_unit = _portion_description_unit(portion_description)
+    if portion_unit is not None:
+        unit_size, unit = portion_unit
+        return f"{_format_decimal_plain(amount * unit_size)}{unit}"
     number = _format_decimal_plain(amount)
     unit = _format_ingredient_unit(amount, portion_description)
     if not unit:
@@ -464,22 +484,23 @@ class TelegramRecipeBot:
         if existing is None and len(accounts) < 2:
             buttons.append([InlineKeyboardButton("Подключить FatSecret", callback_data="account_add:0")])
         for account in accounts:
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        f"Поменять ник: {account.label[:32]}",
-                        callback_data=f"account_label:{account.key}",
-                    )
-                ]
-            )
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        f"Выйти: {account.label[:42]}",
-                        callback_data=f"account_logout:{account.key}",
-                    )
-                ]
-            )
+            if existing is not None and account.key == existing.key:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            f"Поменять ник: {account.label[:32]}",
+                            callback_data=f"account_label:{account.key}",
+                        )
+                    ]
+                )
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            f"Выйти: {account.label[:42]}",
+                            callback_data=f"account_logout:{account.key}",
+                        )
+                    ]
+                )
         return InlineKeyboardMarkup(buttons)
 
     def _active_group_account(
@@ -490,8 +511,11 @@ class TelegramRecipeBot:
         group = self.storage.active_group_for_user(telegram_id)
         if group is None:
             return None, None
-        accounts = {account.key: account for account in self.storage.list_fatsecret_accounts(group.id)}
-        return group, accounts.get(account_key)
+        owner_account = self.storage.get_fatsecret_account_by_telegram_id(telegram_id)
+        if owner_account is None or owner_account.key != account_key:
+            return group, None
+        group_accounts = {account.key: account for account in self.storage.list_fatsecret_accounts(group.id)}
+        return group, group_accounts.get(account_key)
 
     async def accounts(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._require_user(update):
@@ -846,7 +870,6 @@ class TelegramRecipeBot:
                 reply_markup=self._groups_keyboard(user.id) if user else None,
             )
             return
-        self.storage.delete_unlinked_recipes(group.id)
         recipes = self.storage.list_recipes(group.id)
         if context is not None:
             context.user_data["recipe_list_page"] = page

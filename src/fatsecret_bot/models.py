@@ -42,6 +42,8 @@ class RecipeSummary:
     title: str
     description: str = ""
     brand: str = ""
+    default_portion_id: str = "0"
+    default_portion_description: str = ""
     energy_per_portion: Decimal | None = None
     carbohydrate_per_portion: Decimal | None = None
     protein_per_portion: Decimal | None = None
@@ -69,6 +71,7 @@ class Recipe:
     prep_time: int = 0
     cook_time: int = 0
     default_portion_id: str = "0"
+    default_portion_description: str = ""
     version: int = 1
     group_id: str | None = None
     ingredients: list[Ingredient] = field(default_factory=list)
@@ -97,6 +100,7 @@ class FoodSearchResult:
     description: str = ""
     brand: str = ""
     default_portion_id: str = "0"
+    default_portion_description: str = ""
     energy_per_portion: Decimal | None = None
     carbohydrate_per_portion: Decimal | None = None
     protein_per_portion: Decimal | None = None

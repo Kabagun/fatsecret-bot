@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from urllib.parse import parse_qs
 
 import httpx
 
 from fatsecret_bot.fatsecret_client import FatSecretClient, FatSecretError, parse_recipe_initial_save_response
-from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession
+from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession, Ingredient
 
 
 def _client() -> FatSecretClient:
@@ -38,6 +39,26 @@ def test_parse_recipe_list() -> None:
     assert len(recipes) == 1
     assert recipes[0].remote_id == "123"
     assert recipes[0].title == "Омлет"
+
+
+def test_parse_recipe_list_extracts_brand_and_default_portion_from_metadata() -> None:
+    xml = """
+    <recipes>
+      <recipe>
+        <id>123</id>
+        <title>Кетчуп Русский</title>
+        <defaultPortionID>0</defaultPortionID>
+        <defaultPortionDescription>100г</defaultPortionDescription>
+        <shortDescription>mtypeS#E{P&lt;A*R*A&gt;T}O!R1S#E{P&lt;A*R*A&gt;T}O!RmnameS#E{P&lt;A*R*A&gt;T}O!RМахеевS#E{P&lt;A*R*A&gt;T}O!RssizeS#E{P&lt;A*R*A&gt;T}O!R100г</shortDescription>
+      </recipe>
+    </recipes>
+    """
+    recipes = _client()._parse_recipe_list(xml)
+
+    assert recipes[0].brand == "Махеев"
+    assert recipes[0].description == ""
+    assert recipes[0].default_portion_id == "0"
+    assert recipes[0].default_portion_description == "100г"
 
 
 def test_parse_recipe_ingredients() -> None:
@@ -115,3 +136,49 @@ def test_delete_recipe_posts_recipedelete_form() -> None:
     assert form["action"] == ["recipedelete"]
     assert form["rid"] == ["123456"]
     assert form["fl"] == ["5"]
+
+
+def test_add_ingredient_sends_prepared_portion_amount() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="True")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+    )
+    client._session = FatSecretSession(server_id="server", device_key="device", secret_key="secret")
+    try:
+        ok = asyncio.run(
+            client.add_ingredient(
+                "recipe-1",
+                Ingredient(
+                    id="ingredient-1",
+                    recipe_id="recipe-1",
+                    food_id="food-1",
+                    title="Запеченное Филе Карпа",
+                    portion_id="0",
+                    amount=Decimal("3"),
+                    portion_description="100г",
+                ),
+            )
+        )
+    finally:
+        asyncio.run(http.aclose())
+
+    assert ok is True
+    form = parse_qs(requests[0].content.decode())
+    assert form["action"] == ["ingredientsave"]
+    assert form["portionamount"] == ["3"]

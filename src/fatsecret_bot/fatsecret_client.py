@@ -56,6 +56,21 @@ def _strip_tags(value: str) -> str:
     return re.sub(r"<[^>]+>", "", value).strip()
 
 
+_METADATA_SEPARATOR = "S#E{P<A*R*A>T}O!R"
+
+
+def _metadata_value(value: Any, key: str) -> str:
+    text = str(value or "").strip().replace("&lt;", "<").replace("&gt;", ">")
+    if _METADATA_SEPARATOR not in text:
+        return ""
+    parts = text.split(_METADATA_SEPARATOR)
+    normalized_key = key.casefold()
+    for index, part in enumerate(parts[:-1]):
+        if part.strip().casefold() == normalized_key:
+            return parts[index + 1].strip()
+    return ""
+
+
 def _clean_food_text(value: Any) -> str:
     text = _strip_tags(str(value or ""))
     if "S#E{P<A*R*A>T}O" in text or "mtypeS#E" in text:
@@ -73,7 +88,34 @@ def _food_brand(data: dict[str, Any]) -> str:
         cleaned = _clean_food_text(value)
         if cleaned:
             return cleaned
+    for value in data.values():
+        brand = _metadata_value(value, "mname")
+        if brand:
+            return brand
     return ""
+
+
+def _default_portion_description(data: dict[str, Any]) -> str:
+    for key in (
+        "defaultPortionDescription",
+        "default_portion_description",
+        "portionDescription",
+        "portion_description",
+        "servingSize",
+        "serving_size",
+    ):
+        cleaned = _clean_food_text(data.get(key))
+        if cleaned:
+            return cleaned
+    for value in data.values():
+        description = _metadata_value(value, "ssize")
+        if description:
+            return description
+    return ""
+
+
+def _form_decimal(value: Decimal) -> str:
+    return format(value.normalize(), "f")
 
 
 def _looks_like_true(text: str) -> bool:
@@ -165,6 +207,8 @@ class FatSecretClient:
                     title=item.title,
                     description=item.description,
                     brand=item.brand,
+                    default_portion_id=item.default_portion_id,
+                    default_portion_description=item.default_portion_description,
                     energy_per_portion=item.energy_per_portion,
                     carbohydrate_per_portion=item.carbohydrate_per_portion,
                     protein_per_portion=item.protein_per_portion,
@@ -239,7 +283,7 @@ class FatSecretClient:
             "iid": ingredient.remote_ingredient_id or "0",
             "entryname": ingredient.title,
             "portionid": ingredient.portion_id or "0",
-            "portionamount": str(ingredient.amount),
+            "portionamount": _form_decimal(ingredient.amount),
         }
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
         return _looks_like_true(response.text)
@@ -331,17 +375,23 @@ class FatSecretClient:
             title = _text(node, "title")
             if not remote_id or not title:
                 continue
+            short_description = _text(node, "shortDescription")
             recipes.append(
                 RecipeSummary(
                     remote_id=remote_id,
                     title=title,
-                    description=_clean_food_text(_text(node, "description") or _text(node, "shortDescription")),
+                    description=_clean_food_text(_text(node, "description") or short_description),
                     brand=(
                         _clean_food_text(_text(node, "brand"))
                         or _clean_food_text(_text(node, "brandName"))
                         or _clean_food_text(_text(node, "brand_name"))
                         or _clean_food_text(_text(node, "manufacturer"))
                         or _clean_food_text(_text(node, "manufacturerName"))
+                        or _metadata_value(short_description, "mname")
+                    ),
+                    default_portion_id=_text(node, "defaultPortionID", "0"),
+                    default_portion_description=(
+                        _text(node, "defaultPortionDescription") or _metadata_value(short_description, "ssize")
                     ),
                     energy_per_portion=_decimal(_text(node, "energyPerPortion"), None),
                     carbohydrate_per_portion=_decimal(_text(node, "carbohydratePerPortion"), None),
@@ -367,6 +417,7 @@ class FatSecretClient:
             prep_time=_int(_text(root, "preparationtimemin")),
             cook_time=_int(_text(root, "cookingtimemin")),
             default_portion_id=_text(root, "defaultPortionID", "0"),
+            default_portion_description=_text(root, "defaultPortionDescription"),
         )
         recipe.ingredients = []
         for node in root.findall(".//recipeingredient"):
@@ -406,6 +457,13 @@ class FatSecretClient:
                         title=_strip_tags(str(raw_title)),
                         description=_clean_food_text(item.get("description") or item.get("subtitle") or ""),
                         brand=_food_brand(item),
+                        default_portion_id=str(
+                            item.get("defaultPortionID")
+                            or item.get("defaultPortionId")
+                            or item.get("default_portion_id")
+                            or "0"
+                        ),
+                        default_portion_description=_default_portion_description(item),
                         energy_per_portion=_decimal(
                             str(
                                 item.get("energyPerPortion")
@@ -445,7 +503,12 @@ class FatSecretClient:
             title=recipe.title or result.title,
             description=result.description,
             brand=result.brand,
-            default_portion_id=recipe.default_portion_id or "0",
+            default_portion_id=(
+                recipe.default_portion_id
+                if recipe.default_portion_id and recipe.default_portion_id != "0"
+                else result.default_portion_id or "0"
+            ),
+            default_portion_description=recipe.default_portion_description or result.default_portion_description,
             energy_per_portion=result.energy_per_portion,
             carbohydrate_per_portion=result.carbohydrate_per_portion,
             protein_per_portion=result.protein_per_portion,
