@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from fatsecret_bot.models import Ingredient, Recipe
-from fatsecret_bot.telegram_bot import _format_recipe, _recipe_actions_keyboard
+from fatsecret_bot.telegram_bot import TelegramRecipeBot, _format_recipe, _recipe_actions_keyboard
 
 
 def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
@@ -45,11 +45,36 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     assert "- Соус: 0.06 порции" in text
 
 
-def test_recipe_actions_keyboard_starts_with_list_navigation() -> None:
+def test_recipe_actions_keyboard_uses_navigation_without_page_label() -> None:
     keyboard = _recipe_actions_keyboard("recipe-1", page=1, page_action="list", total_pages=3)
     rows = keyboard.inline_keyboard
 
-    assert [button.text for button in rows[0]] == ["Назад", "2/3", "Дальше"]
-    assert rows[0][1].callback_data == "noop:0"
-    assert [button.text for button in rows[1]] == ["Поиск", "Создать из списка"]
-    assert [button.text for button in rows[-1]] == ["Удалить в FatSecret", "В меню"]
+    assert [button.text for button in rows[0]] == ["Назад", "Дальше"]
+    assert all("/" not in button.text for button in rows[0])
+    flat_texts = [button.text for row in rows for button in row]
+    assert "Синхронизировать" not in flat_texts
+    assert "Удалить в FatSecret" not in flat_texts
+    assert "В меню" not in flat_texts
+
+
+def test_recipe_actions_keyboard_is_absent_without_navigation() -> None:
+    assert _recipe_actions_keyboard("recipe-1", page=0, page_action="list", total_pages=1) is None
+
+
+def test_recipe_list_keyboard_keeps_only_recipe_buttons_and_navigation_inline() -> None:
+    recipes = [
+        Recipe(id=f"recipe-{index}", title=f"Рецепт {index}", remote_ids={"tg1": "remote"})
+        for index in range(9)
+    ]
+    bot = object.__new__(TelegramRecipeBot)
+
+    keyboard = TelegramRecipeBot._recipe_list_keyboard(bot, recipes, 0, "list", {"tg1": "Каба"})
+    rows = keyboard.inline_keyboard
+    flat_texts = [button.text for row in rows for button in row]
+
+    assert "Дальше" in flat_texts
+    assert "1/2" not in flat_texts
+    assert "Поиск" not in flat_texts
+    assert "Создать из списка" not in flat_texts
+    assert "Удалить несколько" not in flat_texts
+    assert "В меню" not in flat_texts

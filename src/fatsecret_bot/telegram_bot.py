@@ -26,12 +26,37 @@ RECIPE_LIST_CANDIDATES_PAGE_SIZE = 10
 RECIPE_LIST_CANDIDATES_PREFETCH_PAGES = 2
 RECIPE_LIST_CANDIDATES_PREFETCH_SIZE = RECIPE_LIST_CANDIDATES_PAGE_SIZE * RECIPE_LIST_CANDIDATES_PREFETCH_PAGES
 MAIN_BUTTONS = {"Рецепты", "Группы", "Аккаунты"}
+RECIPE_KEYBOARD_BUTTONS = {
+    "Поиск",
+    "Создать из списка",
+    "Удалить несколько",
+    "Синхронизировать",
+    "Удалить",
+    "В меню",
+}
 RECIPE_LIST_LINE_RE = re.compile(r"^(?P<name>.+?)\s+(?P<grams>\d+(?:[,.]\d+)?)$")
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Рецепты"],
         ["Группы", "Аккаунты"],
+    ],
+    resize_keyboard=True,
+)
+
+RECIPES_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Поиск", "Создать из списка"],
+        ["Удалить несколько", "В меню"],
+    ],
+    resize_keyboard=True,
+)
+
+RECIPE_DETAIL_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Синхронизировать", "Удалить"],
+        ["Поиск", "Создать из списка"],
+        ["В меню"],
     ],
     resize_keyboard=True,
 )
@@ -96,30 +121,16 @@ def _recipe_actions_keyboard(
     page: int = 0,
     page_action: str = "list",
     total_pages: int = 1,
-) -> InlineKeyboardMarkup:
+) -> InlineKeyboardMarkup | None:
     total_pages = max(1, total_pages)
     page = min(max(0, page), total_pages - 1)
     page_action = page_action if page_action in {"list", "searchpage"} else "list"
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop:0"))
     if page + 1 < total_pages:
         nav.append(InlineKeyboardButton("Дальше", callback_data=f"{page_action}:{page + 1}"))
-    return InlineKeyboardMarkup(
-        [
-            nav,
-            [
-                InlineKeyboardButton("Поиск", callback_data="search:0"),
-                InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0"),
-            ],
-            [InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")],
-            [
-                InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}"),
-                InlineKeyboardButton("В меню", callback_data="menu:0"),
-            ],
-        ]
-    )
+    return InlineKeyboardMarkup([nav]) if nav else None
 
 
 def _recipe_owner_text(recipe: Recipe, account_labels: dict[str, str]) -> str:
@@ -253,10 +264,10 @@ def _recipe_list_candidate_keyboard(
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(InlineKeyboardButton("Назад", callback_data=f"recipe_list_cpage:{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page + 1}", callback_data="noop:0"))
     if has_next:
         nav.append(InlineKeyboardButton("Дальше", callback_data=f"recipe_list_cpage:{page + 1}"))
-    buttons.append(nav)
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")])
     return InlineKeyboardMarkup(buttons)
 
@@ -540,15 +551,17 @@ class TelegramRecipeBot:
             return
         self.storage.delete_unlinked_recipes(group.id)
         recipes = self.storage.list_recipes(group.id)
+        context.user_data["recipe_list_page"] = page
+        context.user_data["group_id"] = group.id
+        if context.user_data.get("reply_keyboard") != "recipes":
+            await update.effective_message.reply_text(
+                "Кнопки рецептов снизу.",
+                reply_markup=RECIPES_KEYBOARD,
+            )
+            context.user_data["reply_keyboard"] = "recipes"
         if not recipes:
             await update.effective_message.reply_text(
                 "Рецептов пока нет. Создай рецепт в FatSecret и обнови список командой /refresh.",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0")],
-                        [InlineKeyboardButton("В меню", callback_data="menu:0")],
-                    ]
-                ),
             )
             return
         await update.effective_message.reply_text(
@@ -584,23 +597,10 @@ class TelegramRecipeBot:
         nav: list[InlineKeyboardButton] = []
         if page > 0:
             nav.append(InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}"))
-        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop:0"))
         if page + 1 < total_pages:
             nav.append(InlineKeyboardButton("Дальше", callback_data=f"{page_action}:{page + 1}"))
         if nav:
             buttons.append(nav)
-        buttons.append(
-            [
-                InlineKeyboardButton("Поиск", callback_data="search:0"),
-                InlineKeyboardButton("Создать из списка", callback_data="recipe_list_create:0"),
-            ]
-        )
-        buttons.append(
-            [
-                InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}"),
-                InlineKeyboardButton("В меню", callback_data="menu:0"),
-            ]
-        )
         return InlineKeyboardMarkup(buttons)
 
     def _filter_recipes(self, query: str, group_id: str) -> list[Recipe]:
@@ -739,7 +739,7 @@ class TelegramRecipeBot:
             )
         elif action == "list":
             context.user_data.clear()
-            await self._edit_recipe_list(query, int(value or "0"))
+            await self._edit_recipe_list(query, int(value or "0"), context)
         elif action == "search":
             context.user_data.clear()
             group = await self._require_active_group_query(query, update.effective_user.id)
@@ -773,7 +773,7 @@ class TelegramRecipeBot:
             await self._edit_recipe_list_draft(query, context)
         elif action == "recipe_list_cancel":
             context.user_data.clear()
-            await self._edit_recipe_list(query, 0)
+            await self._edit_recipe_list(query, 0, context)
         elif action == "refresh":
             context.user_data.clear()
             await self._refresh_from_callback(query)
@@ -794,7 +794,7 @@ class TelegramRecipeBot:
             await self._execute_batch_delete(query, context)
         elif action == "bdcancel":
             context.user_data.clear()
-            await self._edit_recipe_list(query, 0)
+            await self._edit_recipe_list(query, 0, context)
         elif action == "delete":
             context.user_data.clear()
             await self._confirm_delete_recipe(query, value)
@@ -824,7 +824,7 @@ class TelegramRecipeBot:
         context.user_data["group_id"] = group.id
         await query.edit_message_text("Пришли логин или email от FatSecret. Сообщение я постараюсь удалить после чтения.")
 
-    async def _edit_recipe_list(self, query, page: int) -> None:
+    async def _edit_recipe_list(self, query, page: int, context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
         user = query.from_user
         group = self.storage.active_group_for_user(user.id) if user else None
         if group is None:
@@ -835,6 +835,12 @@ class TelegramRecipeBot:
             return
         self.storage.delete_unlinked_recipes(group.id)
         recipes = self.storage.list_recipes(group.id)
+        if context is not None:
+            context.user_data["recipe_list_page"] = page
+            context.user_data["group_id"] = group.id
+            if context.user_data.get("reply_keyboard") != "recipes" and query.message is not None:
+                await query.message.reply_text("Кнопки рецептов снизу.", reply_markup=RECIPES_KEYBOARD)
+                context.user_data["reply_keyboard"] = "recipes"
         if not recipes:
             await query.edit_message_text("Рецептов пока нет.")
             return
@@ -863,6 +869,9 @@ class TelegramRecipeBot:
                 parse_mode=ParseMode.HTML,
             )
             return
+        if context.user_data.get("reply_keyboard") != "recipes" and query.message is not None:
+            await query.message.reply_text("Кнопки рецептов снизу.", reply_markup=RECIPES_KEYBOARD)
+            context.user_data["reply_keyboard"] = "recipes"
         await query.edit_message_text(
             f"Найдено рецептов: {len(recipes)}",
             reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage", self._account_labels_for_group(group_id)),
@@ -914,6 +923,12 @@ class TelegramRecipeBot:
             await query.edit_message_text("Рецепт не найден.")
             return
         total_pages, page_action = self._recipe_detail_page_count(query.from_user.id, context, page_action)
+        context.user_data["current_recipe_id"] = recipe.id
+        context.user_data["recipe_list_page"] = page
+        context.user_data["recipe_page_action"] = page_action
+        if context.user_data.get("reply_keyboard") != "recipe_detail" and query.message is not None:
+            await query.message.reply_text("Кнопки рецепта снизу.", reply_markup=RECIPE_DETAIL_KEYBOARD)
+            context.user_data["reply_keyboard"] = "recipe_detail"
         await query.edit_message_text(
             _format_recipe(recipe),
             reply_markup=_recipe_actions_keyboard(recipe.id, page, page_action, total_pages),
@@ -1025,6 +1040,95 @@ class TelegramRecipeBot:
             ),
         )
 
+    async def _sync_current_recipe_from_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        recipe_id = str(context.user_data.get("current_recipe_id") or "")
+        recipe = self.storage.get_recipe(recipe_id) if recipe_id else None
+        group = self.storage.active_group_for_user(update.effective_user.id)
+        if recipe is None or group is None or recipe.group_id != group.id:
+            await update.effective_message.reply_text("Открой рецепт из списка и нажми «Синхронизировать».")
+            return
+        accounts = {account.key: account.label for account in self.storage.list_fatsecret_accounts(recipe.group_id)}
+        source_keys = [key for key in recipe.remote_ids if key in accounts]
+        if not source_keys:
+            if not recipe.remote_ids:
+                self.storage.delete_recipe(recipe.id)
+                await update.effective_message.reply_text(
+                    "Этот рецепт не был создан ни в одном FatSecret аккаунте, поэтому я удалил локальный черновик.",
+                    reply_markup=RECIPES_KEYBOARD,
+                )
+                return
+            await update.effective_message.reply_text(
+                "Рецепт привязан только к FatSecret аккаунтам, которые сейчас не подключены к этой группе.",
+                reply_markup=RECIPE_DETAIL_KEYBOARD,
+            )
+            return
+        if len(source_keys) > 1:
+            await update.effective_message.reply_text(
+                "На каком FatSecret аккаунте сейчас правильная версия рецепта?",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton(f"Из {accounts[key]}", callback_data=f"syncfrom:{key}:{recipe_id}")]
+                        for key in source_keys
+                    ]
+                ),
+            )
+            return
+        await self._sync_recipe_from_message(update, recipe_id, source_keys[0])
+
+    async def _sync_recipe_from_message(self, update: Update, recipe_id: str, source_account_key: str) -> None:
+        recipe = self.storage.get_recipe(recipe_id)
+        group = self.storage.active_group_for_user(update.effective_user.id)
+        if recipe is None or group is None or recipe.group_id != group.id:
+            await update.effective_message.reply_text("Рецепт не найден в активной группе.")
+            return
+        account_labels = {
+            account.key: account.label
+            for account in self.storage.list_fatsecret_accounts(recipe.group_id)
+        }
+        source_label = account_labels.get(source_account_key, source_account_key)
+        status = await update.effective_message.reply_text(
+            f"Синхронизирую рецепт из FatSecret аккаунта «{source_label}»..."
+        )
+        try:
+            results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("sync failed")
+            await status.edit_text(f"Ошибка синхронизации: {exc}")
+            return
+        lines = [
+            f"{account_labels.get(result.account_key, result.account_key)}: {'OK' if result.ok else 'ERROR'}"
+            f" {result.remote_recipe_id or ''} {result.message}"
+            for result in results
+        ]
+        await status.edit_text("Синхронизация завершена:\n" + "\n".join(lines))
+
+    async def _confirm_current_recipe_delete_from_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        recipe_id = str(context.user_data.get("current_recipe_id") or "")
+        recipe = self.storage.get_recipe(recipe_id) if recipe_id else None
+        group = self.storage.active_group_for_user(update.effective_user.id)
+        if recipe is None or group is None or recipe.group_id != group.id:
+            await update.effective_message.reply_text("Открой рецепт из списка и нажми «Удалить».")
+            return
+        await update.effective_message.reply_text(
+            f"Удалить «{html.escape(recipe.title)}» из FatSecret на всех привязанных аккаунтах?\n\n"
+            "После успешного удаления бот уберет рецепт из своего списка.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete_confirm:{recipe_id}")],
+                    [InlineKeyboardButton("Отмена", callback_data=f"open:{recipe_id}")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
     def _batch_delete_ids(self, context: ContextTypes.DEFAULT_TYPE) -> set[str]:
         selected = context.user_data.setdefault("batch_delete_ids", set())
         if not isinstance(selected, set):
@@ -1050,6 +1154,34 @@ class TelegramRecipeBot:
         selected = self._batch_delete_ids(context)
         selected.intersection_update({recipe.id for recipe in recipes})
         await query.edit_message_text(
+            f"Выбери рецепты для удаления из FatSecret. Отмечено: {len(selected)}",
+            reply_markup=self._batch_delete_keyboard(
+                recipes,
+                page,
+                selected,
+                self._account_labels_for_group(group.id),
+            ),
+        )
+
+    async def _send_batch_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+        user = update.effective_user
+        group = self.storage.active_group_for_user(user.id) if user else None
+        if group is None:
+            await update.effective_message.reply_text(
+                "Сначала создай группу или подключись к группе.",
+                reply_markup=self._groups_keyboard(user.id) if user else None,
+            )
+            return
+        recipes = self.storage.list_recipes(group.id)
+        if not recipes:
+            await update.effective_message.reply_text("Рецептов пока нет.", reply_markup=RECIPES_KEYBOARD)
+            return
+        context.user_data.clear()
+        context.user_data["mode"] = "batch_delete"
+        context.user_data["group_id"] = group.id
+        context.user_data["reply_keyboard"] = "recipes"
+        selected = self._batch_delete_ids(context)
+        await update.effective_message.reply_text(
             f"Выбери рецепты для удаления из FatSecret. Отмечено: {len(selected)}",
             reply_markup=self._batch_delete_keyboard(
                 recipes,
@@ -1096,7 +1228,6 @@ class TelegramRecipeBot:
         nav: list[InlineKeyboardButton] = []
         if page > 0:
             nav.append(InlineKeyboardButton("Назад", callback_data=f"batchdel:{page - 1}"))
-        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"batchdel:{page}"))
         if page + 1 < total_pages:
             nav.append(InlineKeyboardButton("Дальше", callback_data=f"batchdel:{page + 1}"))
         if nav:
@@ -1190,14 +1321,57 @@ class TelegramRecipeBot:
             return
         mode = context.user_data.get("mode")
         text = update.effective_message.text.strip()
+        if text == "В меню":
+            context.user_data.clear()
+            await update.effective_message.reply_text(
+                "Главное меню. Выбери действие на клавиатуре снизу.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
         if mode is not None and text.casefold() in {"отмена", "назад"}:
             await self._cancel_mode(update, context)
             return
+        if text in RECIPE_KEYBOARD_BUTTONS:
+            context.user_data.pop("mode", None)
+            mode = None
         if text in MAIN_BUTTONS:
             context.user_data.clear()
             mode = None
         if mode is None and text == "Рецепты":
             await self._send_recipe_list(update, context, page=0)
+            return
+        if mode is None and text == "Синхронизировать":
+            await self._sync_current_recipe_from_message(update, context)
+            return
+        if mode is None and text == "Удалить":
+            await self._confirm_current_recipe_delete_from_message(update, context)
+            return
+        if mode is None and text == "Поиск":
+            group = await self._require_active_group(update)
+            if group is None:
+                return
+            context.user_data.clear()
+            context.user_data["mode"] = "recipe_search"
+            context.user_data["group_id"] = group.id
+            context.user_data["reply_keyboard"] = "recipes"
+            await update.effective_message.reply_text(
+                "Что искать в рецептах? Пришли часть названия или ингредиента.",
+                reply_markup=RECIPES_KEYBOARD,
+            )
+            return
+        if mode is None and text == "Создать из списка":
+            group = await self._require_active_group(update)
+            if group is None:
+                return
+            context.user_data.clear()
+            context.user_data["mode"] = "recipe_list_title"
+            context.user_data["group_id"] = group.id
+            context.user_data["reply_keyboard"] = "recipes"
+            await update.effective_message.reply_text("Пришли название рецепта.", reply_markup=RECIPES_KEYBOARD)
+            return
+        if mode is None and text == "Удалить несколько":
+            page = int(context.user_data.get("recipe_list_page") or 0)
+            await self._send_batch_delete(update, context, page)
             return
         if mode is None and text == "Аккаунты":
             await self.accounts(update, context)
