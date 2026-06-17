@@ -294,7 +294,18 @@ class RecipeSyncEngine:
         accounts = self.storage.list_fatsecret_accounts(group_id)
         if not accounts:
             raise FatSecretError("Сначала подключи хотя бы один FatSecret аккаунт через кнопку «Аккаунты».")
-        return {account.key: FatSecretClient(account, self.device) for account in accounts}
+        return {account.key: self._build_client(account) for account in accounts}
+
+    def _build_client(self, account: FatSecretAccountConfig) -> FatSecretClient:
+        return FatSecretClient(
+            account,
+            self.device,
+            session=self.storage.get_fatsecret_session(account.key),
+            session_saver=lambda session, account_key=account.key: self.storage.update_fatsecret_session(
+                account_key,
+                session,
+            ),
+        )
 
     async def _close_clients(self, clients: dict[str, FatSecretClient]) -> None:
         for client in clients.values():
@@ -302,7 +313,7 @@ class RecipeSyncEngine:
 
     async def validate_account(self, account: FatSecretAccountConfig) -> None:
         """Verify FatSecret credentials by performing a real mobile API login."""
-        client = FatSecretClient(account, self.device)
+        client = self._build_client(account)
         try:
             await client.login()
         finally:
@@ -310,7 +321,7 @@ class RecipeSyncEngine:
 
     async def refresh_account_recipes(self, account: FatSecretAccountConfig, group_id: str | None = None) -> int:
         """Import cookbook recipes for one connected FatSecret account."""
-        client = FatSecretClient(account, self.device)
+        client = self._build_client(account)
         imported = 0
         try:
             recipes = await client.cookbook()
@@ -333,6 +344,49 @@ class RecipeSyncEngine:
         finally:
             await self._close_clients(clients)
         return imported
+
+    async def load_remote_recipe_index(self, group_id: str) -> list[Recipe]:
+        """Load and merge current cookbook recipe summaries from all FatSecret accounts in a group."""
+        clients = self._build_clients(group_id)
+        merged: dict[str, Recipe] = {}
+        try:
+            for account_key, client in clients.items():
+                summaries = await client.cookbook()
+                for summary in summaries:
+                    normalized = normalize_title(summary.title)
+                    if not normalized:
+                        continue
+                    recipe = merged.get(normalized)
+                    if recipe is None:
+                        recipe = Recipe(
+                            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"fatsecret-bot:recipe:{group_id}:{normalized}")),
+                            title=summary.title,
+                            description=summary.description,
+                            group_id=group_id,
+                        )
+                        merged[normalized] = recipe
+                    recipe.remote_ids[account_key] = summary.remote_id
+        finally:
+            await self._close_clients(clients)
+        return [merged[key] for key in sorted(merged)]
+
+    async def hydrate_live_recipe(self, recipe_ref: Recipe) -> Recipe | None:
+        """Load current recipe details from FatSecret for an in-memory recipe reference."""
+        clients = self._build_clients(recipe_ref.group_id)
+        try:
+            for account_key, remote_id in recipe_ref.remote_ids.items():
+                client = clients.get(account_key)
+                if client is None:
+                    continue
+                remote = await client.get_recipe(remote_id)
+                recipe = _copy_recipe_from_remote(recipe_ref.id, remote)
+                recipe.title = recipe.title or recipe_ref.title
+                recipe.group_id = recipe_ref.group_id
+                recipe.remote_ids = dict(recipe_ref.remote_ids)
+                return recipe
+        finally:
+            await self._close_clients(clients)
+        return None
 
     def _frequent_local_ingredient(self, group_id: str, query: str) -> Ingredient | None:
         normalized_query = normalize_title(query)
@@ -772,6 +826,52 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return results
 
+    async def sync_live_recipe_from_source(
+        self,
+        recipe_ref: Recipe,
+        source_account_key: str,
+    ) -> tuple[Recipe, list[AccountSyncResult]]:
+        """Read a live recipe from one FatSecret account and propagate it without persisting local recipe rows."""
+        source_remote_id = recipe_ref.remote_ids.get(source_account_key)
+        if source_remote_id is None:
+            raise FatSecretError("Выбранный аккаунт не содержит этот рецепт. Обнови список рецептов.")
+
+        results: list[AccountSyncResult] = []
+        clients = self._build_clients(recipe_ref.group_id)
+        try:
+            source_client = clients.get(source_account_key)
+            if source_client is None:
+                raise FatSecretError("Аккаунт-источник больше не подключен.")
+
+            source_remote = await source_client.get_recipe(source_remote_id)
+            recipe = _copy_recipe_from_remote(recipe_ref.id, source_remote)
+            recipe.title = recipe.title or recipe_ref.title
+            recipe.description = _sync_description(timezone=self.timezone)
+            recipe.group_id = recipe_ref.group_id
+            recipe.remote_ids = dict(recipe_ref.remote_ids)
+
+            for account_key, client in clients.items():
+                try:
+                    remote_id = recipe.remote_ids.get(account_key)
+                    if account_key == source_account_key:
+                        ok = await client.save_recipe_meta(recipe, source_remote_id)
+                        if not ok:
+                            raise FatSecretError(f"{client.account.label}: source recipe metadata save returned false")
+                        results.append(AccountSyncResult(account_key, source_remote_id, True, "источник; дата обновлена"))
+                        continue
+                    remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
+                    recipe.remote_ids[account_key] = remote_id
+                    stats = await self._sync_ingredients(client, recipe, remote_id)
+                    ok = await client.save_recipe_meta(recipe, remote_id)
+                    if not ok:
+                        raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
+                    results.append(AccountSyncResult(account_key, remote_id, True, stats.message()))
+                except Exception as exc:  # noqa: BLE001 - keep per-account sync isolated.
+                    results.append(AccountSyncResult(account_key, recipe.remote_ids.get(account_key), False, str(exc)))
+        finally:
+            await self._close_clients(clients)
+        return recipe, results
+
     async def delete_recipe_everywhere(self, recipe_id: str) -> list[AccountSyncResult]:
         """Delete one recipe from every FatSecret account where it is mapped."""
         recipe = self.storage.get_recipe(recipe_id)
@@ -796,6 +896,37 @@ class RecipeSyncEngine:
                     results[recipe_id] = [AccountSyncResult("local", None, False, str(exc))]
         finally:
             await self._close_clients(clients)
+        return results
+
+    async def delete_live_recipe_everywhere(self, recipe_ref: Recipe) -> list[AccountSyncResult]:
+        """Delete one in-memory recipe reference from every mapped FatSecret account."""
+        clients = self._build_clients(recipe_ref.group_id)
+        results: list[AccountSyncResult] = []
+        try:
+            for account_key, remote_id in list(recipe_ref.remote_ids.items()):
+                client = clients.get(account_key)
+                if client is None:
+                    results.append(AccountSyncResult(account_key, remote_id, False, "FatSecret аккаунт больше не подключен"))
+                    continue
+                try:
+                    ok = await client.delete_recipe(remote_id)
+                    if not ok:
+                        raise FatSecretError(f"{client.account.label}: recipe delete returned false")
+                    results.append(AccountSyncResult(account_key, remote_id, True, "удален в FatSecret"))
+                except Exception as exc:  # noqa: BLE001 - keep per-account deletion isolated.
+                    results.append(AccountSyncResult(account_key, remote_id, False, str(exc)))
+        finally:
+            await self._close_clients(clients)
+        return results
+
+    async def delete_live_recipes_everywhere(self, recipe_refs: list[Recipe]) -> dict[str, list[AccountSyncResult]]:
+        """Delete several in-memory recipe references from FatSecret."""
+        results: dict[str, list[AccountSyncResult]] = {}
+        for recipe in recipe_refs:
+            try:
+                results[recipe.id] = await self.delete_live_recipe_everywhere(recipe)
+            except Exception as exc:  # noqa: BLE001 - keep batch deletion moving.
+                results[recipe.id] = [AccountSyncResult("local", None, False, str(exc))]
         return results
 
     async def _delete_recipe_with_clients(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from fatsecret_bot.models import RecipeSummary
+from fatsecret_bot.models import FatSecretSession, RecipeSummary
 from fatsecret_bot.storage import Storage, normalize_title
 
 
@@ -252,6 +252,36 @@ def test_fatsecret_account_upsert_replaces_user_account(tmp_path) -> None:
         assert account.password == "new-password"
         assert account.market == "PL"
         assert account.language == "en"
+    finally:
+        storage.close()
+
+
+def test_fatsecret_session_is_cached_and_reset_on_account_upsert(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        account_key = storage.upsert_fatsecret_account(
+            telegram_id=11,
+            label="User One",
+            username="one@example.com",
+            password="password",
+            market="BY",
+            language="ru",
+        )
+        session = FatSecretSession(server_id="server", device_key="device", secret_key="secret")
+
+        assert storage.get_fatsecret_session(account_key) is None
+        assert storage.update_fatsecret_session(account_key, session) is True
+        assert storage.get_fatsecret_session(account_key) == session
+
+        storage.upsert_fatsecret_account(
+            telegram_id=11,
+            label="User One",
+            username="one@example.com",
+            password="new-password",
+            market="BY",
+            language="ru",
+        )
+        assert storage.get_fatsecret_session(account_key) is None
     finally:
         storage.close()
 

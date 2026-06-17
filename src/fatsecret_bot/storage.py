@@ -9,7 +9,7 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from .models import FatSecretAccountConfig, Ingredient, Recipe, RecipeGroup, RecipeGroupMember, RecipeSummary
+from .models import FatSecretAccountConfig, FatSecretSession, Ingredient, Recipe, RecipeGroup, RecipeGroupMember, RecipeSummary
 
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
@@ -97,6 +97,10 @@ class Storage:
                 password TEXT NOT NULL,
                 market TEXT NOT NULL,
                 language TEXT NOT NULL,
+                session_server_id TEXT,
+                session_device_key TEXT,
+                session_secret_key TEXT,
+                session_updated_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -147,6 +151,10 @@ class Storage:
             """
         )
         self._ensure_column("telegram_users", "active_group_id", "TEXT")
+        self._ensure_column("fatsecret_accounts", "session_server_id", "TEXT")
+        self._ensure_column("fatsecret_accounts", "session_device_key", "TEXT")
+        self._ensure_column("fatsecret_accounts", "session_secret_key", "TEXT")
+        self._ensure_column("fatsecret_accounts", "session_updated_at", "TEXT")
         self._ensure_column("recipes", "group_id", "TEXT")
         self._ensure_column("recipes", "steps", "TEXT NOT NULL DEFAULT '[]'")
         self._conn.execute("DROP INDEX IF EXISTS idx_recipes_normalized_title")
@@ -345,6 +353,42 @@ class Storage:
             market=row["market"],
             language=row["language"],
         )
+
+    def get_fatsecret_session(self, account_key: str) -> FatSecretSession | None:
+        """Return a cached FatSecret mobile session for an account, if one is stored."""
+        row = self._conn.execute(
+            """
+            SELECT session_server_id, session_device_key, session_secret_key
+            FROM fatsecret_accounts
+            WHERE account_key = ?
+            """,
+            (account_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        server_id = row["session_server_id"]
+        device_key = row["session_device_key"]
+        secret_key = row["session_secret_key"]
+        if not server_id or not device_key or not secret_key:
+            return None
+        return FatSecretSession(server_id=server_id, device_key=device_key, secret_key=secret_key)
+
+    def update_fatsecret_session(self, account_key: str, session: FatSecretSession) -> bool:
+        """Persist the latest FatSecret mobile session for reuse by future API clients."""
+        cursor = self._conn.execute(
+            """
+            UPDATE fatsecret_accounts
+            SET session_server_id = ?,
+                session_device_key = ?,
+                session_secret_key = ?,
+                session_updated_at = ?,
+                updated_at = ?
+            WHERE account_key = ?
+            """,
+            (session.server_id, session.device_key, session.secret_key, _now(), _now(), account_key),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
 
     def active_group_for_user(self, telegram_id: int) -> RecipeGroup | None:
         """Return the active recipe group for a Telegram user."""
@@ -557,6 +601,10 @@ class Storage:
                 password = excluded.password,
                 market = excluded.market,
                 language = excluded.language,
+                session_server_id = NULL,
+                session_device_key = NULL,
+                session_secret_key = NULL,
+                session_updated_at = NULL,
                 updated_at = excluded.updated_at
             """,
             (account_key, telegram_id, label, username, password, market, language, now, now),

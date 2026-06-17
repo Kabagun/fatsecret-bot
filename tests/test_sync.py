@@ -4,7 +4,7 @@ import asyncio
 import datetime as dt
 from decimal import Decimal
 
-from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
+from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe, RecipeSummary
 from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import FatSecretError, RecipeSyncEngine, ResolvedRecipeListItem, _sync_description
 
@@ -41,6 +41,25 @@ class FakeFatSecretClient:
     async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
         self.saved_meta.append(recipe)
         return True
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeCookbookClient:
+    def __init__(self, summaries: list[RecipeSummary], account_key: str) -> None:
+        self.account = FatSecretAccountConfig(
+            key=account_key,
+            label=account_key,
+            username=f"{account_key}@example.com",
+            password="secret",
+            market="BY",
+            language="ru",
+        )
+        self.summaries = summaries
+
+    async def cookbook(self) -> list[RecipeSummary]:
+        return list(self.summaries)
 
     async def close(self) -> None:
         return None
@@ -547,6 +566,94 @@ def test_create_recipe_from_list_deletes_local_recipe_when_every_account_fails(t
         else:
             raise AssertionError("expected FatSecretError")
 
+        assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+def test_load_remote_recipe_index_merges_live_cookbooks_by_title(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": FakeCookbookClient([RecipeSummary(remote_id="111", title="Омлет")], "tg11"),
+            "tg22": FakeCookbookClient(
+                [
+                    RecipeSummary(remote_id="222", title="омлет"),
+                    RecipeSummary(remote_id="333", title="Салат"),
+                ],
+                "tg22",
+            ),
+        }
+
+        recipes = asyncio.run(engine.load_remote_recipe_index("group"))
+
+        assert [(recipe.title, recipe.remote_ids) for recipe in recipes] == [
+            ("Омлет", {"tg11": "111", "tg22": "222"}),
+            ("Салат", {"tg22": "333"}),
+        ]
+        assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(id="111", title="Омлет", group_id="group")
+        source_recipe.ingredients = [
+            Ingredient(
+                id="src-1",
+                recipe_id="111",
+                food_id="food-1",
+                title="Яйцо",
+                portion_id="portion-1",
+                amount=Decimal("2"),
+            )
+        ]
+        target_recipe = Recipe(id="222", title="Омлет", group_id="group")
+        recipe_ref = Recipe(
+            id="local-live",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "111", "tg22": "222"},
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        first = FakeFatSecretClient(source_recipe, account_key="tg11")
+        second = FakeFatSecretClient(target_recipe, account_key="tg22")
+        engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+
+        synced, results = asyncio.run(engine.sync_live_recipe_from_source(recipe_ref, "tg11"))
+
+        assert synced.id == "local-live"
+        assert synced.remote_ids == {"tg11": "111", "tg22": "222"}
+        assert [result.ok for result in results] == [True, True]
+        assert first.saved_meta
+        assert second.saved_ingredients[0].title == "Яйцо"
+        assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+def test_delete_live_recipes_everywhere_does_not_require_local_recipe_rows(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_ref = Recipe(
+            id="local-live",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "111", "tg22": "222"},
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        first = FakeFatSecretClient(Recipe(id="111", title="Омлет"), account_key="tg11")
+        second = FakeFatSecretClient(Recipe(id="222", title="Омлет"), account_key="tg22")
+        engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+
+        results = asyncio.run(engine.delete_live_recipes_everywhere([recipe_ref]))
+
+        assert all(result.ok for result in results["local-live"])
+        assert first.deleted_recipe_ids == ["111"]
+        assert second.deleted_recipe_ids == ["222"]
         assert storage.list_recipes("group") == []
     finally:
         storage.close()

@@ -6,7 +6,7 @@ import re
 import uuid
 import xml.etree.ElementTree as ET
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 import httpx
@@ -167,12 +167,16 @@ class FatSecretClient:
         account: FatSecretAccountConfig,
         device: FatSecretDeviceConfig,
         http: httpx.AsyncClient | None = None,
+        session: FatSecretSession | None = None,
+        session_saver: Callable[[FatSecretSession], None] | None = None,
     ) -> None:
         self.account = account
         self.device = device
         self._http = http or httpx.AsyncClient(timeout=30)
         self._owns_http = http is None
-        self._session: FatSecretSession | None = None
+        self._session: FatSecretSession | None = session
+        self._session_from_cache = session is not None
+        self._session_saver = session_saver
 
     async def close(self) -> None:
         if self._owns_http:
@@ -198,6 +202,9 @@ class FatSecretClient:
                 device_key=str(data["deviceKey"]),
                 secret_key=str(data["secretKey"]),
             )
+            self._session_from_cache = False
+            if self._session_saver is not None:
+                self._session_saver(self._session)
         except KeyError as exc:
             raise FatSecretError(f"{self.account.label}: login response has no {exc.args[0]}") from exc
         return self._session
@@ -319,6 +326,13 @@ class FatSecretClient:
         common.update(fields)
         url = f"https://android.fatsecret.com/android/{page}"
         response = await self._http.post(url, data=common, headers=self._headers("application/x-www-form-urlencoded"))
+        if response.status_code in {401, 403, 500} and self._session_from_cache:
+            self._session = None
+            self._session_from_cache = False
+            session = await self.login()
+            common = self._common_form(session)
+            common.update(fields)
+            response = await self._http.post(url, data=common, headers=self._headers("application/x-www-form-urlencoded"))
         if response.status_code != 200:
             raise FatSecretError(f"{self.account.label}: {page} failed with HTTP {response.status_code}")
         return response

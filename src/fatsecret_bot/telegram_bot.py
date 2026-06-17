@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from decimal import Decimal, InvalidOperation
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -25,6 +26,9 @@ RECIPES_PAGE_SIZE = 8
 RECIPE_LIST_CANDIDATES_PAGE_SIZE = 10
 RECIPE_LIST_CANDIDATES_PREFETCH_PAGES = 2
 RECIPE_LIST_CANDIDATES_PREFETCH_SIZE = RECIPE_LIST_CANDIDATES_PAGE_SIZE * RECIPE_LIST_CANDIDATES_PREFETCH_PAGES
+RECIPE_CACHE_KEY = "recipe_cache"
+RECIPE_CACHE_GROUP_KEY = "recipe_cache_group_id"
+RECIPE_CACHE_LOADED_KEY = "recipe_cache_loaded_at"
 MAIN_BUTTONS = {"Поиск рецептов", "Рецепты", "Создать из списка", "Группы", "Аккаунты"}
 LIST_WIDTH_LINE = "--------------------------------"
 PORTION_DESCRIPTION_RE = re.compile(
@@ -385,6 +389,58 @@ class TelegramRecipeBot:
             return True
         return not self.allowed_user_ids and self.storage.registered_user_count() < 2
 
+    def _recipe_cache(self, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> list[Recipe] | None:
+        if context.chat_data.get(RECIPE_CACHE_GROUP_KEY) != group_id:
+            return None
+        recipes = context.chat_data.get(RECIPE_CACHE_KEY)
+        return recipes if isinstance(recipes, list) else None
+
+    def _set_recipe_cache(self, context: ContextTypes.DEFAULT_TYPE, group_id: str, recipes: list[Recipe]) -> None:
+        context.chat_data[RECIPE_CACHE_GROUP_KEY] = group_id
+        context.chat_data[RECIPE_CACHE_KEY] = recipes
+        context.chat_data[RECIPE_CACHE_LOADED_KEY] = time.time()
+
+    def _clear_recipe_cache(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        context.chat_data.pop(RECIPE_CACHE_GROUP_KEY, None)
+        context.chat_data.pop(RECIPE_CACHE_KEY, None)
+        context.chat_data.pop(RECIPE_CACHE_LOADED_KEY, None)
+
+    def _cached_recipe(self, context: ContextTypes.DEFAULT_TYPE, group_id: str, recipe_id: str) -> Recipe | None:
+        recipes = self._recipe_cache(context, group_id) or []
+        return next((recipe for recipe in recipes if recipe.id == recipe_id), None)
+
+    def _replace_cached_recipe(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        group_id: str,
+        recipe: Recipe,
+    ) -> None:
+        recipes = list(self._recipe_cache(context, group_id) or [])
+        for index, item in enumerate(recipes):
+            if item.id == recipe.id:
+                recipes[index] = recipe
+                self._set_recipe_cache(context, group_id, recipes)
+                return
+        recipes.append(recipe)
+        recipes.sort(key=lambda item: normalize_title(item.title))
+        self._set_recipe_cache(context, group_id, recipes)
+
+    def _remove_cached_recipe(self, context: ContextTypes.DEFAULT_TYPE, group_id: str, recipe_id: str) -> None:
+        recipes = [recipe for recipe in self._recipe_cache(context, group_id) or [] if recipe.id != recipe_id]
+        self._set_recipe_cache(context, group_id, recipes)
+
+    def _cached_or_stored_recipe(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        group_id: str,
+        recipe_id: str,
+    ) -> Recipe | None:
+        return self._cached_recipe(context, group_id, recipe_id) or self.storage.get_recipe(recipe_id)
+
+    def _cached_recipe_list(self, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> list[Recipe] | None:
+        recipes = self._recipe_cache(context, group_id)
+        return list(recipes) if recipes is not None else None
+
     async def _require_user(self, update: Update) -> bool:
         user = update.effective_user
         message = update.effective_message
@@ -590,14 +646,6 @@ class TelegramRecipeBot:
         group = await self._require_active_group(update)
         if group is None:
             return
-        msg = await update.effective_message.reply_text(f"Обновляю рецепты группы «{group.name}» из FatSecret...")
-        try:
-            imported = await self.sync_engine.refresh_remote_recipes(group.id)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("refresh failed")
-            await msg.edit_text(f"Ошибка обновления: {exc}")
-            return
-        await msg.edit_text(f"Готово. Импортировано/смёржено записей: {imported}.")
         await self._send_recipe_list(update, context, page=0)
 
     async def recipes(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -608,11 +656,12 @@ class TelegramRecipeBot:
             return
         await self._send_recipe_list(update, context, page=0)
 
-    def _recipe_page(self, group_id: str, page: int) -> tuple[list[Recipe], int, int]:
-        total_count = self.storage.count_recipes(group_id)
+    def _recipe_page(self, recipes: list[Recipe], page: int) -> tuple[list[Recipe], int, int]:
+        total_count = len(recipes)
         total_pages = max(1, (total_count + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE)
         page = min(max(0, page), total_pages - 1)
-        return self.storage.list_recipe_page(group_id, page, RECIPES_PAGE_SIZE), page, total_count
+        start = page * RECIPES_PAGE_SIZE
+        return recipes[start : start + RECIPES_PAGE_SIZE], page, total_count
 
     async def _send_recipe_list(
         self,
@@ -627,18 +676,23 @@ class TelegramRecipeBot:
                 reply_markup=self._groups_keyboard(update.effective_user.id),
             )
             return
-        self.storage.delete_unlinked_recipes(group.id)
-        recipes, page, total_count = self._recipe_page(group.id, page)
+        await self._ensure_main_keyboard(update.effective_message, context)
+        status = await update.effective_message.reply_text(f"Загружаю рецепты группы «{group.name}» из FatSecret...")
+        try:
+            all_recipes = await self.sync_engine.load_remote_recipe_index(group.id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("live recipe list load failed")
+            await status.edit_text(f"Ошибка загрузки рецептов из FatSecret: {exc}")
+            return
+        self._set_recipe_cache(context, group.id, all_recipes)
+        recipes, page, total_count = self._recipe_page(all_recipes, page)
         context.user_data["mode"] = "recipe_search"
         context.user_data["recipe_list_page"] = page
         context.user_data["group_id"] = group.id
-        await self._ensure_main_keyboard(update.effective_message, context)
         if total_count == 0:
-            await update.effective_message.reply_text(
-                "Рецептов пока нет. Создай рецепт в FatSecret и обнови список командой /refresh.",
-            )
+            await status.edit_text("Рецептов пока нет. Создай рецепт в FatSecret и снова нажми «Поиск рецептов».")
             return
-        await update.effective_message.reply_text(
+        await status.edit_text(
             _recipe_list_message("Общий список рецептов:"),
             reply_markup=self._recipe_list_keyboard(
                 recipes,
@@ -690,12 +744,12 @@ class TelegramRecipeBot:
         buttons.append([InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}")])
         return InlineKeyboardMarkup(buttons)
 
-    def _filter_recipes(self, query: str, group_id: str) -> list[Recipe]:
+    def _filter_recipes(self, query: str, recipes: list[Recipe]) -> list[Recipe]:
         terms = normalize_title(query).split()
         if not terms:
             return []
         matches: list[Recipe] = []
-        for recipe in self.storage.list_recipes(group_id):
+        for recipe in recipes:
             haystack = normalize_title(
                 " ".join([recipe.title, recipe.description, *(item.title for item in recipe.ingredients)])
             )
@@ -867,14 +921,14 @@ class TelegramRecipeBot:
             await self._edit_recipe_list(query, 0, context)
         elif action == "refresh":
             context.user_data.clear()
-            await self._refresh_from_callback(query)
+            await self._refresh_from_callback(query, context)
         elif action == "sync":
-            context.user_data.clear()
-            await self._open_sync_menu(query, value)
+            context.user_data.pop("mode", None)
+            await self._open_sync_menu(query, context, value)
         elif action == "syncfrom":
-            context.user_data.clear()
             source_key, _, recipe_id = value.partition(":")
-            await self._sync_recipe_message(query, recipe_id, source_key)
+            context.user_data.pop("mode", None)
+            await self._sync_recipe_message(query, context, recipe_id, source_key)
         elif action == "batchdel":
             await self._open_batch_delete(query, context, int(value or "0"))
         elif action == "bdtoggle":
@@ -887,11 +941,11 @@ class TelegramRecipeBot:
             context.user_data.clear()
             await self._edit_recipe_list(query, 0, context)
         elif action == "delete":
-            context.user_data.clear()
-            await self._confirm_delete_recipe(query, value)
+            context.user_data.pop("mode", None)
+            await self._confirm_delete_recipe(query, context, value)
         elif action == "delete_confirm":
-            context.user_data.clear()
-            await self._delete_recipe(query, value)
+            context.user_data.pop("mode", None)
+            await self._delete_recipe(query, context, value)
         else:
             await query.edit_message_text(
                 "Это действие устарело. Открой список рецептов заново.",
@@ -924,7 +978,18 @@ class TelegramRecipeBot:
                 reply_markup=self._groups_keyboard(user.id) if user else None,
             )
             return
-        recipes, page, total_count = self._recipe_page(group.id, page)
+        all_recipes = self._recipe_cache(context, group.id) if context is not None else None
+        if all_recipes is None:
+            await query.edit_message_text(f"Загружаю рецепты группы «{group.name}» из FatSecret...")
+            try:
+                all_recipes = await self.sync_engine.load_remote_recipe_index(group.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("live recipe list load failed")
+                await query.edit_message_text(f"Ошибка загрузки рецептов из FatSecret: {exc}")
+                return
+            if context is not None:
+                self._set_recipe_cache(context, group.id, all_recipes)
+        recipes, page, total_count = self._recipe_page(all_recipes, page)
         if context is not None:
             context.user_data["mode"] = "recipe_search"
             context.user_data["recipe_list_page"] = page
@@ -955,7 +1020,11 @@ class TelegramRecipeBot:
         if not group_id:
             await query.edit_message_text("Группа поиска устарела. Запусти поиск заново.")
             return
-        recipes = self._filter_recipes(search_query, group_id)
+        cached = self._recipe_cache(context, str(group_id))
+        if cached is None:
+            await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
+            return
+        recipes = self._filter_recipes(search_query, cached)
         if not recipes:
             await query.edit_message_text(
                 f"По запросу «{html.escape(search_query)}» ничего не найдено. Пришли другой текст.",
@@ -969,7 +1038,7 @@ class TelegramRecipeBot:
             reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage", self._account_labels_for_group(group_id)),
         )
 
-    async def _refresh_from_callback(self, query) -> None:
+    async def _refresh_from_callback(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = query.from_user
         group = self.storage.active_group_for_user(user.id) if user else None
         if group is None:
@@ -978,14 +1047,15 @@ class TelegramRecipeBot:
                 reply_markup=self._groups_keyboard(user.id) if user else None,
             )
             return
-        await query.edit_message_text(f"Обновляю рецепты группы «{group.name}» из FatSecret...")
+        await query.edit_message_text(f"Загружаю рецепты группы «{group.name}» из FatSecret...")
         try:
-            imported = await self.sync_engine.refresh_remote_recipes(group.id)
+            recipes = await self.sync_engine.load_remote_recipe_index(group.id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("refresh failed")
             await query.edit_message_text(f"Ошибка обновления: {exc}")
             return
-        await query.edit_message_text(f"Готово. Импортировано/смёржено записей: {imported}.")
+        self._set_recipe_cache(context, group.id, recipes)
+        await self._edit_recipe_list(query, 0, context)
 
     def _recipe_detail_page_count(
         self,
@@ -1000,20 +1070,28 @@ class TelegramRecipeBot:
             search_query = str(context.user_data.get("recipe_search_query") or "").strip()
             group_id = context.user_data.get("group_id")
             if search_query and group_id == group.id:
-                recipes = self._filter_recipes(search_query, group.id)
+                recipes = self._filter_recipes(search_query, self._recipe_cache(context, group.id) or [])
                 return max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE), "searchpage"
-        recipes = self.storage.list_recipes(group.id)
+        recipes = self._recipe_cache(context, group.id) or []
         return max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE), "list"
 
     async def _open_recipe(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
         recipe_id, page, page_action = _parse_open_recipe_value(value)
-        local_recipe = self.storage.get_recipe(recipe_id)
+        group = self.storage.active_group_for_user(query.from_user.id)
+        recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
+        local_recipe = recipe_ref or self.storage.get_recipe(recipe_id)
         if not await self._require_recipe_in_active_group(query, local_recipe):
             return
-        recipe = await self.sync_engine.hydrate_recipe_from_remote(recipe_id)
+        recipe = (
+            await self.sync_engine.hydrate_live_recipe(recipe_ref)
+            if recipe_ref is not None
+            else await self.sync_engine.hydrate_recipe_from_remote(recipe_id)
+        )
         if recipe is None:
             await query.edit_message_text("Рецепт не найден.")
             return
+        if recipe_ref is not None and group is not None:
+            self._replace_cached_recipe(context, group.id, recipe)
         total_pages, page_action = self._recipe_detail_page_count(query.from_user.id, context, page_action)
         context.user_data["current_recipe_id"] = recipe.id
         context.user_data["recipe_list_page"] = page
@@ -1025,8 +1103,9 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
-    async def _open_sync_menu(self, query, recipe_id: str) -> None:
-        recipe = self.storage.get_recipe(recipe_id)
+    async def _open_sync_menu(self, query, context: ContextTypes.DEFAULT_TYPE, recipe_id: str) -> None:
+        group = self.storage.active_group_for_user(query.from_user.id)
+        recipe = self._cached_or_stored_recipe(context, group.id, recipe_id) if group is not None else None
         if not await self._require_recipe_in_active_group(query, recipe):
             return
         accounts = {account.key: account.label for account in self.storage.list_fatsecret_accounts(recipe.group_id)}
@@ -1045,7 +1124,7 @@ class TelegramRecipeBot:
             )
             return
         if len(source_keys) == 1:
-            await self._sync_recipe_message(query, recipe_id, source_keys[0])
+            await self._sync_recipe_message(query, context, recipe_id, source_keys[0])
             return
         buttons = [
             [InlineKeyboardButton(f"Из {accounts[key]}", callback_data=f"syncfrom:{key}:{recipe_id}")]
@@ -1057,8 +1136,16 @@ class TelegramRecipeBot:
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
-    async def _sync_recipe_message(self, query, recipe_id: str, source_account_key: str) -> None:
-        recipe = self.storage.get_recipe(recipe_id)
+    async def _sync_recipe_message(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        recipe_id: str,
+        source_account_key: str,
+    ) -> None:
+        group = self.storage.active_group_for_user(query.from_user.id)
+        recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
+        recipe = recipe_ref or self.storage.get_recipe(recipe_id)
         if not await self._require_recipe_in_active_group(query, recipe):
             return
         account_labels = {
@@ -1068,7 +1155,11 @@ class TelegramRecipeBot:
         source_label = account_labels.get(source_account_key, source_account_key)
         await query.edit_message_text(f"Синхронизирую рецепт из FatSecret аккаунта «{source_label}»...")
         try:
-            results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
+            if recipe_ref is not None:
+                synced_recipe, results = await self.sync_engine.sync_live_recipe_from_source(recipe_ref, source_account_key)
+                self._replace_cached_recipe(context, recipe.group_id, synced_recipe)
+            else:
+                results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
         except Exception as exc:  # noqa: BLE001
             logger.exception("sync failed")
             await query.edit_message_text(f"Ошибка синхронизации: {exc}")
@@ -1088,8 +1179,9 @@ class TelegramRecipeBot:
             ),
         )
 
-    async def _confirm_delete_recipe(self, query, recipe_id: str) -> None:
-        recipe = self.storage.get_recipe(recipe_id)
+    async def _confirm_delete_recipe(self, query, context: ContextTypes.DEFAULT_TYPE, recipe_id: str) -> None:
+        group = self.storage.active_group_for_user(query.from_user.id)
+        recipe = self._cached_or_stored_recipe(context, group.id, recipe_id) if group is not None else None
         if not await self._require_recipe_in_active_group(query, recipe):
             return
         await query.edit_message_text(
@@ -1104,18 +1196,28 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
-    async def _delete_recipe(self, query, recipe_id: str) -> None:
-        recipe = self.storage.get_recipe(recipe_id)
+    async def _delete_recipe(self, query, context: ContextTypes.DEFAULT_TYPE, recipe_id: str) -> None:
+        group = self.storage.active_group_for_user(query.from_user.id)
+        recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
+        recipe = recipe_ref or self.storage.get_recipe(recipe_id)
         if not await self._require_recipe_in_active_group(query, recipe):
             return
         account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts(recipe.group_id)}
         await query.edit_message_text("Удаляю рецепт в FatSecret...")
         try:
-            results = await self.sync_engine.delete_recipe_everywhere(recipe_id)
+            results = (
+                await self.sync_engine.delete_live_recipe_everywhere(recipe_ref)
+                if recipe_ref is not None
+                else await self.sync_engine.delete_recipe_everywhere(recipe_id)
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("delete failed")
             await query.edit_message_text(f"Ошибка удаления: {exc}")
             return
+        if results and all(result.ok for result in results):
+            self._remove_cached_recipe(context, recipe.group_id, recipe_id)
+            if context.user_data.get("current_recipe_id") == recipe_id:
+                context.user_data.pop("current_recipe_id", None)
         lines = [
             f"{account_labels.get(result.account_key, result.account_key)}: "
             f"{'OK' if result.ok else 'ERROR'} {result.remote_recipe_id or ''} {result.message}"
@@ -1136,8 +1238,8 @@ class TelegramRecipeBot:
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         recipe_id = str(context.user_data.get("current_recipe_id") or "")
-        recipe = self.storage.get_recipe(recipe_id) if recipe_id else None
         group = self.storage.active_group_for_user(update.effective_user.id)
+        recipe = self._cached_or_stored_recipe(context, group.id, recipe_id) if group is not None and recipe_id else None
         if recipe is None or group is None or recipe.group_id != group.id:
             await update.effective_message.reply_text("Открой рецепт из списка и нажми «Синхронизировать».")
             return
@@ -1169,11 +1271,18 @@ class TelegramRecipeBot:
                 ),
             )
             return
-        await self._sync_recipe_from_message(update, recipe_id, source_keys[0])
+        await self._sync_recipe_from_message(update, context, recipe_id, source_keys[0])
 
-    async def _sync_recipe_from_message(self, update: Update, recipe_id: str, source_account_key: str) -> None:
-        recipe = self.storage.get_recipe(recipe_id)
+    async def _sync_recipe_from_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        recipe_id: str,
+        source_account_key: str,
+    ) -> None:
         group = self.storage.active_group_for_user(update.effective_user.id)
+        recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
+        recipe = recipe_ref or self.storage.get_recipe(recipe_id)
         if recipe is None or group is None or recipe.group_id != group.id:
             await update.effective_message.reply_text("Рецепт не найден в активной группе.")
             return
@@ -1186,7 +1295,11 @@ class TelegramRecipeBot:
             f"Синхронизирую рецепт из FatSecret аккаунта «{source_label}»..."
         )
         try:
-            results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
+            if recipe_ref is not None:
+                synced_recipe, results = await self.sync_engine.sync_live_recipe_from_source(recipe_ref, source_account_key)
+                self._replace_cached_recipe(context, group.id, synced_recipe)
+            else:
+                results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
         except Exception as exc:  # noqa: BLE001
             logger.exception("sync failed")
             await status.edit_text(f"Ошибка синхронизации: {exc}")
@@ -1204,8 +1317,8 @@ class TelegramRecipeBot:
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         recipe_id = str(context.user_data.get("current_recipe_id") or "")
-        recipe = self.storage.get_recipe(recipe_id) if recipe_id else None
         group = self.storage.active_group_for_user(update.effective_user.id)
+        recipe = self._cached_or_stored_recipe(context, group.id, recipe_id) if group is not None and recipe_id else None
         if recipe is None or group is None or recipe.group_id != group.id:
             await update.effective_message.reply_text("Открой рецепт из списка и нажми «Удалить».")
             return
@@ -1237,7 +1350,10 @@ class TelegramRecipeBot:
                 reply_markup=self._groups_keyboard(user.id) if user else None,
             )
             return
-        recipes = self.storage.list_recipes(group.id)
+        recipes = self._cached_recipe_list(context, group.id)
+        if recipes is None:
+            await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
+            return
         if not recipes:
             await query.edit_message_text("Рецептов пока нет.")
             return
@@ -1264,7 +1380,14 @@ class TelegramRecipeBot:
                 reply_markup=self._groups_keyboard(user.id) if user else None,
             )
             return
-        recipes = self.storage.list_recipes(group.id)
+        recipes = self._cached_recipe_list(context, group.id)
+        if recipes is None:
+            await update.effective_message.reply_text(
+                "Список рецептов еще не загружен. Нажми «Поиск рецептов».",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            context.chat_data["reply_keyboard"] = "main"
+            return
         if not recipes:
             await update.effective_message.reply_text("Рецептов пока нет.", reply_markup=MAIN_KEYBOARD)
             context.chat_data["reply_keyboard"] = "main"
@@ -1335,7 +1458,11 @@ class TelegramRecipeBot:
         if not group_id:
             await query.edit_message_text("Группа выбора устарела. Начни batch-удаление заново.")
             return
-        selected_recipes = [recipe for recipe in self.storage.list_recipes(group_id) if recipe.id in selected]
+        recipes = self._cached_recipe_list(context, str(group_id))
+        if recipes is None:
+            await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
+            return
+        selected_recipes = [recipe for recipe in recipes if recipe.id in selected]
         if not selected_recipes:
             await query.edit_message_text(
                 "Ничего не выбрано.",
@@ -1364,29 +1491,35 @@ class TelegramRecipeBot:
         if not group_id:
             await query.edit_message_text("Группа выбора устарела. Начни batch-удаление заново.")
             return
-        recipes = self.storage.list_recipes(group_id)
-        selected = [recipe.id for recipe in recipes if recipe.id in selected_set]
-        if not selected:
+        recipes = self._cached_recipe_list(context, str(group_id))
+        if recipes is None:
+            await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
+            return
+        selected_recipes = [recipe for recipe in recipes if recipe.id in selected_set]
+        selected = [recipe.id for recipe in selected_recipes]
+        if not selected_recipes:
             await query.edit_message_text("Ничего не выбрано.")
             return
         title_by_id = {recipe.id: recipe.title for recipe in recipes}
         await query.edit_message_text(f"Удаляю рецепты в FatSecret: {len(selected)}...")
         try:
-            results_by_recipe = await self.sync_engine.delete_recipes_everywhere(selected)
+            results_by_recipe = await self.sync_engine.delete_live_recipes_everywhere(selected_recipes)
         except Exception as exc:  # noqa: BLE001
             logger.exception("batch delete failed")
             await query.edit_message_text(f"Ошибка batch удаления: {exc}")
             return
-        context.user_data.clear()
         account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts(group_id)}
         ok_count = 0
         error_count = 0
         lines: list[str] = []
+        deleted_ids: set[str] = set()
         for recipe_id in selected:
             results = results_by_recipe.get(recipe_id, [])
             ok = bool(results) and all(result.ok for result in results)
             ok_count += int(ok)
             error_count += int(not ok)
+            if ok:
+                deleted_ids.add(recipe_id)
             deleted_accounts = [
                 account_labels.get(result.account_key, result.account_key)
                 for result in results
@@ -1403,6 +1536,8 @@ class TelegramRecipeBot:
             if errors:
                 parts.append("ошибка у " + "; ".join(errors))
             lines.append(f"- {title_by_id.get(recipe_id, recipe_id)}: {'; '.join(parts) if parts else 'нет ответа FatSecret'}")
+        self._set_recipe_cache(context, str(group_id), [recipe for recipe in recipes if recipe.id not in deleted_ids])
+        context.user_data.clear()
         text = (
             f"Массовое удаление завершено. Удалено: {ok_count}; ошибок: {error_count}.\n\n"
             + "\n".join(lines)
@@ -2135,7 +2270,15 @@ class TelegramRecipeBot:
             if group is None:
                 return
             group_id = group.id
-        recipes = self._filter_recipes(text, group_id)
+        cached = self._recipe_cache(context, str(group_id))
+        if cached is None:
+            await update.effective_message.reply_text(
+                "Список рецептов еще не загружен. Нажми «Поиск рецептов», потом пришли текст для поиска.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            context.chat_data["reply_keyboard"] = "main"
+            return
+        recipes = self._filter_recipes(text, cached)
         context.user_data["recipe_search_query"] = text
         context.user_data["group_id"] = group_id
         context.user_data["mode"] = "recipe_search"
