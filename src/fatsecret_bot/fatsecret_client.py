@@ -17,6 +17,7 @@ from .models import (
     FatSecretSession,
     FoodSearchResult,
     Ingredient,
+    MAX_RECIPE_STEPS,
     Recipe,
     RecipeSummary,
 )
@@ -129,8 +130,23 @@ def _ingredient_portion_amount(ingredient: Ingredient) -> Decimal:
     return ingredient.amount
 
 
-def _recipe_step(recipe: Recipe, index: int) -> str:
-    return recipe.steps[index] if index < len(recipe.steps) else ""
+_STEP_TAG_RE = re.compile(r"^step(\d+)$")
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _recipe_steps_from_xml(root: ET.Element) -> list[str]:
+    numbered_steps: list[tuple[int, str]] = []
+    for node in root.iter():
+        match = _STEP_TAG_RE.fullmatch(_xml_local_name(node.tag))
+        if match is None:
+            continue
+        step = (node.text or "").strip()
+        if step:
+            numbered_steps.append((int(match.group(1)), step))
+    return [step for _, step in sorted(numbered_steps)[:MAX_RECIPE_STEPS]]
 
 
 def _looks_like_true(text: str) -> bool:
@@ -288,11 +304,12 @@ class FatSecretClient:
             "preptime": str(recipe.prep_time),
             "cooktime": str(recipe.cook_time),
             "osharing": "false",
-            "step1": _recipe_step(recipe, 0),
-            "step2": _recipe_step(recipe, 1),
-            "step3": _recipe_step(recipe, 2),
             "fl": "7",
         }
+        for index, step in enumerate((step.strip() for step in recipe.steps if step.strip()), start=1):
+            if index > MAX_RECIPE_STEPS:
+                break
+            form[f"step{index}"] = step
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
         return _looks_like_true(response.text)
 
@@ -445,15 +462,7 @@ class FatSecretClient:
             portions=_decimal(_text(root, "servings"), Decimal("1")) or Decimal("1"),
             prep_time=_int(_text(root, "preparationtimemin")),
             cook_time=_int(_text(root, "cookingtimemin")),
-            steps=[
-                step
-                for step in (
-                    _text(root, "step1"),
-                    _text(root, "step2"),
-                    _text(root, "step3"),
-                )
-                if step
-            ],
+            steps=_recipe_steps_from_xml(root),
             default_portion_id=_text(root, "defaultPortionID", "0"),
             default_portion_description=_text(root, "defaultPortionDescription"),
         )

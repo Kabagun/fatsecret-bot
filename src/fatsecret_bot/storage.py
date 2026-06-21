@@ -9,7 +9,16 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from .models import FatSecretAccountConfig, FatSecretSession, Ingredient, Recipe, RecipeGroup, RecipeGroupMember, RecipeSummary
+from .models import (
+    MAX_RECIPE_STEPS,
+    FatSecretAccountConfig,
+    FatSecretSession,
+    Ingredient,
+    Recipe,
+    RecipeGroup,
+    RecipeGroupMember,
+    RecipeSummary,
+)
 
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
@@ -25,7 +34,7 @@ def _now() -> str:
 
 def _steps_to_json(steps: list[str] | None) -> str:
     clean_steps = [step.strip() for step in steps or [] if step.strip()]
-    return json.dumps(clean_steps[:3], ensure_ascii=False)
+    return json.dumps(clean_steps[:MAX_RECIPE_STEPS], ensure_ascii=False)
 
 
 def _steps_from_json(value: str | None) -> list[str]:
@@ -37,7 +46,7 @@ def _steps_from_json(value: str | None) -> list[str]:
         return []
     if not isinstance(data, list):
         return []
-    return [str(step).strip() for step in data if str(step).strip()][:3]
+    return [str(step).strip() for step in data if str(step).strip()][:MAX_RECIPE_STEPS]
 
 
 def _decimal_to_text(value: Decimal) -> str:

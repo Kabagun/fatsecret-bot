@@ -5,6 +5,9 @@ from decimal import Decimal
 from typing import Any
 
 
+MAX_RECIPE_STEPS = 100
+
+
 @dataclass(frozen=True)
 class FatSecretAccountConfig:
     key: str

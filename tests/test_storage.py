@@ -204,6 +204,19 @@ def test_recipe_steps_are_stored_and_updated_from_remote(tmp_path) -> None:
         storage.close()
 
 
+def test_recipe_steps_keep_first_100_items(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        steps = [f"Шаг {index}" for index in range(1, 102)]
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("1"), 0, 0, updated_by=1, steps=steps)
+        recipe = storage.get_recipe(recipe_id)
+
+        assert recipe is not None
+        assert recipe.steps == steps[:100]
+    finally:
+        storage.close()
+
+
 def test_migration_normalizes_legacy_zero_portion_gram_ingredients(tmp_path) -> None:
     db_path = tmp_path / "bot.sqlite3"
     storage = Storage(db_path)

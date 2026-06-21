@@ -70,6 +70,9 @@ def test_parse_recipe_ingredients() -> None:
       <servings>2</servings>
       <preparationtimemin>5</preparationtimemin>
       <cookingtimemin>10</cookingtimemin>
+      <step1>Смешать</step1>
+      <step4>Подать</step4>
+      <step2>Запечь</step2>
       <defaultPortionID>4751539</defaultPortionID>
       <recipeingredient>
         <id>1</id>
@@ -84,6 +87,7 @@ def test_parse_recipe_ingredients() -> None:
     recipe = _client()._parse_recipe(xml)
     assert recipe.title == "Омлет"
     assert recipe.default_portion_id == "4751539"
+    assert recipe.steps == ["Смешать", "Запечь", "Подать"]
     assert recipe.ingredients[0].food_id == "4881229"
     assert recipe.ingredients[0].portion_id == "4751539"
 
@@ -322,6 +326,7 @@ def test_save_recipe_meta_posts_recipe_steps() -> None:
         http=http,
     )
     client._session = FatSecretSession(server_id="server", device_key="device", secret_key="secret")
+    steps = [f"Шаг {index}" for index in range(1, 102)]
     try:
         ok = asyncio.run(
             client.save_recipe_meta(
@@ -329,7 +334,7 @@ def test_save_recipe_meta_posts_recipe_steps() -> None:
                     id="local",
                     title="Омлет",
                     description="desc",
-                    steps=["Смешать", "Запечь", "Подать", "Лишнее"],
+                    steps=steps,
                 ),
                 "recipe-1",
             )
@@ -340,6 +345,7 @@ def test_save_recipe_meta_posts_recipe_steps() -> None:
     assert ok is True
     form = parse_qs(requests[0].content.decode())
     assert form["action"] == ["recipesave"]
-    assert form["step1"] == ["Смешать"]
-    assert form["step2"] == ["Запечь"]
-    assert form["step3"] == ["Подать"]
+    assert form["step1"] == ["Шаг 1"]
+    assert form["step4"] == ["Шаг 4"]
+    assert form["step100"] == ["Шаг 100"]
+    assert "step101" not in form

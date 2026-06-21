@@ -62,7 +62,7 @@ def test_parse_recipe_list_payload_splits_ingredients_and_steps() -> None:
         ("Филе", Decimal("300")),
         ("Куркума", Decimal("5")),
     ]
-    assert steps == ["Нарезать филе", "Запечь", "Подать"]
+    assert steps == ["Нарезать филе", "Запечь", "Подать", "Лишнее"]
 
 
 def test_format_resolved_item_shows_macros_per_100g_and_brand() -> None:
@@ -89,8 +89,10 @@ def test_format_resolved_item_shows_macros_per_100g_and_brand() -> None:
     assert _format_resolved_item(item) == "- Кетчуп (Махеевъ) | 100г: 96/1.2/0.1/25.2 | масса: 25г"
 
 
-def test_parse_recipe_steps_keeps_first_three_non_empty_lines() -> None:
-    assert _parse_recipe_steps("Смешать\n\nЗапечь\nПодать\nЛишнее") == ["Смешать", "Запечь", "Подать"]
+def test_parse_recipe_steps_keeps_first_100_non_empty_lines() -> None:
+    steps = "\n".join(f"Шаг {index}" for index in range(1, 102))
+
+    assert _parse_recipe_steps(steps) == [f"Шаг {index}" for index in range(1, 101)]
     assert _parse_recipe_steps("-") == []
 
 

@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -17,7 +18,7 @@ from telegram.ext import (
     filters,
 )
 
-from .models import FatSecretAccountConfig, Recipe, RecipeGroup
+from .models import MAX_RECIPE_STEPS, FatSecretAccountConfig, Recipe, RecipeGroup
 from .storage import Storage, normalize_title
 from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 
@@ -26,9 +27,12 @@ RECIPES_PAGE_SIZE = 8
 RECIPE_LIST_CANDIDATES_PAGE_SIZE = 10
 RECIPE_LIST_CANDIDATES_PREFETCH_PAGES = 2
 RECIPE_LIST_CANDIDATES_PREFETCH_SIZE = RECIPE_LIST_CANDIDATES_PAGE_SIZE * RECIPE_LIST_CANDIDATES_PREFETCH_PAGES
+DISPLAY_RECIPE_STEPS_LIMIT = 20
 RECIPE_CACHE_KEY = "recipe_cache"
 RECIPE_CACHE_GROUP_KEY = "recipe_cache_group_id"
 RECIPE_CACHE_LOADED_KEY = "recipe_cache_loaded_at"
+RECIPE_RENDER_KEY = "recipe_render_key"
+RECIPE_SEARCH_IDS_KEY = "recipe_search_ids"
 MAIN_BUTTONS = {"Поиск рецептов", "Рецепты", "Создать из списка", "Группы", "Аккаунты"}
 LIST_WIDTH_LINE = "--------------------------------"
 PORTION_DESCRIPTION_RE = re.compile(
@@ -55,6 +59,18 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+
+def _format_steps_lines(steps: list[str], limit: int = DISPLAY_RECIPE_STEPS_LIMIT) -> list[str]:
+    clean_steps = [step.strip() for step in steps if step.strip()]
+    lines = [
+        f"{index}. {html.escape(step)}"
+        for index, step in enumerate(clean_steps[:limit], start=1)
+    ]
+    if len(clean_steps) > limit:
+        lines.append(f"...и еще {len(clean_steps) - limit} шагов")
+    return lines
+
+
 def _format_recipe(recipe: Recipe) -> str:
     ingredients = "\n".join(
         f"- {html.escape(item.title)}: {html.escape(_format_ingredient_amount(item.amount, item.portion_description))}"
@@ -63,11 +79,7 @@ def _format_recipe(recipe: Recipe) -> str:
     if not ingredients:
         ingredients = "Ингредиентов пока нет."
     description = f"\n\n{html.escape(recipe.description)}" if recipe.description else ""
-    steps = "\n".join(
-        f"{index}. {html.escape(step)}"
-        for index, step in enumerate(recipe.steps, start=1)
-        if step.strip()
-    )
+    steps = "\n".join(_format_steps_lines(recipe.steps))
     steps_text = f"\n\n<b>Шаги</b>\n{steps}" if steps else ""
     return (
         f"<b>{html.escape(recipe.title)}</b>\n"
@@ -222,14 +234,14 @@ def _parse_recipe_list_payload(text: str) -> tuple[list[RecipeListItem], list[st
         else:
             ingredient_lines.append(line)
     items, bad_lines = _parse_recipe_list_lines("\n".join(ingredient_lines))
-    return items, bad_lines, step_lines[:3]
+    return items, bad_lines, step_lines[:MAX_RECIPE_STEPS]
 
 
 def _parse_recipe_steps(text: str) -> list[str]:
     value = text.strip()
     if value == "-":
         return []
-    return [line.strip() for line in text.splitlines() if line.strip()][:3]
+    return [line.strip() for line in text.splitlines() if line.strip()][:MAX_RECIPE_STEPS]
 
 
 def _format_decimal(value: Decimal | None, digits: int = 1) -> str:
@@ -291,7 +303,7 @@ def _format_recipe_list_draft(
         *(_format_resolved_item(item) for item in items),
     ]
     if steps:
-        lines.extend(["", "<b>Шаги</b>", *(f"{index}. {html.escape(step)}" for index, step in enumerate(steps, start=1))])
+        lines.extend(["", "<b>Шаги</b>", *_format_steps_lines(steps)])
     return "\n".join(lines)
 
 
@@ -440,6 +452,39 @@ class TelegramRecipeBot:
     def _cached_recipe_list(self, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> list[Recipe] | None:
         recipes = self._recipe_cache(context, group_id)
         return list(recipes) if recipes is not None else None
+
+    def _recipes_by_ids(self, context: ContextTypes.DEFAULT_TYPE, group_id: str, recipe_ids: list[str]) -> list[Recipe] | None:
+        cached = self._recipe_cache(context, group_id)
+        if cached is None:
+            return None
+        by_id = {recipe.id: recipe for recipe in cached}
+        return [by_id[recipe_id] for recipe_id in recipe_ids if recipe_id in by_id]
+
+    def _render_key(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        view: str,
+        page: int,
+        extra: str = "",
+    ) -> str:
+        message_id = query.message.message_id if query.message is not None else 0
+        cache_loaded = context.chat_data.get(RECIPE_CACHE_LOADED_KEY, 0)
+        return f"{message_id}:{view}:{page}:{cache_loaded}:{extra}"
+
+    def _is_duplicate_render(self, context: ContextTypes.DEFAULT_TYPE, key: str) -> bool:
+        return context.chat_data.get(RECIPE_RENDER_KEY) == key
+
+    def _mark_rendered(self, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+        context.chat_data[RECIPE_RENDER_KEY] = key
+
+    async def _safe_edit_message_text(self, query, text: str, **kwargs) -> None:
+        try:
+            await query.edit_message_text(text, **kwargs)
+        except BadRequest as exc:
+            if "Message is not modified" in str(exc):
+                return
+            raise
 
     async def _require_user(self, update: Update) -> bool:
         user = update.effective_user
@@ -980,16 +1025,14 @@ class TelegramRecipeBot:
             return
         all_recipes = self._recipe_cache(context, group.id) if context is not None else None
         if all_recipes is None:
-            await query.edit_message_text(f"Загружаю рецепты группы «{group.name}» из FatSecret...")
-            try:
-                all_recipes = await self.sync_engine.load_remote_recipe_index(group.id)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("live recipe list load failed")
-                await query.edit_message_text(f"Ошибка загрузки рецептов из FatSecret: {exc}")
-                return
-            if context is not None:
-                self._set_recipe_cache(context, group.id, all_recipes)
+            await query.edit_message_text(
+                "Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список."
+            )
+            return
         recipes, page, total_count = self._recipe_page(all_recipes, page)
+        render_key = self._render_key(query, context, "list", page) if context is not None else ""
+        if context is not None and self._is_duplicate_render(context, render_key):
+            return
         if context is not None:
             context.user_data["mode"] = "recipe_search"
             context.user_data["recipe_list_page"] = page
@@ -998,7 +1041,8 @@ class TelegramRecipeBot:
         if total_count == 0:
             await query.edit_message_text("Рецептов пока нет.")
             return
-        await query.edit_message_text(
+        await self._safe_edit_message_text(
+            query,
             _recipe_list_message("Общий список рецептов:"),
             reply_markup=self._recipe_list_keyboard(
                 recipes,
@@ -1008,6 +1052,8 @@ class TelegramRecipeBot:
                 total_count=total_count,
             ),
         )
+        if context is not None:
+            self._mark_rendered(context, render_key)
 
     async def _edit_search_results(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
         search_query = context.user_data.get("recipe_search_query")
@@ -1024,19 +1070,33 @@ class TelegramRecipeBot:
         if cached is None:
             await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
             return
-        recipes = self._filter_recipes(search_query, cached)
+        search_ids = context.user_data.get(RECIPE_SEARCH_IDS_KEY)
+        recipes = (
+            self._recipes_by_ids(context, str(group_id), search_ids)
+            if isinstance(search_ids, list)
+            else None
+        )
+        if recipes is None:
+            recipes = self._filter_recipes(search_query, cached)
+            context.user_data[RECIPE_SEARCH_IDS_KEY] = [recipe.id for recipe in recipes]
         if not recipes:
             await query.edit_message_text(
                 f"По запросу «{html.escape(search_query)}» ничего не найдено. Пришли другой текст.",
                 parse_mode=ParseMode.HTML,
             )
             return
+        extra = f"{search_query}:{len(recipes)}:{hash(tuple(recipe.id for recipe in recipes))}"
+        render_key = self._render_key(query, context, "searchpage", page, extra)
+        if self._is_duplicate_render(context, render_key):
+            return
         await self._ensure_main_keyboard(query.message, context)
         context.user_data["mode"] = "recipe_search"
-        await query.edit_message_text(
+        await self._safe_edit_message_text(
+            query,
             _recipe_list_message(f"Найдено рецептов: {len(recipes)}"),
             reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage", self._account_labels_for_group(group_id)),
         )
+        self._mark_rendered(context, render_key)
 
     async def _refresh_from_callback(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = query.from_user
@@ -1070,7 +1130,15 @@ class TelegramRecipeBot:
             search_query = str(context.user_data.get("recipe_search_query") or "").strip()
             group_id = context.user_data.get("group_id")
             if search_query and group_id == group.id:
-                recipes = self._filter_recipes(search_query, self._recipe_cache(context, group.id) or [])
+                search_ids = context.user_data.get(RECIPE_SEARCH_IDS_KEY)
+                recipes = (
+                    self._recipes_by_ids(context, group.id, search_ids)
+                    if isinstance(search_ids, list)
+                    else None
+                )
+                if recipes is None:
+                    recipes = self._filter_recipes(search_query, self._recipe_cache(context, group.id) or [])
+                    context.user_data[RECIPE_SEARCH_IDS_KEY] = [recipe.id for recipe in recipes]
                 return max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE), "searchpage"
         recipes = self._recipe_cache(context, group.id) or []
         return max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE), "list"
@@ -1903,7 +1971,7 @@ class TelegramRecipeBot:
         context.user_data["mode"] = "recipe_list_steps"
         await query.edit_message_text(
             "Пришли шаги приготовления, каждый шаг с новой строки.\n"
-            "Сохраню первые 3 шага в FatSecret.\n\n"
+            f"Сохраню первые {MAX_RECIPE_STEPS} шагов в FatSecret.\n\n"
             "Отправь <code>-</code>, чтобы очистить шаги.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
@@ -2280,6 +2348,7 @@ class TelegramRecipeBot:
             return
         recipes = self._filter_recipes(text, cached)
         context.user_data["recipe_search_query"] = text
+        context.user_data[RECIPE_SEARCH_IDS_KEY] = [recipe.id for recipe in recipes]
         context.user_data["group_id"] = group_id
         context.user_data["mode"] = "recipe_search"
         if not recipes:
