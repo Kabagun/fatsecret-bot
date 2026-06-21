@@ -89,6 +89,29 @@ def test_format_resolved_item_shows_macros_per_100g_and_brand() -> None:
     assert _format_resolved_item(item) == "- Кетчуп (Махеевъ) | 100г: 96/1.2/0.1/25.2 | масса: 25г"
 
 
+def test_format_resolved_item_keeps_zero_energy_visible() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="вода",
+        grams=Decimal("420"),
+        ingredient=Ingredient(
+            id="i1",
+            recipe_id="",
+            food_id="food-water",
+            title="Вода",
+            portion_id="0",
+            amount=Decimal("4.2"),
+            portion_description="100г",
+        ),
+        source="FatSecret",
+        energy_per_100g=Decimal("0"),
+        protein_per_100g=Decimal("0"),
+        fat_per_100g=Decimal("0"),
+        carbohydrate_per_100g=Decimal("0"),
+    )
+
+    assert _format_resolved_item(item) == "- Вода | 100г: 0/0/0/0 | масса: 420г"
+
+
 def test_parse_recipe_steps_keeps_first_100_non_empty_lines() -> None:
     steps = "\n".join(f"Шаг {index}" for index in range(1, 102))
 
