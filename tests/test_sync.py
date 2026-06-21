@@ -92,7 +92,7 @@ class FakeSearchClient:
     def __init__(
         self,
         results: list[FoodSearchResult],
-        search_results: list[FoodSearchResult] | None = None,
+        search_results: list[FoodSearchResult] | dict[str, list[FoodSearchResult]] | None = None,
         details: dict[str, FoodSearchResult] | None = None,
     ) -> None:
         self.account = FatSecretAccountConfig(
@@ -111,6 +111,8 @@ class FakeSearchClient:
         return list(self.results)
 
     async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        if isinstance(self.search_results, dict):
+            return list(self.search_results.get(query, []))
         return list(self.search_results)
 
     async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
@@ -441,25 +443,39 @@ def test_recipe_list_candidates_uses_direct_brand_when_enriching_cached_food(tmp
         engine = RecipeSyncEngine(storage, _device())
         client = FakeSearchClient(
             [],
-            search_results=[
-                FoodSearchResult(
-                    food_id="food-wrong",
-                    title="Сметана 20%",
-                    energy_per_portion=Decimal("287"),
-                    protein_per_portion=Decimal("3.6"),
-                    fat_per_portion=Decimal("28.8"),
-                    carbohydrate_per_portion=Decimal("4.9"),
-                ),
-                FoodSearchResult(
-                    food_id="food-search-brest",
-                    title="Сметана 20%",
-                    brand="Брест-Литовск",
-                    energy_per_portion=Decimal("204"),
-                    protein_per_portion=Decimal("2.5"),
-                    fat_per_portion=Decimal("20"),
-                    carbohydrate_per_portion=Decimal("3.4"),
-                ),
-            ],
+            search_results={
+                "Сметана 20%": [
+                    FoodSearchResult(
+                        food_id="food-wrong",
+                        title="Сметана 20%",
+                        energy_per_portion=Decimal("287"),
+                        protein_per_portion=Decimal("3.6"),
+                        fat_per_portion=Decimal("28.8"),
+                        carbohydrate_per_portion=Decimal("4.9"),
+                    )
+                ],
+                "сметана 20": [
+                    FoodSearchResult(
+                        food_id="food-wrong",
+                        title="Сметана 20%",
+                        energy_per_portion=Decimal("287"),
+                        protein_per_portion=Decimal("3.6"),
+                        fat_per_portion=Decimal("28.8"),
+                        carbohydrate_per_portion=Decimal("4.9"),
+                    )
+                ],
+                "Брест-Литовск Сметана 20%": [
+                    FoodSearchResult(
+                        food_id="food-search-brest",
+                        title="Сметана 20%",
+                        brand="Брест-Литовск",
+                        energy_per_portion=Decimal("204"),
+                        protein_per_portion=Decimal("2.5"),
+                        fat_per_portion=Decimal("20"),
+                        carbohydrate_per_portion=Decimal("3.4"),
+                    )
+                ],
+            },
             details={
                 "food-brest": FoodSearchResult(
                     food_id="food-brest",

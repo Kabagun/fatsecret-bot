@@ -565,9 +565,26 @@ class RecipeSyncEngine:
             except Exception:  # noqa: BLE001 - fall back to search metadata if direct lookup fails.
                 logger.debug("local food direct metadata lookup failed for %s", ingredient.title, exc_info=True)
         title_matches: list[FoodSearchResult] = []
-        for search_query in (ingredient.title, query):
+        search_queries = [ingredient.title, query]
+        if direct_metadata is not None and direct_metadata.brand:
+            brand = direct_metadata.brand.strip()
+            brand_words = brand.replace("-", " ")
+            search_queries.extend(
+                [
+                    f"{brand} {ingredient.title}",
+                    f"{ingredient.title} {brand}",
+                    f"{brand_words} {ingredient.title}",
+                    f"{ingredient.title} {brand_words}",
+                ]
+            )
+        seen_queries: set[str] = set()
+        for search_query in search_queries:
             if not search_query.strip():
                 continue
+            normalized_search_query = normalize_title(search_query)
+            if normalized_search_query in seen_queries:
+                continue
+            seen_queries.add(normalized_search_query)
             try:
                 results = _dedupe_food_results(
                     [
