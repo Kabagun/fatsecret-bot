@@ -153,6 +153,30 @@ def _device() -> FatSecretDeviceConfig:
     )
 
 
+def _cache_foods(
+    storage: Storage,
+    group_id: str,
+    foods: list[tuple[str, str, int]],
+    portion_id: str = "0",
+    portion_description: str = "100г",
+) -> None:
+    ingredients: list[Ingredient] = []
+    for food_id, title, count in foods:
+        for index in range(count):
+            ingredients.append(
+                Ingredient(
+                    id=f"{food_id}-{index}",
+                    recipe_id=f"recipe-{index}",
+                    food_id=food_id,
+                    title=title,
+                    portion_id=portion_id,
+                    amount=Decimal("1"),
+                    portion_description=portion_description,
+                )
+            )
+    storage.replace_food_usage_cache(group_id, ingredients)
+
+
 def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> None:
     source = Recipe(id="local", title="Завтрак")
     source.ingredients = [
@@ -217,10 +241,14 @@ def test_recipe_list_candidates_prefers_frequent_local_shorter_tie(tmp_path) -> 
     try:
         storage.register_user(11, "One")
         group = storage.create_group(11, "Семья")
-        first = storage.create_recipe("A", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
-        second = storage.create_recipe("B", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
-        storage.add_ingredient(first, "food-cheese", "Филе Куриное в Сыре", "portion-1", Decimal("100"), "г")
-        storage.add_ingredient(second, "food-chicken", "Куриное Филе", "portion-2", Decimal("100"), "г")
+        _cache_foods(
+            storage,
+            group.id,
+            [
+                ("food-cheese", "Филе Куриное в Сыре", 1),
+                ("food-chicken", "Куриное Филе", 2),
+            ],
+        )
         engine = RecipeSyncEngine(storage, _device())
 
         candidates = asyncio.run(engine.recipe_list_candidates(group.id, "Филе", Decimal("300"), limit=1))
@@ -240,8 +268,13 @@ def test_recipe_list_candidates_repairs_local_zero_portion_with_search_metadata(
     try:
         storage.register_user(11, "One")
         group = storage.create_group(11, "Семья")
-        recipe_id = storage.create_recipe("A", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
-        storage.add_ingredient(recipe_id, "food-oil", "Масло Растительное", "0", Decimal("10"), "г")
+        _cache_foods(
+            storage,
+            group.id,
+            [("food-oil", "Масло Растительное", 1)],
+            portion_id="0",
+            portion_description="г",
+        )
         engine = RecipeSyncEngine(storage, _device())
         client = FakeSearchClient(
             [],
@@ -270,8 +303,7 @@ def test_recipe_list_candidates_enriches_frequent_local_with_macros(tmp_path) ->
     try:
         storage.register_user(11, "One")
         group = storage.create_group(11, "Семья")
-        recipe_id = storage.create_recipe("A", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
-        storage.add_ingredient(recipe_id, "food-chicken", "Куриное Филе", "portion-1", Decimal("300"), "г")
+        _cache_foods(storage, group.id, [("food-chicken", "Куриное Филе", 3)])
         engine = RecipeSyncEngine(storage, _device())
         client = FakeSearchClient(
             [],
@@ -302,13 +334,11 @@ def test_recipe_list_candidates_enriches_frequent_local_with_macros(tmp_path) ->
         storage.close()
 
 
-def test_recipe_list_candidates_skips_local_when_fatsecret_metadata_missing(tmp_path) -> None:
+def test_recipe_list_candidates_uses_remote_when_usage_cache_is_empty(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         storage.register_user(11, "One")
         group = storage.create_group(11, "Семья")
-        recipe_id = storage.create_recipe("A", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
-        storage.add_ingredient(recipe_id, "food-local", "Куриное Филе", "portion-1", Decimal("300"), "г")
         engine = RecipeSyncEngine(storage, _device())
         client = FakeSearchClient(
             [
@@ -361,8 +391,7 @@ def test_recipe_list_candidates_prefers_exact_remote_over_bad_local_history(tmp_
     try:
         storage.register_user(11, "One")
         group = storage.create_group(11, "Семья")
-        recipe_id = storage.create_recipe("Bad", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
-        storage.add_ingredient(recipe_id, "food-cheese", "Куриное Филе в Сыре", "portion-cheese", Decimal("1"), "100г")
+        _cache_foods(storage, group.id, [("food-cheese", "Куриное Филе в Сыре", 5)])
         engine = RecipeSyncEngine(storage, _device())
         client = FakeSearchClient(
             [
@@ -382,6 +411,119 @@ def test_recipe_list_candidates_prefers_exact_remote_over_bad_local_history(tmp_
         assert candidates[0].ingredient.amount == Decimal("6.31")
         assert candidates[0].ingredient.portion_id == "0"
         assert candidates[0].ingredient.portion_description == "100г"
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_rejects_farshmak_for_meat_query(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(food_id="food-farshmak", title="Фаршмак", brand="Баренцево"),
+                FoodSearchResult(food_id="food-mince", title='Фарш Мясной "Котлетный"', brand="Евроопт"),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "Свино-куриный фарш", Decimal("259"), limit=3))
+
+        assert candidates == []
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_uses_cached_own_food_before_weak_remote_match(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("food-own-mince", "Свино-Куриный Фарш", 4)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(food_id="food-farshmak", title="Фаршмак", brand="Баренцево"),
+                FoodSearchResult(food_id="food-own-mince", title="Свино-Куриный Фарш"),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "Свино-куриный фарш", Decimal("259"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.food_id == "food-own-mince"
+        assert candidates[0].ingredient.title == "Свино-Куриный Фарш"
+        assert candidates[0].ingredient.amount == Decimal("2.59")
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_does_not_use_cached_food_missing_requested_detail(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("food-russian", "Кетчуп Русский Махеев", 10)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(food_id="food-tomato", title="Кетчуп Томатный", brand="Махеев"),
+                FoodSearchResult(food_id="food-russian", title="Кетчуп Русский", brand="Махеев"),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(
+            engine.recipe_list_candidates(group.id, "кетчуп махеев томатный", Decimal("25"), limit=1)
+        )
+
+        assert candidates[0].source == "FatSecret"
+        assert candidates[0].ingredient.food_id == "food-tomato"
+        assert candidates[0].ingredient.title == "Кетчуп Томатный"
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_prefers_cached_food_for_generic_brand_query(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("food-russian", "Кетчуп Русский Махеев", 10)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(food_id="food-generic", title="Кетчуп", brand="Махеев"),
+                FoodSearchResult(food_id="food-russian", title="Кетчуп Русский", brand="Махеев"),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "кетчуп махеев", Decimal("25"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.food_id == "food-russian"
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_requires_requested_percent(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(food_id="food-cream", title="Сметана"),
+                FoodSearchResult(food_id="food-cream-20", title="Сметана 20%"),
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "Сметана 20%", Decimal("150"), limit=1))
+
+        assert candidates[0].ingredient.food_id == "food-cream-20"
+        assert candidates[0].ingredient.title == "Сметана 20%"
     finally:
         storage.close()
 

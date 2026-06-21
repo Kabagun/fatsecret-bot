@@ -97,6 +97,16 @@ class RecipeGroupMember:
     fatsecret_username: str | None = None
 
 
+@dataclass(frozen=True)
+class CachedFoodUsage:
+    group_id: str
+    food_id: str
+    title: str
+    portion_id: str = "0"
+    portion_description: str = ""
+    use_count: int = 0
+
+
 @dataclass
 class FoodSearchResult:
     food_id: str

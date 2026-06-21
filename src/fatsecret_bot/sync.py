@@ -14,6 +14,7 @@ from .storage import Storage, normalize_title
 
 logger = logging.getLogger(__name__)
 PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
+SEARCH_TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class ResolvedRecipeListItem:
     ingredient: Ingredient
     source: str
     brand: str = ""
+    usage_count: int = 0
     energy_per_100g: Decimal | None = None
     protein_per_100g: Decimal | None = None
     fat_per_100g: Decimal | None = None
@@ -115,16 +117,55 @@ def _ingredient_needs_update(target: Ingredient, source: Ingredient) -> bool:
     )
 
 
-def _rank_text(query: str, title: str, search_text: str) -> tuple[int, int, int, int, int, int, int, str]:
+def _search_tokens(value: str) -> list[str]:
+    return [token.replace("ё", "е") for token in SEARCH_TOKEN_RE.findall(value.casefold())]
+
+
+def _token_matches(query_token: str, candidate_token: str) -> bool:
+    if query_token == candidate_token:
+        return True
+    if query_token.isdigit() or candidate_token.isdigit():
+        return False
+    if len(query_token) <= 3 or len(candidate_token) <= 3:
+        return False
+    if candidate_token.startswith(query_token) and len(candidate_token) - len(query_token) <= 2:
+        return True
+    if query_token.startswith(candidate_token) and len(query_token) - len(candidate_token) <= 2:
+        return True
+    return len(query_token) >= 5 and len(candidate_token) >= 5 and query_token[:5] == candidate_token[:5]
+
+
+def _optional_query_token(query_token: str, candidate_tokens: list[str]) -> bool:
+    if query_token.startswith("курин") and any(token.startswith("яйц") for token in candidate_tokens):
+        return True
+    return False
+
+
+def _missing_search_tokens(query: str, search_text: str) -> list[str]:
+    candidate_tokens = _search_tokens(search_text)
+    missing: list[str] = []
+    for query_token in _search_tokens(query):
+        if _optional_query_token(query_token, candidate_tokens):
+            continue
+        if not any(_token_matches(query_token, candidate_token) for candidate_token in candidate_tokens):
+            missing.append(query_token)
+    return missing
+
+
+def _matches_requested_food(query: str, title: str, search_text: str = "") -> bool:
+    text = " ".join([title, search_text])
+    return not _missing_search_tokens(query, text)
+
+
+def _rank_text(query: str, title: str, search_text: str) -> tuple[int, int, int, int, int, int, int, int, str]:
     normalized_query = normalize_title(query)
     normalized_title = normalize_title(title)
-    normalized_search_text = normalize_title(search_text)
     terms = normalized_query.split()
     words = set(normalized_title.split())
     all_terms_as_words = all(term in words for term in terms)
     all_terms_present = all(term in normalized_title for term in terms)
-    missing_terms = sum(1 for term in terms if term not in normalized_search_text)
-    title_missing_terms = sum(1 for term in terms if term not in normalized_title)
+    missing_terms = len(_missing_search_tokens(query, search_text))
+    title_missing_terms = len(_missing_search_tokens(query, title))
     extra_title_words = len(words - set(terms)) if all_terms_as_words else len(words)
     return (
         missing_terms,
@@ -137,10 +178,6 @@ def _rank_text(query: str, title: str, search_text: str) -> tuple[int, int, int,
         len(normalized_title),
         normalized_title,
     )
-
-
-def _ingredient_query_rank(query: str, title: str) -> tuple[int, int, int, int, int, int, int, str]:
-    return _rank_text(query, title, title)
 
 
 def _food_search_text(result: FoodSearchResult) -> str:
@@ -157,13 +194,47 @@ def _resolved_search_text(item: ResolvedRecipeListItem) -> str:
     return " ".join([item.ingredient.title, item.brand])
 
 
-def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int, int, int, int, int, int, int, str]:
+def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int, int, int, int, int, int, int, int, str]:
     return _rank_text(query, result.title, _food_search_text(result))
 
 
-def _resolved_candidate_rank(query: str, item: ResolvedRecipeListItem) -> tuple[int, int, int, int, int, int, int, int, str]:
+def _resolved_candidate_rank(
+    query: str,
+    item: ResolvedRecipeListItem,
+) -> tuple[int, int, int, int, int, int, int, int, int, int, str]:
+    missing_terms, exact_title, title_missing_terms, extra_title_words, all_terms_present, all_terms_as_words, title_words, title_length, normalized_title = _rank_text(
+        query,
+        item.ingredient.title,
+        _resolved_search_text(item),
+    )
     source_priority = 0 if item.source == "часто использовался" else 1
-    return (*_rank_text(query, item.ingredient.title, _resolved_search_text(item)), source_priority)
+    if len(_search_tokens(query)) <= 1:
+        return (
+            missing_terms,
+            title_missing_terms,
+            source_priority,
+            -item.usage_count,
+            exact_title,
+            extra_title_words,
+            all_terms_present,
+            all_terms_as_words,
+            title_words,
+            title_length,
+            normalized_title,
+        )
+    return (
+        missing_terms,
+        title_missing_terms,
+        exact_title,
+        source_priority,
+        -item.usage_count,
+        extra_title_words,
+        all_terms_present,
+        all_terms_as_words,
+        title_words,
+        title_length,
+        normalized_title,
+    )
 
 
 def _query_variants(query: str) -> list[str]:
@@ -249,11 +320,6 @@ def _amount_for_grams(grams: Decimal, portion_description: str) -> Decimal:
 
 def _gram_portion_amount(grams: Decimal) -> Decimal:
     return _amount_for_grams(grams, "100г")
-
-
-def _bare_weight_portion_description(description: str) -> bool:
-    normalized = description.strip().casefold()
-    return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}
 
 
 def _copy_remote_ingredients(recipe_id: str, ingredients: list[Ingredient]) -> list[Ingredient]:
@@ -352,6 +418,37 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return imported
 
+    async def refresh_food_usage_cache(self, group_id: str) -> int:
+        """Refresh frequently used foods from live FatSecret recipe ingredients for one group."""
+        clients = self._build_clients(group_id)
+        ingredients: list[Ingredient] = []
+        try:
+            for account_key, client in clients.items():
+                summaries = await client.cookbook()
+                for summary in summaries:
+                    try:
+                        recipe = await client.get_recipe(summary.remote_id)
+                    except Exception:  # noqa: BLE001 - keep one broken recipe from poisoning the whole cache.
+                        logger.debug(
+                            "food usage cache recipe load failed for %s/%s",
+                            account_key,
+                            summary.remote_id,
+                            exc_info=True,
+                        )
+                        continue
+                    ingredients.extend(recipe.ingredients)
+        finally:
+            await self._close_clients(clients)
+        return self.storage.replace_food_usage_cache(group_id, ingredients)
+
+    async def ensure_food_usage_cache(self, group_id: str) -> None:
+        """Refresh the FatSecret-derived food usage cache at most once per day."""
+        if self.storage.food_usage_cache_is_fresh(group_id):
+            return
+        if self.storage.fatsecret_account_count(group_id) == 0:
+            return
+        await self.refresh_food_usage_cache(group_id)
+
     async def load_remote_recipe_index(self, group_id: str) -> list[Recipe]:
         """Load and merge current cookbook recipe summaries from all FatSecret accounts in a group."""
         clients = self._build_clients(group_id)
@@ -395,38 +492,9 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return None
 
-    def _frequent_local_ingredient(self, group_id: str, query: str) -> Ingredient | None:
-        normalized_query = normalize_title(query)
-        terms = normalized_query.split()
-        if not terms:
-            return None
-        matches: dict[tuple[str, str, str, str], tuple[int, Ingredient]] = {}
-        for recipe in self.storage.list_recipes(group_id):
-            for ingredient in recipe.ingredients:
-                haystack = normalize_title(ingredient.title)
-                if not all(term in haystack for term in terms):
-                    continue
-                key = (
-                    ingredient.food_id,
-                    ingredient.portion_id or "0",
-                    ingredient.title,
-                    ingredient.portion_description,
-                )
-                count, stored = matches.get(key, (0, ingredient))
-                matches[key] = (count + 1, stored)
-        if not matches:
-            return None
-        return max(
-            matches.values(),
-            key=lambda item: (
-                item[0],
-                normalize_title(item[1].title) == normalized_query,
-                -len(normalize_title(item[1].title)),
-            ),
-        )[1]
-
     async def resolve_recipe_list_items(self, group_id: str, items: list[RecipeListItem]) -> RecipeListDraft:
-        """Resolve free-text ingredient lines using local frequency first, then FatSecret search."""
+        """Resolve free-text ingredient lines using daily FatSecret usage cache and live search."""
+        await self.ensure_food_usage_cache(group_id)
         resolved: list[ResolvedRecipeListItem] = []
         unresolved: list[str] = []
         for item in items:
@@ -436,37 +504,6 @@ class RecipeSyncEngine:
                 continue
             resolved.append(candidates[0])
         return RecipeListDraft(items=resolved, unresolved=unresolved)
-
-    async def _local_portion_metadata(
-        self,
-        client: FatSecretClient,
-        ingredient: Ingredient,
-        query: str,
-    ) -> tuple[str, str]:
-        portion_id = ingredient.portion_id or "0"
-        portion_description = ingredient.portion_description or "г"
-        if portion_id != "0":
-            return portion_id, portion_description
-        for search_query in (ingredient.title, query):
-            if not search_query.strip():
-                continue
-            try:
-                results = await client.search_recipes(search_query, page=0)
-            except Exception:  # noqa: BLE001 - keep local candidate usable on lookup failure.
-                logger.debug("local portion metadata lookup failed for %s", search_query, exc_info=True)
-                continue
-            for result in results:
-                if result.food_id != ingredient.food_id:
-                    continue
-                resolved_description = result.default_portion_description
-                if not resolved_description and _bare_weight_portion_description(portion_description):
-                    resolved_description = "100г"
-                resolved_description = resolved_description or portion_description
-                resolved_id = result.default_portion_id or portion_id
-                return resolved_id, resolved_description
-        if _bare_weight_portion_description(portion_description):
-            return portion_id, "100г"
-        return portion_id, portion_description
 
     async def _local_food_metadata(
         self,
@@ -497,6 +534,60 @@ class RecipeSyncEngine:
                     return result
         return None
 
+    async def _cached_food_usage_candidates(
+        self,
+        group_id: str,
+        query: str,
+        grams: Decimal,
+        client: FatSecretClient | None,
+    ) -> list[ResolvedRecipeListItem]:
+        candidates: list[ResolvedRecipeListItem] = []
+        for usage in self.storage.list_food_usage_cache(group_id):
+            if not _matches_requested_food(query, usage.title):
+                continue
+            usage_ingredient = Ingredient(
+                id=str(uuid.uuid4()),
+                recipe_id="",
+                food_id=usage.food_id,
+                title=usage.title,
+                portion_id=usage.portion_id or "0",
+                amount=Decimal("0"),
+                portion_description=usage.portion_description,
+            )
+            metadata: FoodSearchResult | None = None
+            if client is not None:
+                metadata = await self._local_food_metadata(client, usage_ingredient, query)
+            protein = metadata.protein_per_portion if metadata is not None else None
+            fat = metadata.fat_per_portion if metadata is not None else None
+            carbohydrate = metadata.carbohydrate_per_portion if metadata is not None else None
+            candidates.append(
+                ResolvedRecipeListItem(
+                    requested_query=query,
+                    grams=grams,
+                    ingredient=Ingredient(
+                        id=str(uuid.uuid4()),
+                        recipe_id="",
+                        food_id=usage.food_id,
+                        title=usage.title,
+                        portion_id="0",
+                        amount=_gram_portion_amount(grams),
+                        portion_description="100г",
+                    ),
+                    source="часто использовался",
+                    brand=metadata.brand if metadata is not None else "",
+                    usage_count=usage.use_count,
+                    energy_per_100g=(
+                        _correct_energy(metadata.energy_per_portion, protein, fat, carbohydrate)
+                        if metadata is not None
+                        else None
+                    ),
+                    protein_per_100g=protein,
+                    fat_per_100g=fat,
+                    carbohydrate_per_100g=carbohydrate,
+                )
+            )
+        return candidates
+
     async def recipe_list_candidates(
         self,
         group_id: str,
@@ -518,67 +609,21 @@ class RecipeSyncEngine:
                 clients = self._build_clients(group_id)
             return next(iter(clients.values()))
 
-        local = self._frequent_local_ingredient(group_id, query)
         try:
-            if local is not None:
-                local_key = (local.food_id, normalize_title(local.title))
-                local_portion_id = local.portion_id or "0"
-                local_portion_description = local.portion_description or "г"
-                first_client: FatSecretClient | None = None
-                local_metadata: FoodSearchResult | None = None
-                try:
-                    first_client = get_first_client()
-                    local_metadata = await self._local_food_metadata(first_client, local, query)
-                except FatSecretError:
-                    first_client = None
-                if first_client is not None and local_metadata is None:
-                    local = None
-                elif local_portion_id == "0" and local_metadata is not None:
-                    local_portion_id = local_metadata.default_portion_id or local_portion_id
-                    resolved_description = local_metadata.default_portion_description
-                    if not resolved_description and _bare_weight_portion_description(local_portion_description):
-                        resolved_description = "100г"
-                    local_portion_description = resolved_description or local_portion_description
-                elif local_portion_id == "0" and first_client is not None:
-                    local_portion_id, local_portion_description = await self._local_portion_metadata(
-                        first_client,
-                        local,
-                        query,
-                    )
-                elif local_portion_id == "0" and _bare_weight_portion_description(local_portion_description):
-                    local_portion_description = "100г"
-                else:
-                    local_portion_description = local.portion_description or "г"
-                if local is not None:
-                    protein = local_metadata.protein_per_portion if local_metadata is not None else None
-                    fat = local_metadata.fat_per_portion if local_metadata is not None else None
-                    carbohydrate = local_metadata.carbohydrate_per_portion if local_metadata is not None else None
-                    seen.add(local_key)
-                    local_candidates.append(
-                        ResolvedRecipeListItem(
-                            requested_query=query,
-                            grams=grams,
-                            ingredient=Ingredient(
-                                id=str(uuid.uuid4()),
-                                recipe_id="",
-                                food_id=local.food_id,
-                                title=local.title,
-                                portion_id="0",
-                                amount=_gram_portion_amount(grams),
-                                portion_description="100г",
-                            ),
-                            source="часто использовался",
-                            brand=local_metadata.brand if local_metadata is not None else "",
-                            energy_per_100g=(
-                                _correct_energy(local_metadata.energy_per_portion, protein, fat, carbohydrate)
-                                if local_metadata is not None
-                                else None
-                            ),
-                            protein_per_100g=protein,
-                            fat_per_100g=fat,
-                            carbohydrate_per_100g=carbohydrate,
-                        )
-                    )
+            await self.ensure_food_usage_cache(group_id)
+            first_client_for_cache: FatSecretClient | None = None
+            try:
+                first_client_for_cache = get_first_client()
+            except FatSecretError:
+                first_client_for_cache = None
+            local_candidates = await self._cached_food_usage_candidates(
+                group_id,
+                query,
+                grams,
+                first_client_for_cache,
+            )
+            for item in local_candidates:
+                seen.add((item.ingredient.food_id, normalize_title(item.ingredient.title)))
 
             try:
                 first_client = get_first_client()
@@ -604,7 +649,11 @@ class RecipeSyncEngine:
                     if len(_dedupe_food_results(remote_candidates)) >= raw_target_count:
                         break
 
-            remote_candidates = _dedupe_food_results(remote_candidates)
+            remote_candidates = [
+                item
+                for item in _dedupe_food_results(remote_candidates)
+                if _matches_requested_food(query, item.title, _food_search_text(item))
+            ]
             remote_candidates.sort(key=lambda item: _food_result_rank(query, item))
             remote_candidates = remote_candidates[: remote_limit + 5]
 
@@ -616,6 +665,8 @@ class RecipeSyncEngine:
                     found = await first_client.resolve_food_detail(remote)
                 except Exception:  # noqa: BLE001 - keep alternative candidates usable.
                     logger.debug("recipe list candidate resolve failed for %s", remote.title, exc_info=True)
+                    continue
+                if not _matches_requested_food(query, found.title, _food_search_text(found)):
                     continue
                 remote_key = (found.food_id, normalize_title(found.title))
                 if remote_key in seen:

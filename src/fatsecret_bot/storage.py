@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .models import (
+    CachedFoodUsage,
     MAX_RECIPE_STEPS,
     FatSecretAccountConfig,
     FatSecretSession,
@@ -157,6 +158,23 @@ class Storage:
                 message TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS food_usage_cache (
+                group_id TEXT NOT NULL,
+                food_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                portion_id TEXT NOT NULL DEFAULT '0',
+                portion_description TEXT NOT NULL DEFAULT '',
+                use_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (group_id, food_id, normalized_title)
+            );
+
+            CREATE TABLE IF NOT EXISTS food_usage_refreshes (
+                group_id TEXT PRIMARY KEY,
+                refreshed_at TEXT NOT NULL
+            );
             """
         )
         self._ensure_column("telegram_users", "active_group_id", "TEXT")
@@ -169,6 +187,10 @@ class Storage:
         self._conn.execute("DROP INDEX IF EXISTS idx_recipes_normalized_title")
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_group_title ON recipes(group_id, normalized_title)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_food_usage_cache_group_count "
+            "ON food_usage_cache(group_id, use_count DESC, normalized_title ASC)"
         )
         self._backfill_default_group()
         self._normalize_zero_portion_gram_ingredients()
@@ -972,6 +994,97 @@ class Storage:
         for row in rows:
             deleted += int(self.delete_recipe(row["id"]))
         return deleted
+
+    def food_usage_cache_is_fresh(
+        self,
+        group_id: str,
+        max_age: dt.timedelta = dt.timedelta(days=1),
+        now: dt.datetime | None = None,
+    ) -> bool:
+        """Return whether the FatSecret-derived food usage cache is recent enough."""
+        row = self._conn.execute(
+            "SELECT refreshed_at FROM food_usage_refreshes WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            refreshed_at = dt.datetime.fromisoformat(row["refreshed_at"])
+        except ValueError:
+            return False
+        if refreshed_at.tzinfo is None:
+            refreshed_at = refreshed_at.replace(tzinfo=dt.UTC)
+        current = now or dt.datetime.now(dt.UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=dt.UTC)
+        return current - refreshed_at < max_age
+
+    def replace_food_usage_cache(self, group_id: str, ingredients: list[Ingredient]) -> int:
+        """Replace cached frequently used foods for a group from live FatSecret recipes."""
+        aggregated: dict[tuple[str, str], tuple[Ingredient, int]] = {}
+        for ingredient in ingredients:
+            normalized_title = normalize_title(ingredient.title)
+            if not ingredient.food_id or not normalized_title:
+                continue
+            key = (ingredient.food_id, normalized_title)
+            stored, count = aggregated.get(key, (ingredient, 0))
+            aggregated[key] = (stored, count + 1)
+
+        now = _now()
+        self._conn.execute("DELETE FROM food_usage_cache WHERE group_id = ?", (group_id,))
+        for (food_id, normalized_title), (ingredient, count) in aggregated.items():
+            self._conn.execute(
+                """
+                INSERT INTO food_usage_cache(
+                    group_id, food_id, title, normalized_title, portion_id,
+                    portion_description, use_count, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    group_id,
+                    food_id,
+                    ingredient.title,
+                    normalized_title,
+                    ingredient.portion_id or "0",
+                    ingredient.portion_description,
+                    count,
+                    now,
+                ),
+            )
+        self._conn.execute(
+            """
+            INSERT INTO food_usage_refreshes(group_id, refreshed_at)
+            VALUES (?, ?)
+            ON CONFLICT(group_id) DO UPDATE SET refreshed_at = excluded.refreshed_at
+            """,
+            (group_id, now),
+        )
+        self._conn.commit()
+        return len(aggregated)
+
+    def list_food_usage_cache(self, group_id: str) -> list[CachedFoodUsage]:
+        """Return cached foods used in real FatSecret recipes for one group."""
+        rows = self._conn.execute(
+            """
+            SELECT group_id, food_id, title, portion_id, portion_description, use_count
+            FROM food_usage_cache
+            WHERE group_id = ?
+            ORDER BY use_count DESC, normalized_title ASC, food_id ASC
+            """,
+            (group_id,),
+        ).fetchall()
+        return [
+            CachedFoodUsage(
+                group_id=row["group_id"],
+                food_id=row["food_id"],
+                title=row["title"],
+                portion_id=row["portion_id"],
+                portion_description=row["portion_description"],
+                use_count=int(row["use_count"]),
+            )
+            for row in rows
+        ]
 
     def add_ingredient(
         self,
