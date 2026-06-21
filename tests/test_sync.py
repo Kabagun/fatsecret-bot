@@ -396,6 +396,71 @@ def test_recipe_list_candidates_enriches_frequent_local_with_macros(tmp_path) ->
         storage.close()
 
 
+def test_recipe_list_candidates_enriches_cached_food_by_title_when_food_id_differs(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("food-cached-chicken", "Куриное Филе", 3)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="food-search-chicken",
+                    title="Куриное Филе",
+                    default_portion_id="portion-1",
+                    default_portion_description="100г",
+                    energy_per_portion=Decimal("110"),
+                    protein_per_portion=Decimal("23"),
+                    fat_per_portion=Decimal("2"),
+                    carbohydrate_per_portion=Decimal("0"),
+                )
+            ],
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "куриное филе", Decimal("631"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.food_id == "food-cached-chicken"
+        assert candidates[0].energy_per_100g == Decimal("110")
+        assert candidates[0].protein_per_100g == Decimal("23")
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_does_not_enrich_cached_food_from_extra_title_words(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("food-cached-chicken", "Куриное Филе", 3)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="food-cheese-chicken",
+                    title="Куриное Филе в Сыре",
+                    energy_per_portion=Decimal("210"),
+                    protein_per_portion=Decimal("22"),
+                    fat_per_portion=Decimal("12"),
+                    carbohydrate_per_portion=Decimal("5"),
+                )
+            ],
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "куриное филе", Decimal("631"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.food_id == "food-cached-chicken"
+        assert candidates[0].energy_per_100g is None
+    finally:
+        storage.close()
+
+
 def test_recipe_list_candidates_uses_remote_when_usage_cache_is_empty(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

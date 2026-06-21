@@ -157,6 +157,16 @@ def _matches_requested_food(query: str, title: str, search_text: str = "") -> bo
     return not _missing_search_tokens(query, text)
 
 
+def _title_has_extra_meaningful_tokens(query: str, title: str) -> bool:
+    query_tokens = _search_tokens(query)
+    for title_token in _search_tokens(title):
+        if len(title_token) <= 2:
+            continue
+        if not any(_token_matches(query_token, title_token) for query_token in query_tokens):
+            return True
+    return False
+
+
 def _rank_text(query: str, title: str, search_text: str) -> tuple[int, int, int, int, int, int, int, int, str]:
     normalized_query = normalize_title(query)
     normalized_title = normalize_title(title)
@@ -287,6 +297,18 @@ def _correct_energy(
     if calculated is not None and calculated > 0 and energy < calculated * Decimal("0.5"):
         return calculated
     return energy
+
+
+def _macro_field_count(item: ResolvedRecipeListItem) -> int:
+    return sum(
+        value is not None
+        for value in (
+            item.energy_per_100g,
+            item.protein_per_100g,
+            item.fat_per_100g,
+            item.carbohydrate_per_100g,
+        )
+    )
 
 
 def _sync_description(now: dt.datetime | None = None, timezone: str = "Europe/Minsk") -> str:
@@ -523,6 +545,7 @@ class RecipeSyncEngine:
         ingredient: Ingredient,
         query: str,
     ) -> FoodSearchResult | None:
+        title_matches: list[FoodSearchResult] = []
         for search_query in (ingredient.title, query):
             if not search_query.strip():
                 continue
@@ -538,12 +561,25 @@ class RecipeSyncEngine:
                 continue
             for result in results:
                 if result.food_id != ingredient.food_id:
+                    if (
+                        _matches_requested_food(ingredient.title, result.title, _food_search_text(result))
+                        and not _title_has_extra_meaningful_tokens(ingredient.title, result.title)
+                    ):
+                        title_matches.append(result)
                     continue
                 try:
                     return await client.resolve_food_detail(result)
                 except Exception:  # noqa: BLE001 - search metadata is still better than local-only data.
                     logger.debug("local food detail lookup failed for %s", result.title, exc_info=True)
                     return result
+        title_matches = _dedupe_food_results(title_matches)
+        title_matches.sort(key=lambda item: _food_result_rank(ingredient.title, item))
+        for result in title_matches:
+            try:
+                return await client.resolve_food_detail(result)
+            except Exception:  # noqa: BLE001 - search metadata is still better than local-only data.
+                logger.debug("local food title metadata lookup failed for %s", result.title, exc_info=True)
+                return result
         return None
 
     async def _cached_food_usage_candidates(
@@ -612,7 +648,6 @@ class RecipeSyncEngine:
         limit = max(1, limit)
         offset = max(0, offset)
         local_candidates: list[ResolvedRecipeListItem] = []
-        seen: set[tuple[str, str]] = set()
         clients: dict[str, FatSecretClient] | None = None
 
         def get_first_client() -> FatSecretClient:
@@ -634,8 +669,6 @@ class RecipeSyncEngine:
                 grams,
                 first_client_for_cache,
             )
-            for item in local_candidates:
-                seen.add((item.ingredient.food_id, normalize_title(item.ingredient.title)))
 
             try:
                 first_client = get_first_client()
@@ -681,8 +714,6 @@ class RecipeSyncEngine:
                 if not _matches_requested_food(query, found.title, _food_search_text(found)):
                     continue
                 remote_key = (found.food_id, normalize_title(found.title))
-                if remote_key in seen:
-                    continue
                 portion_description = found.default_portion_description or "г"
                 protein = found.protein_per_portion
                 fat = found.fat_per_portion
@@ -711,12 +742,22 @@ class RecipeSyncEngine:
             candidates = [*local_candidates, *remote_resolved]
             candidates.sort(key=lambda item: _resolved_candidate_rank(query, item))
             deduped_candidates: list[ResolvedRecipeListItem] = []
-            seen_candidates: set[tuple[str, str]] = set()
+            seen_candidates: dict[tuple[str, str], int] = {}
             for candidate in candidates:
                 key = (candidate.ingredient.food_id, normalize_title(candidate.ingredient.title))
-                if key in seen_candidates:
+                existing_index = seen_candidates.get(key)
+                if existing_index is not None:
+                    existing = deduped_candidates[existing_index]
+                    if (
+                        _macro_field_count(candidate),
+                        bool(candidate.brand),
+                    ) > (
+                        _macro_field_count(existing),
+                        bool(existing.brand),
+                    ):
+                        deduped_candidates[existing_index] = candidate
                     continue
-                seen_candidates.add(key)
+                seen_candidates[key] = len(deduped_candidates)
                 deduped_candidates.append(candidate)
             return deduped_candidates[offset : offset + limit]
         finally:
