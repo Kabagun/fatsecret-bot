@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import datetime as dt
 import html
 import logging
 import re
 import time
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -28,6 +32,7 @@ RECIPE_LIST_CANDIDATES_PAGE_SIZE = 10
 RECIPE_LIST_CANDIDATES_PREFETCH_PAGES = 2
 RECIPE_LIST_CANDIDATES_PREFETCH_SIZE = RECIPE_LIST_CANDIDATES_PAGE_SIZE * RECIPE_LIST_CANDIDATES_PREFETCH_PAGES
 DISPLAY_RECIPE_STEPS_LIMIT = 20
+FOOD_USAGE_REFRESH_HOUR = 12
 RECIPE_CACHE_KEY = "recipe_cache"
 RECIPE_CACHE_GROUP_KEY = "recipe_cache_group_id"
 RECIPE_CACHE_LOADED_KEY = "recipe_cache_loaded_at"
@@ -382,9 +387,16 @@ class TelegramRecipeBot:
         self.default_language = default_language
         self.storage = storage
         self.sync_engine = sync_engine
+        self._food_usage_refresh_task: asyncio.Task[None] | None = None
 
     def build(self) -> Application:
-        app = Application.builder().token(self.token).build()
+        app = (
+            Application.builder()
+            .token(self.token)
+            .post_init(self._post_init)
+            .post_shutdown(self._post_shutdown)
+            .build()
+        )
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("accounts", self.accounts))
         app.add_handler(CommandHandler("recipes", self.recipes))
@@ -393,6 +405,67 @@ class TelegramRecipeBot:
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         return app
+
+    def _refresh_timezone(self) -> dt.tzinfo:
+        try:
+            return ZoneInfo(self.sync_engine.timezone)
+        except ZoneInfoNotFoundError:
+            logger.warning("Unknown timezone %s; using system local timezone", self.sync_engine.timezone)
+            return dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+
+    def _next_food_usage_refresh_at(self, now: dt.datetime | None = None) -> dt.datetime:
+        timezone = self._refresh_timezone()
+        current = now or dt.datetime.now(timezone)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone)
+        current = current.astimezone(timezone)
+        target = current.replace(
+            hour=FOOD_USAGE_REFRESH_HOUR,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if target <= current:
+            target += dt.timedelta(days=1)
+        return target
+
+    async def _post_init(self, app: Application) -> None:
+        if self._food_usage_refresh_task is not None and not self._food_usage_refresh_task.done():
+            return
+        self._food_usage_refresh_task = asyncio.create_task(
+            self._food_usage_refresh_loop(),
+            name="fatsecret-food-usage-refresh",
+        )
+        logger.info("Scheduled daily FatSecret food usage refresh background task")
+
+    async def _post_shutdown(self, app: Application) -> None:
+        if self._food_usage_refresh_task is None:
+            return
+        self._food_usage_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._food_usage_refresh_task
+        self._food_usage_refresh_task = None
+
+    async def _food_usage_refresh_loop(self) -> None:
+        while True:
+            try:
+                next_run = self._next_food_usage_refresh_at()
+                delay = max(0.0, (next_run - dt.datetime.now(next_run.tzinfo)).total_seconds())
+                logger.info("Next FatSecret food usage refresh scheduled for %s", next_run.isoformat())
+                await asyncio.sleep(delay)
+                started_at = time.monotonic()
+                refreshed = await self.sync_engine.refresh_food_usage_cache_for_all_groups()
+                logger.info(
+                    "Finished FatSecret food usage refresh for %d groups, %d foods in %.1fs",
+                    len(refreshed),
+                    sum(refreshed.values()),
+                    time.monotonic() - started_at,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("FatSecret food usage background refresh failed")
+                await asyncio.sleep(60)
 
     def _is_authorized(self, telegram_id: int) -> bool:
         if telegram_id in self.allowed_user_ids:

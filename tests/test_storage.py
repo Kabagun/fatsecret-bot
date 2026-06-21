@@ -82,6 +82,18 @@ def test_group_join_switch_and_group_scoped_accounts(tmp_path) -> None:
         storage.close()
 
 
+def test_list_group_ids_returns_all_groups_in_creation_order(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        first = storage.create_group(11, "Первая")
+        second = storage.create_group(11, "Вторая")
+
+        assert storage.list_group_ids() == [first.id, second.id]
+    finally:
+        storage.close()
+
+
 def test_group_members_and_leave_active_group(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

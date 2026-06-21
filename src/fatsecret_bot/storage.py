@@ -437,6 +437,13 @@ class Storage:
             return None
         return RecipeGroup(id=row["id"], name=row["name"], invite_code=row["invite_code"])
 
+    def list_group_ids(self) -> list[str]:
+        """Return all recipe group ids known to the bot."""
+        rows = self._conn.execute(
+            "SELECT id FROM recipe_groups ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+        return [row["id"] for row in rows]
+
     def list_groups_for_user(self, telegram_id: int) -> list[RecipeGroup]:
         """Return groups that a Telegram user belongs to."""
         rows = self._conn.execute(

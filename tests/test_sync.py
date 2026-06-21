@@ -65,6 +65,29 @@ class FakeCookbookClient:
         return None
 
 
+class FakeFoodUsageClient:
+    def __init__(self, recipes: list[Recipe], account_key: str) -> None:
+        self.account = FatSecretAccountConfig(
+            key=account_key,
+            label=account_key,
+            username=f"{account_key}@example.com",
+            password="secret",
+            market="BY",
+            language="ru",
+        )
+        self.recipes = {recipe.id: recipe for recipe in recipes}
+        self.closed = False
+
+    async def cookbook(self) -> list[RecipeSummary]:
+        return [RecipeSummary(remote_id=recipe.id, title=recipe.title) for recipe in self.recipes.values()]
+
+    async def get_recipe(self, remote_id: str) -> Recipe:
+        return self.recipes[remote_id]
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 class FakeSearchClient:
     def __init__(
         self,
@@ -232,6 +255,45 @@ def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> No
         assert client.saved_ingredients[0].remote_ingredient_id == "iid-1"
         assert client.saved_ingredients[0].amount == Decimal("125")
         assert client.saved_ingredients[1].remote_ingredient_id is None
+    finally:
+        storage.close()
+
+
+def test_refresh_food_usage_cache_for_all_groups_refreshes_groups_with_accounts(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        storage.register_user(22, "Two")
+        group = storage.create_group(11, "Семья")
+        empty_group = storage.create_group(22, "Без аккаунта")
+        storage.upsert_fatsecret_account(11, "One", "one@example.com", "secret", "BY", "ru")
+        recipe = Recipe(id="remote-1", title="Котлеты")
+        recipe.ingredients = [
+            Ingredient(
+                id="i1",
+                recipe_id="remote-1",
+                food_id="food-mince",
+                title="Свино-Куриный Фарш",
+                portion_id="0",
+                amount=Decimal("1"),
+                portion_description="100г",
+            )
+        ]
+        client = FakeFoodUsageClient([recipe], "tg11")
+        engine = RecipeSyncEngine(storage, _device())
+
+        def build_clients(group_id=None):  # type: ignore[no-untyped-def]
+            assert group_id == group.id
+            return {"tg11": client}
+
+        engine._build_clients = build_clients  # type: ignore[method-assign]
+
+        refreshed = asyncio.run(engine.refresh_food_usage_cache_for_all_groups())
+
+        assert refreshed == {group.id: 1}
+        assert [item.title for item in storage.list_food_usage_cache(group.id)] == ["Свино-Куриный Фарш"]
+        assert storage.list_food_usage_cache(empty_group.id) == []
+        assert client.closed is True
     finally:
         storage.close()
 

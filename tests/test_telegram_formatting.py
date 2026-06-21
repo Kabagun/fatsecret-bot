@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from fatsecret_bot.models import Ingredient, Recipe
 from fatsecret_bot.storage import Storage
@@ -102,6 +104,24 @@ def test_recipe_list_keyboard_keeps_recipe_buttons_navigation_and_actions_inline
     assert "Создать из списка" not in flat_texts
     assert "Удалить несколько" in flat_texts
     assert "В меню" not in flat_texts
+
+
+def test_next_food_usage_refresh_runs_at_noon_in_bot_timezone() -> None:
+    bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = type("Engine", (), {"timezone": "Europe/Minsk"})()
+    timezone = ZoneInfo("Europe/Minsk")
+
+    before_noon = TelegramRecipeBot._next_food_usage_refresh_at(
+        bot,
+        dt.datetime(2026, 6, 21, 11, 30, tzinfo=timezone),
+    )
+    after_noon = TelegramRecipeBot._next_food_usage_refresh_at(
+        bot,
+        dt.datetime(2026, 6, 21, 12, 1, tzinfo=timezone),
+    )
+
+    assert before_noon == dt.datetime(2026, 6, 21, 12, 0, tzinfo=timezone)
+    assert after_noon == dt.datetime(2026, 6, 22, 12, 0, tzinfo=timezone)
 
 
 def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path) -> None:

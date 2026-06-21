@@ -441,6 +441,18 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return self.storage.replace_food_usage_cache(group_id, ingredients)
 
+    async def refresh_food_usage_cache_for_all_groups(self) -> dict[str, int]:
+        """Refresh frequently used foods for every group that has connected FatSecret accounts."""
+        refreshed: dict[str, int] = {}
+        for group_id in self.storage.list_group_ids():
+            if self.storage.fatsecret_account_count(group_id) == 0:
+                continue
+            try:
+                refreshed[group_id] = await self.refresh_food_usage_cache(group_id)
+            except Exception:  # noqa: BLE001 - one group should not block other groups.
+                logger.exception("food usage cache refresh failed for group %s", group_id)
+        return refreshed
+
     async def ensure_food_usage_cache(self, group_id: str) -> None:
         """Refresh the FatSecret-derived food usage cache at most once per day."""
         if self.storage.food_usage_cache_is_fresh(group_id):
