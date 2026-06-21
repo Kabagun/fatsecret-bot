@@ -4,7 +4,7 @@ Updated: 2026-06-21
 
 ## Repository
 
-- Local path: `D:\Projects\fatsecret`
+- Local path: repository root
 - Branch: `main`
 - Remote: `https://github.com/Kabagun/fatsecret-bot.git`
 - Latest deployed commit at time of writing: `aa9ee1c fix: keep recipe drafts with unresolved ingredients`
@@ -16,18 +16,18 @@ Keep scratch files under `temp/`.
 
 ## Server And Deploy
 
-- Server: `apps@204.168.223.123` (`Helsinki-VPN`)
-- Live checkout: `/srv/bots/fatsecret-bot/app`
+- Server: `apps` user on the FatSecret bot host (`Helsinki-VPN`)
+- Live checkout: bot app checkout directory
 - Service: `fatsecret-bot`
 - Service manager: `systemctl --user`
-- Current process command: `/srv/bots/fatsecret-bot/venv/bin/python /srv/bots/fatsecret-bot/app/run_bot.py`
+- Current process: project venv Python running `run_bot.py`
 
 Deploy only through server-side git. Do not upload tar/scp archives.
 
 Typical deploy:
 
 ```bash
-cd /srv/bots/fatsecret-bot/app
+cd "$FATSECRET_BOT_APP"
 git fetch origin main
 git reset --hard origin/main
 systemctl --user restart fatsecret-bot
@@ -40,7 +40,7 @@ SSH uses 1Password SSH agent. If plain `ssh apps@...` fails with `Too many authe
 ## Credentials
 
 - Use 1Password as the primary source for credentials and SSH keys.
-- Use `D:\Projects\access.llm.codex-ready.yml` only if the user explicitly says to use that fallback file.
+- Use the fallback access file only if the user explicitly says to use it.
 - Telegram bot token and FatSecret credentials must stay out of git.
 - FatSecret login/password are added through the bot UI.
 - FatSecret mobile sessions are persisted in DB and reused; stale cached sessions are retried by relogin.
@@ -219,4 +219,3 @@ Latest deploy verification before this context file:
 - server checkout was clean on `main...origin/main`
 - service `fatsecret-bot` was `active`
 - recent logs showed clean stop/start and `telegram.ext.Application: Application started`
-
