@@ -284,6 +284,10 @@ def _format_resolved_item(item: ResolvedRecipeListItem) -> str:
     return f"- {_format_item_title(item)} | 100г: {_format_macros_per_100g(item)} | масса: {_format_decimal(item.grams)}г"
 
 
+def _format_unresolved_item(item: RecipeListItem) -> str:
+    return f"- ? {html.escape(item.query)} | масса: {_format_decimal(item.grams)}г"
+
+
 def _sum_known_macros(values: list[Decimal | None]) -> Decimal | None:
     known = [value for value in values if value is not None]
     if not known:
@@ -295,25 +299,44 @@ def _format_recipe_list_draft(
     title: str,
     items: list[ResolvedRecipeListItem],
     steps: list[str] | None = None,
+    unresolved: list[RecipeListItem] | None = None,
 ) -> str:
     energy = _sum_known_macros([_scaled_macro(item.energy_per_100g, item.grams) for item in items])
     protein = _sum_known_macros([_scaled_macro(item.protein_per_100g, item.grams) for item in items])
     fat = _sum_known_macros([_scaled_macro(item.fat_per_100g, item.grams) for item in items])
     carbs = _sum_known_macros([_scaled_macro(item.carbohydrate_per_100g, item.grams) for item in items])
     steps = steps or []
+    unresolved = unresolved or []
     lines = [
         f"<b>Рецепт: {html.escape(title)}</b>",
         f"Итого ккал/Б/Ж/У: {_format_decimal(energy, 0)}/{_format_decimal(protein)}/{_format_decimal(fat)}/{_format_decimal(carbs)}",
         "",
         "<b>Ингредиенты</b>",
-        *(_format_resolved_item(item) for item in items),
     ]
+    lines.extend(_format_resolved_item(item) for item in items)
+    if not items:
+        lines.append("Пока нет подобранных ингредиентов.")
+    if unresolved:
+        lines.extend(
+            [
+                "",
+                "<b>Нужно заполнить или удалить</b>",
+                *(_format_unresolved_item(item) for item in unresolved),
+                "",
+                "Создать рецепт можно после заполнения или удаления этих позиций.",
+            ]
+        )
     if steps:
         lines.extend(["", "<b>Шаги</b>", *_format_steps_lines(steps)])
     return "\n".join(lines)
 
 
-def _recipe_list_draft_keyboard(items: list[ResolvedRecipeListItem], steps: list[str] | None = None) -> InlineKeyboardMarkup:
+def _recipe_list_draft_keyboard(
+    items: list[ResolvedRecipeListItem],
+    steps: list[str] | None = None,
+    unresolved: list[RecipeListItem] | None = None,
+) -> InlineKeyboardMarkup:
+    unresolved = unresolved or []
     buttons = [
         [
             InlineKeyboardButton(
@@ -323,11 +346,22 @@ def _recipe_list_draft_keyboard(items: list[ResolvedRecipeListItem], steps: list
         ]
         for index, item in enumerate(items)
     ]
+    for index, item in enumerate(unresolved):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Заполнить: {item.query[:34]}",
+                    callback_data=f"recipe_list_resolve:{index}",
+                ),
+                InlineKeyboardButton("Удалить", callback_data=f"recipe_list_drop:{index}"),
+            ]
+        )
     buttons.append([InlineKeyboardButton("Изменить имя", callback_data="recipe_list_rename:0")])
     buttons.append(
         [InlineKeyboardButton("Изменить шаги" if steps else "Шаги", callback_data="recipe_list_steps:0")]
     )
-    buttons.append([InlineKeyboardButton("Создать рецепт", callback_data="recipe_list_confirm:0")])
+    if items and not unresolved:
+        buttons.append([InlineKeyboardButton("Создать рецепт", callback_data="recipe_list_confirm:0")])
     buttons.append([InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")])
     return InlineKeyboardMarkup(buttons)
 
@@ -1025,6 +1059,10 @@ class TelegramRecipeBot:
             await self._create_recipe_list_from_draft(query, context, update.effective_user.id)
         elif action == "recipe_list_replace":
             await self._start_recipe_list_replace(query, context, int(value or "0"))
+        elif action == "recipe_list_resolve":
+            await self._start_recipe_list_resolve(query, context, int(value or "0"))
+        elif action == "recipe_list_drop":
+            await self._drop_recipe_list_unresolved(query, context, int(value or "0"))
         elif action == "recipe_list_pick":
             await self._pick_recipe_list_candidate(query, context, int(value or "0"))
         elif action == "recipe_list_cpage":
@@ -2072,9 +2110,11 @@ class TelegramRecipeBot:
         context.user_data["mode"] = "recipe_list_confirm"
         steps = context.user_data.get("recipe_list_steps")
         steps = steps if isinstance(steps, list) else []
+        unresolved = context.user_data.get("recipe_list_unresolved")
+        unresolved = unresolved if isinstance(unresolved, list) else []
         await update.effective_message.reply_text(
-            _format_recipe_list_draft(title, draft_items, steps),
-            reply_markup=_recipe_list_draft_keyboard(draft_items, steps),
+            _format_recipe_list_draft(title, draft_items, steps, unresolved),
+            reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
             parse_mode=ParseMode.HTML,
         )
 
@@ -2093,9 +2133,11 @@ class TelegramRecipeBot:
         steps = _parse_recipe_steps(text)
         context.user_data["recipe_list_steps"] = steps
         context.user_data["mode"] = "recipe_list_confirm"
+        unresolved = context.user_data.get("recipe_list_unresolved")
+        unresolved = unresolved if isinstance(unresolved, list) else []
         await update.effective_message.reply_text(
-            _format_recipe_list_draft(title, draft_items, steps),
-            reply_markup=_recipe_list_draft_keyboard(draft_items, steps),
+            _format_recipe_list_draft(title, draft_items, steps, unresolved),
+            reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
             parse_mode=ParseMode.HTML,
         )
 
@@ -2127,21 +2169,13 @@ class TelegramRecipeBot:
             logger.exception("recipe list resolve failed")
             await status.edit_text(f"Не удалось подобрать ингредиенты: {exc}")
             return
-        if draft.unresolved:
-            lines = "\n".join(f"- {html.escape(line)}" for line in draft.unresolved)
-            await status.edit_text(
-                "Не нашел ингредиенты в FatSecret:\n"
-                f"{lines}\n\n"
-                "Попробуй уточнить названия и пришли список заново.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
         context.user_data["recipe_list_draft"] = draft.items
+        context.user_data["recipe_list_unresolved"] = draft.unresolved
         context.user_data["mode"] = "recipe_list_confirm"
         context.user_data["recipe_list_steps"] = steps
         await status.edit_text(
-            _format_recipe_list_draft(title, draft.items, steps),
-            reply_markup=_recipe_list_draft_keyboard(draft.items, steps),
+            _format_recipe_list_draft(title, draft.items, steps, draft.unresolved),
+            reply_markup=_recipe_list_draft_keyboard(draft.items, steps, draft.unresolved),
             parse_mode=ParseMode.HTML,
         )
 
@@ -2160,11 +2194,14 @@ class TelegramRecipeBot:
         context.user_data.pop("recipe_list_candidates_cache", None)
         context.user_data.pop("recipe_list_candidates_exhausted", None)
         context.user_data.pop("recipe_list_replace_query", None)
+        context.user_data.pop("recipe_list_replace_kind", None)
         steps = context.user_data.get("recipe_list_steps")
         steps = steps if isinstance(steps, list) else []
+        unresolved = context.user_data.get("recipe_list_unresolved")
+        unresolved = unresolved if isinstance(unresolved, list) else []
         await query.edit_message_text(
-            _format_recipe_list_draft(title, draft_items, steps),
-            reply_markup=_recipe_list_draft_keyboard(draft_items, steps),
+            _format_recipe_list_draft(title, draft_items, steps, unresolved),
+            reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
             parse_mode=ParseMode.HTML,
         )
 
@@ -2183,6 +2220,7 @@ class TelegramRecipeBot:
             return
         item = draft_items[index]
         context.user_data["mode"] = "recipe_list_replace_query"
+        context.user_data["recipe_list_replace_kind"] = "resolved"
         context.user_data["recipe_list_replace_index"] = index
         context.user_data.pop("recipe_list_candidates", None)
         context.user_data.pop("recipe_list_candidates_cache", None)
@@ -2197,6 +2235,53 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _start_recipe_list_resolve(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        index: int,
+    ) -> None:
+        unresolved = context.user_data.get("recipe_list_unresolved")
+        if not isinstance(unresolved, list) or index < 0 or index >= len(unresolved):
+            await query.edit_message_text(
+                "Неизвестный ингредиент в черновике больше не найден.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]),
+            )
+            return
+        item = unresolved[index]
+        context.user_data["mode"] = "recipe_list_replace_query"
+        context.user_data["recipe_list_replace_kind"] = "unresolved"
+        context.user_data["recipe_list_replace_index"] = index
+        context.user_data.pop("recipe_list_candidates", None)
+        context.user_data.pop("recipe_list_candidates_cache", None)
+        context.user_data.pop("recipe_list_candidates_exhausted", None)
+        context.user_data.pop("recipe_list_replace_query", None)
+        await query.edit_message_text(
+            f"Что искать для «{html.escape(item.query)}»?\n"
+            f"Массу оставлю {_format_decimal(item.grams)}г.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _drop_recipe_list_unresolved(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        index: int,
+    ) -> None:
+        unresolved = context.user_data.get("recipe_list_unresolved")
+        if not isinstance(unresolved, list) or index < 0 or index >= len(unresolved):
+            await query.edit_message_text(
+                "Неизвестный ингредиент в черновике больше не найден.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]),
+            )
+            return
+        unresolved.pop(index)
+        context.user_data["recipe_list_unresolved"] = unresolved
+        await self._edit_recipe_list_draft(query, context)
+
     async def _handle_recipe_list_replace_query(
         self,
         update: Update,
@@ -2206,14 +2291,21 @@ class TelegramRecipeBot:
         user = update.effective_user
         group_id = context.user_data.get("group_id")
         draft_items = context.user_data.get("recipe_list_draft")
+        unresolved = context.user_data.get("recipe_list_unresolved")
         index = context.user_data.get("recipe_list_replace_index")
+        replace_kind = context.user_data.get("recipe_list_replace_kind") or "resolved"
         if user is None or not group_id or not isinstance(draft_items, list) or not isinstance(index, int):
             context.user_data.clear()
             await update.effective_message.reply_text(
                 "Контекст замены потерян. Начни создание заново из списка рецептов."
             )
             return
-        if index < 0 or index >= len(draft_items):
+        if replace_kind == "unresolved":
+            if not isinstance(unresolved, list) or index < 0 or index >= len(unresolved):
+                context.user_data.clear()
+                await update.effective_message.reply_text("Неизвестный ингредиент больше не найден. Начни создание заново.")
+                return
+        elif index < 0 or index >= len(draft_items):
             context.user_data.clear()
             await update.effective_message.reply_text("Ингредиент в черновике больше не найден. Начни создание заново.")
             return
@@ -2242,8 +2334,10 @@ class TelegramRecipeBot:
     ) -> None:
         group_id = context.user_data.get("group_id")
         draft_items = context.user_data.get("recipe_list_draft")
+        unresolved = context.user_data.get("recipe_list_unresolved")
         index = context.user_data.get("recipe_list_replace_index")
         search_query = str(context.user_data.get("recipe_list_replace_query") or "").strip()
+        replace_kind = context.user_data.get("recipe_list_replace_kind") or "resolved"
         if not group_id or not isinstance(draft_items, list) or not isinstance(index, int) or not search_query:
             context.user_data.clear()
             await self._edit_flow_message(
@@ -2252,7 +2346,17 @@ class TelegramRecipeBot:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
             )
             return
-        if index < 0 or index >= len(draft_items):
+        if replace_kind == "unresolved":
+            if not isinstance(unresolved, list) or index < 0 or index >= len(unresolved):
+                context.user_data.clear()
+                await self._edit_flow_message(
+                    message,
+                    "Неизвестный ингредиент больше не найден. Начни создание заново.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                )
+                return
+            grams = unresolved[index].grams
+        elif index < 0 or index >= len(draft_items):
             context.user_data.clear()
             await self._edit_flow_message(
                 message,
@@ -2260,8 +2364,9 @@ class TelegramRecipeBot:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
             )
             return
+        else:
+            grams = draft_items[index].grams
         page = max(0, page)
-        grams = draft_items[index].grams
         start = page * RECIPE_LIST_CANDIDATES_PAGE_SIZE
         end = start + RECIPE_LIST_CANDIDATES_PAGE_SIZE
         try:
@@ -2333,16 +2438,16 @@ class TelegramRecipeBot:
         candidate_index: int,
     ) -> None:
         draft_items = context.user_data.get("recipe_list_draft")
+        unresolved = context.user_data.get("recipe_list_unresolved")
         candidates = context.user_data.get("recipe_list_candidates")
         replace_index = context.user_data.get("recipe_list_replace_index")
+        replace_kind = context.user_data.get("recipe_list_replace_kind") or "resolved"
         if (
             not isinstance(draft_items, list)
             or not isinstance(candidates, list)
             or not isinstance(replace_index, int)
             or candidate_index < 0
             or candidate_index >= len(candidates)
-            or replace_index < 0
-            or replace_index >= len(draft_items)
         ):
             await query.edit_message_text(
                 "Выбор замены устарел. Вернись к проверке и попробуй еще раз.",
@@ -2351,7 +2456,28 @@ class TelegramRecipeBot:
                 ),
             )
             return
-        draft_items[replace_index] = candidates[candidate_index]
+        if replace_kind == "unresolved":
+            if not isinstance(unresolved, list) or replace_index < 0 or replace_index >= len(unresolved):
+                await query.edit_message_text(
+                    "Неизвестный ингредиент больше не найден. Вернись к проверке и попробуй еще раз.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]
+                    ),
+                )
+                return
+            draft_items.append(candidates[candidate_index])
+            unresolved.pop(replace_index)
+            context.user_data["recipe_list_unresolved"] = unresolved
+        else:
+            if replace_index < 0 or replace_index >= len(draft_items):
+                await query.edit_message_text(
+                    "Ингредиент в черновике больше не найден. Вернись к проверке и попробуй еще раз.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]
+                    ),
+                )
+                return
+            draft_items[replace_index] = candidates[candidate_index]
         context.user_data["recipe_list_draft"] = draft_items
         await self._edit_recipe_list_draft(query, context)
 
@@ -2359,11 +2485,25 @@ class TelegramRecipeBot:
         title = str(context.user_data.get("recipe_list_title") or "").strip()
         group_id = context.user_data.get("group_id")
         draft_items = context.user_data.get("recipe_list_draft")
+        unresolved = context.user_data.get("recipe_list_unresolved")
         steps = context.user_data.get("recipe_list_steps")
         if not title or not group_id or not isinstance(draft_items, list):
             await query.edit_message_text("Черновик устарел. Начни создание заново из списка рецептов.")
             return
+        unresolved = unresolved if isinstance(unresolved, list) else []
         steps = steps if isinstance(steps, list) else []
+        if unresolved:
+            await query.edit_message_text(
+                "Сначала заполни или удали неизвестные ингредиенты.",
+                reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+            )
+            return
+        if not draft_items:
+            await query.edit_message_text(
+                "В рецепте не осталось ингредиентов. Добавь хотя бы один ингредиент или отмени черновик.",
+                reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+            )
+            return
         await query.edit_message_text("Создаю рецепт в FatSecret аккаунтах группы...")
         try:
             created = await self.sync_engine.create_recipe_from_list(

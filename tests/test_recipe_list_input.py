@@ -3,13 +3,14 @@ from __future__ import annotations
 from decimal import Decimal
 
 from fatsecret_bot.models import Ingredient
-from fatsecret_bot.sync import ResolvedRecipeListItem
+from fatsecret_bot.sync import RecipeListItem, ResolvedRecipeListItem
 from fatsecret_bot.telegram_bot import (
     _format_recipe_list_draft,
     _format_resolved_item,
     _parse_recipe_list_lines,
     _parse_recipe_list_payload,
     _parse_recipe_steps,
+    _recipe_list_draft_keyboard,
 )
 
 
@@ -144,3 +145,31 @@ def test_format_recipe_list_draft_includes_steps() -> None:
     assert "<b>Шаги</b>" in text
     assert "1. Смешать" in text
     assert "2. Запечь" in text
+
+
+def test_recipe_list_draft_shows_unresolved_items_and_blocks_create() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="филе",
+        grams=Decimal("100"),
+        ingredient=Ingredient(
+            id="i1",
+            recipe_id="",
+            food_id="f1",
+            title="Куриное Филе",
+            portion_id="p1",
+            amount=Decimal("100"),
+            portion_description="г",
+        ),
+        source="FatSecret",
+    )
+    unresolved = [RecipeListItem(query="Приправа для фарша Green", grams=Decimal("3"))]
+
+    text = _format_recipe_list_draft("Тест", [item], unresolved=unresolved)
+    keyboard = _recipe_list_draft_keyboard([item], unresolved=unresolved)
+    flat_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "<b>Нужно заполнить или удалить</b>" in text
+    assert "- ? Приправа для фарша Green | масса: 3г" in text
+    assert "Заполнить: Приправа для фарша Green" in flat_buttons
+    assert "Удалить" in flat_buttons
+    assert "Создать рецепт" not in flat_buttons

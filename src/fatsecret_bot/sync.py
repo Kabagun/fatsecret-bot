@@ -69,7 +69,7 @@ class ResolvedRecipeListItem:
 @dataclass(frozen=True)
 class RecipeListDraft:
     items: list[ResolvedRecipeListItem]
-    unresolved: list[str]
+    unresolved: list[RecipeListItem]
     steps: list[str] | None = None
 
 
@@ -582,7 +582,7 @@ class RecipeSyncEngine:
         for item in items:
             candidates = await self.recipe_list_candidates(group_id, item.query, item.grams, limit=1)
             if not candidates:
-                unresolved.append(item.query)
+                unresolved.append(item)
                 continue
             resolved.append(candidates[0])
         return RecipeListDraft(items=resolved, unresolved=unresolved)
