@@ -545,17 +545,19 @@ class FatSecretClient:
                 raise FatSecretError(f"{self.account.label}: no recipe/food match for {result.title}")
             result = matches[0]
         recipe = await self.get_recipe(result.food_id)
+        detail_brand = _metadata_value(recipe.description, "mname")
+        detail_portion_description = recipe.default_portion_description or _metadata_value(recipe.description, "ssize")
         return FoodSearchResult(
             food_id=result.food_id,
             title=recipe.title or result.title,
             description=result.description,
-            brand=result.brand,
+            brand=result.brand or detail_brand,
             default_portion_id=(
                 recipe.default_portion_id
                 if recipe.default_portion_id and recipe.default_portion_id != "0"
                 else result.default_portion_id or "0"
             ),
-            default_portion_description=recipe.default_portion_description or result.default_portion_description,
+            default_portion_description=detail_portion_description or result.default_portion_description,
             energy_per_portion=result.energy_per_portion,
             carbohydrate_per_portion=result.carbohydrate_per_portion,
             protein_per_portion=result.protein_per_portion,

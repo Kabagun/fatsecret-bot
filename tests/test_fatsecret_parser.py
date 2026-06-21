@@ -7,7 +7,7 @@ from urllib.parse import parse_qs
 import httpx
 
 from fatsecret_bot.fatsecret_client import FatSecretClient, FatSecretError, parse_recipe_initial_save_response
-from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession, Ingredient, Recipe
+from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession, FoodSearchResult, Ingredient, Recipe
 
 
 def _client() -> FatSecretClient:
@@ -90,6 +90,46 @@ def test_parse_recipe_ingredients() -> None:
     assert recipe.steps == ["Смешать", "Запечь", "Подать"]
     assert recipe.ingredients[0].food_id == "4881229"
     assert recipe.ingredients[0].portion_id == "4751539"
+
+
+def test_resolve_food_detail_extracts_brand_and_portion_from_metadata_description() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/RecipeAndroidPage.aspx")
+        return httpx.Response(
+            200,
+            text="""
+            <recipe>
+              <id>8418618</id>
+              <title>Сметана 20%</title>
+              <shortDescription>mtypeS#E{P&lt;A*R*A&gt;T}O!R1S#E{P&lt;A*R*A&gt;T}O!RmnameS#E{P&lt;A*R*A&gt;T}O!RБрест-ЛитовскS#E{P&lt;A*R*A&gt;T}O!RssizeS#E{P&lt;A*R*A&gt;T}O!R100г</shortDescription>
+              <defaultPortionID>0</defaultPortionID>
+            </recipe>
+            """,
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+        session=FatSecretSession(server_id="server", device_key="device", secret_key="secret"),
+    )
+    try:
+        result = asyncio.run(client.resolve_food_detail(FoodSearchResult(food_id="8418618", title="Сметана 20%")))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert result.title == "Сметана 20%"
+    assert result.brand == "Брест-Литовск"
+    assert result.default_portion_description == "100г"
 
 
 def test_parse_recipe_initial_save_response() -> None:

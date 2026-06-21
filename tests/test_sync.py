@@ -93,6 +93,7 @@ class FakeSearchClient:
         self,
         results: list[FoodSearchResult],
         search_results: list[FoodSearchResult] | None = None,
+        details: dict[str, FoodSearchResult] | None = None,
     ) -> None:
         self.account = FatSecretAccountConfig(
             key="search",
@@ -104,6 +105,7 @@ class FakeSearchClient:
         )
         self.results = results
         self.search_results = search_results if search_results is not None else []
+        self.details = details or {}
 
     async def autocomplete_food(self, query: str) -> list[FoodSearchResult]:
         return list(self.results)
@@ -112,7 +114,7 @@ class FakeSearchClient:
         return list(self.search_results)
 
     async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
-        return result
+        return self.details.get(result.food_id, result)
 
     async def close(self) -> None:
         return None
@@ -426,6 +428,96 @@ def test_recipe_list_candidates_enriches_cached_food_by_title_when_food_id_diffe
         assert candidates[0].ingredient.food_id == "food-cached-chicken"
         assert candidates[0].energy_per_100g == Decimal("110")
         assert candidates[0].protein_per_100g == Decimal("23")
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_uses_direct_brand_when_enriching_cached_food(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("food-brest", "Сметана 20%", 1)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="food-wrong",
+                    title="Сметана 20%",
+                    energy_per_portion=Decimal("287"),
+                    protein_per_portion=Decimal("3.6"),
+                    fat_per_portion=Decimal("28.8"),
+                    carbohydrate_per_portion=Decimal("4.9"),
+                ),
+                FoodSearchResult(
+                    food_id="food-search-brest",
+                    title="Сметана 20%",
+                    brand="Брест-Литовск",
+                    energy_per_portion=Decimal("204"),
+                    protein_per_portion=Decimal("2.5"),
+                    fat_per_portion=Decimal("20"),
+                    carbohydrate_per_portion=Decimal("3.4"),
+                ),
+            ],
+            details={
+                "food-brest": FoodSearchResult(
+                    food_id="food-brest",
+                    title="Сметана 20%",
+                    brand="Брест-Литовск",
+                    default_portion_description="100г",
+                )
+            },
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "сметана 20", Decimal("150"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.food_id == "food-brest"
+        assert candidates[0].brand == "Брест-Литовск"
+        assert candidates[0].energy_per_100g == Decimal("204")
+        assert candidates[0].fat_per_100g == Decimal("20")
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_does_not_enrich_cached_food_from_wrong_brand(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("food-brest", "Сметана 20%", 1)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="food-wrong",
+                    title="Сметана 20%",
+                    energy_per_portion=Decimal("287"),
+                    protein_per_portion=Decimal("3.6"),
+                    fat_per_portion=Decimal("28.8"),
+                    carbohydrate_per_portion=Decimal("4.9"),
+                )
+            ],
+            details={
+                "food-brest": FoodSearchResult(
+                    food_id="food-brest",
+                    title="Сметана 20%",
+                    brand="Брест-Литовск",
+                    default_portion_description="100г",
+                )
+            },
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "сметана 20", Decimal("150"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.food_id == "food-brest"
+        assert candidates[0].brand == "Брест-Литовск"
+        assert candidates[0].energy_per_100g is None
     finally:
         storage.close()
 

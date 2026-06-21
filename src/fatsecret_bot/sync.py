@@ -208,6 +208,12 @@ def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int, int, i
     return _rank_text(query, result.title, _food_search_text(result))
 
 
+def _matches_direct_food_metadata(result: FoodSearchResult, direct_metadata: FoodSearchResult | None) -> bool:
+    if direct_metadata is None or not direct_metadata.brand:
+        return True
+    return _matches_requested_food(direct_metadata.brand, result.title, _food_search_text(result))
+
+
 def _resolved_candidate_rank(
     query: str,
     item: ResolvedRecipeListItem,
@@ -545,6 +551,19 @@ class RecipeSyncEngine:
         ingredient: Ingredient,
         query: str,
     ) -> FoodSearchResult | None:
+        direct_metadata: FoodSearchResult | None = None
+        if ingredient.food_id:
+            try:
+                direct_metadata = await client.resolve_food_detail(
+                    FoodSearchResult(
+                        food_id=ingredient.food_id,
+                        title=ingredient.title,
+                        default_portion_id=ingredient.portion_id or "0",
+                        default_portion_description=ingredient.portion_description,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - fall back to search metadata if direct lookup fails.
+                logger.debug("local food direct metadata lookup failed for %s", ingredient.title, exc_info=True)
         title_matches: list[FoodSearchResult] = []
         for search_query in (ingredient.title, query):
             if not search_query.strip():
@@ -564,6 +583,7 @@ class RecipeSyncEngine:
                     if (
                         _matches_requested_food(ingredient.title, result.title, _food_search_text(result))
                         and not _title_has_extra_meaningful_tokens(ingredient.title, result.title)
+                        and _matches_direct_food_metadata(result, direct_metadata)
                     ):
                         title_matches.append(result)
                     continue
@@ -576,11 +596,13 @@ class RecipeSyncEngine:
         title_matches.sort(key=lambda item: _food_result_rank(ingredient.title, item))
         for result in title_matches:
             try:
-                return await client.resolve_food_detail(result)
+                resolved = await client.resolve_food_detail(result)
+                if _matches_direct_food_metadata(resolved, direct_metadata):
+                    return resolved
             except Exception:  # noqa: BLE001 - search metadata is still better than local-only data.
                 logger.debug("local food title metadata lookup failed for %s", result.title, exc_info=True)
-                return result
-        return None
+                return result if _matches_direct_food_metadata(result, direct_metadata) else direct_metadata
+        return direct_metadata
 
     async def _cached_food_usage_candidates(
         self,
