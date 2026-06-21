@@ -227,8 +227,9 @@ def test_recipe_list_candidates_prefers_frequent_local_shorter_tie(tmp_path) -> 
 
         assert len(candidates) == 1
         assert candidates[0].ingredient.title == "Куриное Филе"
-        assert candidates[0].ingredient.amount == Decimal("300")
-        assert candidates[0].ingredient.portion_description == "г"
+        assert candidates[0].ingredient.amount == Decimal("3")
+        assert candidates[0].ingredient.portion_id == "0"
+        assert candidates[0].ingredient.portion_description == "100г"
         assert candidates[0].source == "часто использовался"
     finally:
         storage.close()
@@ -355,6 +356,36 @@ def test_recipe_list_candidates_ranks_remote_matches_before_raw_order(tmp_path) 
         storage.close()
 
 
+def test_recipe_list_candidates_prefers_exact_remote_over_bad_local_history(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        recipe_id = storage.create_recipe("Bad", "", Decimal("1"), 0, 0, updated_by=11, group_id=group.id)
+        storage.add_ingredient(recipe_id, "food-cheese", "Куриное Филе в Сыре", "portion-cheese", Decimal("1"), "100г")
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(food_id="food-cheese", title="Куриное Филе в Сыре"),
+                FoodSearchResult(food_id="food-chicken", title="Куриное Филе"),
+            ],
+            search_results=[
+                FoodSearchResult(food_id="food-chicken", title="Куриное Филе"),
+            ],
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "Куриное филе", Decimal("631"), limit=1))
+
+        assert candidates[0].ingredient.food_id == "food-chicken"
+        assert candidates[0].ingredient.title == "Куриное Филе"
+        assert candidates[0].ingredient.amount == Decimal("6.31")
+        assert candidates[0].ingredient.portion_id == "0"
+        assert candidates[0].ingredient.portion_description == "100г"
+    finally:
+        storage.close()
+
+
 def test_recipe_list_candidates_ranks_brand_and_description_matches(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -462,6 +493,32 @@ def test_recipe_list_candidates_keeps_remote_default_portion_description(tmp_pat
 
         assert candidates[0].ingredient.portion_description == "100г"
         assert candidates[0].ingredient.amount == Decimal("0.25")
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_forces_gram_portion_for_non_weight_remote_default(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(
+                    food_id="food-egg",
+                    title="Яйцо",
+                    default_portion_id="large",
+                    default_portion_description="большой",
+                )
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "яйцо куриное", Decimal("50"), limit=1))
+
+        assert candidates[0].ingredient.title == "Яйцо"
+        assert candidates[0].ingredient.portion_id == "0"
+        assert candidates[0].ingredient.amount == Decimal("0.5")
+        assert candidates[0].ingredient.portion_description == "100г"
     finally:
         storage.close()
 
