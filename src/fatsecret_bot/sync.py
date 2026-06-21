@@ -204,14 +204,56 @@ def _resolved_search_text(item: ResolvedRecipeListItem) -> str:
     return " ".join([item.ingredient.title, item.brand])
 
 
-def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int, int, int, int, int, int, int, int, str]:
-    return _rank_text(query, result.title, _food_search_text(result))
+def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int, int, int, int, int, int, int, int, int, str]:
+    missing_terms, exact_title, title_missing_terms, extra_title_words, all_terms_present, all_terms_as_words, title_words, title_length, normalized_title = _rank_text(
+        query,
+        result.title,
+        _food_search_text(result),
+    )
+    own_priority = 0 if result.is_own else 1
+    if len(_search_tokens(query)) <= 1:
+        return (
+            missing_terms,
+            title_missing_terms,
+            own_priority,
+            exact_title,
+            extra_title_words,
+            all_terms_present,
+            all_terms_as_words,
+            title_words,
+            title_length,
+            normalized_title,
+        )
+    return (
+        missing_terms,
+        title_missing_terms,
+        exact_title,
+        own_priority,
+        extra_title_words,
+        all_terms_present,
+        all_terms_as_words,
+        title_words,
+        title_length,
+        normalized_title,
+    )
 
 
 def _matches_direct_food_metadata(result: FoodSearchResult, direct_metadata: FoodSearchResult | None) -> bool:
     if direct_metadata is None or not direct_metadata.brand:
         return True
     return _matches_requested_food(direct_metadata.brand, result.title, _food_search_text(result))
+
+
+def _food_result_has_detail(result: FoodSearchResult) -> bool:
+    return result.raw.get("_source_endpoint") == "food_search_data" or any(
+        value is not None
+        for value in (
+            result.energy_per_portion,
+            result.protein_per_portion,
+            result.fat_per_portion,
+            result.carbohydrate_per_portion,
+        )
+    )
 
 
 def _resolved_candidate_rank(
@@ -586,12 +628,9 @@ class RecipeSyncEngine:
                 continue
             seen_queries.add(normalized_search_query)
             try:
-                results = _dedupe_food_results(
-                    [
-                        *await client.search_recipes(search_query, page=0),
-                        *await client.autocomplete_food(search_query),
-                    ]
-                )
+                results = _dedupe_food_results([*await client.search_recipes(search_query, page=0)])
+                if not results:
+                    results = _dedupe_food_results([*await client.autocomplete_food(search_query)])
             except Exception:  # noqa: BLE001 - keep local candidate usable on lookup failure.
                 logger.debug("local food metadata lookup failed for %s", search_query, exc_info=True)
                 continue
@@ -605,7 +644,7 @@ class RecipeSyncEngine:
                         title_matches.append(result)
                     continue
                 try:
-                    return await client.resolve_food_detail(result)
+                    return result if _food_result_has_detail(result) else await client.resolve_food_detail(result)
                 except Exception:  # noqa: BLE001 - search metadata is still better than local-only data.
                     logger.debug("local food detail lookup failed for %s", result.title, exc_info=True)
                     return result
@@ -613,7 +652,7 @@ class RecipeSyncEngine:
         title_matches.sort(key=lambda item: _food_result_rank(ingredient.title, item))
         for result in title_matches:
             try:
-                resolved = await client.resolve_food_detail(result)
+                resolved = result if _food_result_has_detail(result) else await client.resolve_food_detail(result)
                 if _matches_direct_food_metadata(resolved, direct_metadata):
                     return resolved
             except Exception:  # noqa: BLE001 - search metadata is still better than local-only data.
@@ -720,8 +759,6 @@ class RecipeSyncEngine:
             raw_target_count = remote_limit
             remote_candidates: list[FoodSearchResult] = []
             variants = _query_variants(query)
-            for variant in variants:
-                remote_candidates.extend(await first_client.autocomplete_food(variant))
 
             search_pages = max(1, (raw_target_count // 10) + 1)
             for page in range(search_pages):
@@ -732,6 +769,10 @@ class RecipeSyncEngine:
                     remote_candidates.extend(await first_client.search_recipes(variant, page=0))
                     if len(_dedupe_food_results(remote_candidates)) >= raw_target_count:
                         break
+
+            if not _dedupe_food_results(remote_candidates):
+                for variant in variants:
+                    remote_candidates.extend(await first_client.autocomplete_food(variant))
 
             remote_candidates = [
                 item
@@ -746,7 +787,7 @@ class RecipeSyncEngine:
                 if len(remote_resolved) >= remote_limit:
                     break
                 try:
-                    found = await first_client.resolve_food_detail(remote)
+                    found = remote if _food_result_has_detail(remote) else await first_client.resolve_food_detail(remote)
                 except Exception:  # noqa: BLE001 - keep alternative candidates usable.
                     logger.debug("recipe list candidate resolve failed for %s", remote.title, exc_info=True)
                     continue
@@ -805,11 +846,13 @@ class RecipeSyncEngine:
         return []
 
     async def _resolve_food_from_remote(self, client: FatSecretClient, query: str) -> FoodSearchResult | None:
-        autocomplete = await client.autocomplete_food(query)
-        candidates = autocomplete or await client.search_recipes(query)
+        candidates = await client.search_recipes(query)
+        if not candidates:
+            candidates = await client.autocomplete_food(query)
         if not candidates:
             return None
-        return await client.resolve_food_detail(candidates[0])
+        candidates.sort(key=lambda item: _food_result_rank(query, item))
+        return candidates[0] if _food_result_has_detail(candidates[0]) else await client.resolve_food_detail(candidates[0])
 
     async def create_recipe_from_list(
         self,

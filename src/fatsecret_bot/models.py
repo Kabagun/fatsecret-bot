@@ -115,6 +115,9 @@ class FoodSearchResult:
     brand: str = ""
     default_portion_id: str = "0"
     default_portion_description: str = ""
+    source: str = ""
+    is_own: bool = False
+    grams_per_portion: Decimal | None = None
     energy_per_portion: Decimal | None = None
     carbohydrate_per_portion: Decimal | None = None
     protein_per_portion: Decimal | None = None

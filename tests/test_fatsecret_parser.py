@@ -92,6 +92,66 @@ def test_parse_recipe_ingredients() -> None:
     assert recipe.ingredients[0].portion_id == "4751539"
 
 
+def test_search_recipes_uses_app_food_search_data_endpoint() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/api/food/v1/search/data"
+        assert request.content
+        return httpx.Response(
+            200,
+            json={
+                "summaries": [
+                    {
+                        "id": "8418618",
+                        "title": "Кетчуп Русский",
+                        "manufacturername": "Махеев",
+                        "defaultPortionId": "0",
+                        "servingSize": "50г",
+                        "gramsPerPortion": 50,
+                        "energyPerPortion": 31,
+                        "proteinPerPortion": 0.6,
+                        "fatPerPortion": 0,
+                        "carbohydratePerPortion": 7.1,
+                        "isOwn": True,
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+        session=FatSecretSession(server_id="server", device_key="device", secret_key="secret"),
+    )
+    try:
+        results = asyncio.run(client.search_recipes("русский", page=2))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/api/food/v1/search/data"
+    assert results[0].food_id == "8418618"
+    assert results[0].title == "Кетчуп Русский"
+    assert results[0].brand == "Махеев"
+    assert results[0].default_portion_description == "50г"
+    assert results[0].is_own is True
+    assert results[0].energy_per_portion == Decimal("62")
+    assert results[0].protein_per_portion == Decimal("1.2")
+    assert results[0].carbohydrate_per_portion == Decimal("14.2")
+
+
 def test_resolve_food_detail_extracts_brand_and_portion_from_metadata_description() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/RecipeAndroidPage.aspx")
@@ -224,6 +284,48 @@ def test_cached_session_retries_login_once_on_auth_failure() -> None:
             return httpx.Response(200, json={"serverId": "new-server", "deviceKey": "new-device", "secretKey": "new-secret"})
         if len([item for item in requests if "RecipeActionAndroidPage.aspx" in str(item.url)]) == 1:
             return httpx.Response(500, text="expired")
+        return httpx.Response(200, text="True")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+        session=FatSecretSession(server_id="old-server", device_key="old-device", secret_key="old-secret"),
+        session_saver=saved.append,
+    )
+    try:
+        ok = asyncio.run(client.delete_recipe("123456"))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert ok is True
+    assert saved == [FatSecretSession(server_id="new-server", device_key="new-device", secret_key="new-secret")]
+    assert [request.url.path for request in requests].count("/api/authenticate/v1/fatsecret") == 1
+    assert [request.url.path for request in requests].count("/android/RecipeActionAndroidPage.aspx") == 2
+
+
+def test_cached_session_retries_login_once_on_redirect() -> None:
+    requests: list[httpx.Request] = []
+    saved: list[FatSecretSession] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "authenticate" in str(request.url):
+            return httpx.Response(
+                200,
+                json={"serverId": "new-server", "deviceKey": "new-device", "secretKey": "new-secret"},
+            )
+        if len([item for item in requests if "RecipeActionAndroidPage.aspx" in str(item.url)]) == 1:
+            return httpx.Response(302, headers={"Location": "/Default.aspx"}, text="")
         return httpx.Response(200, text="True")
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))

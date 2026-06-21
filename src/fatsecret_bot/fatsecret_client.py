@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import re
 import uuid
 import xml.etree.ElementTree as ET
@@ -27,6 +28,12 @@ class FatSecretError(RuntimeError):
     pass
 
 
+logger = logging.getLogger(__name__)
+FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
+FOOD_SEARCH_PAGE_SIZE = 10
+AUTH_RETRY_STATUS_CODES = {401, 403, 500}
+
+
 def days_since_epoch(today: dt.date | None = None) -> str:
     today = today or dt.date.today()
     return str((today - dt.date(1970, 1, 1)).days)
@@ -39,6 +46,30 @@ def _decimal(text: str | None, default: Decimal | None = None) -> Decimal | None
         return Decimal(text)
     except InvalidOperation:
         return default
+
+
+def _decimal_value(value: Any, default: Decimal | None = None) -> Decimal | None:
+    if value is None or value == "":
+        return default
+    try:
+        return Decimal(str(value).replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return default
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().casefold()
+    return normalized in {"1", "true", "yes", "y"}
+
+
+def _first_present(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value is not None and value != "":
+            return value
+    return None
 
 
 def _int(text: str | None, default: int = 0) -> int:
@@ -82,7 +113,16 @@ def _clean_food_text(value: Any) -> str:
 
 
 def _food_brand(data: dict[str, Any]) -> str:
-    for key in ("brand", "brandName", "brand_name", "manufacturer", "manufacturerName", "company", "owner"):
+    for key in (
+        "brand",
+        "brandName",
+        "brand_name",
+        "manufacturer",
+        "manufacturerName",
+        "manufacturername",
+        "company",
+        "owner",
+    ):
         value = data.get(key)
         if isinstance(value, dict):
             value = value.get("name") or value.get("title") or value.get("value")
@@ -115,8 +155,22 @@ def _default_portion_description(data: dict[str, Any]) -> str:
     return ""
 
 
+def _default_portion_id(data: dict[str, Any]) -> str:
+    for key in ("defaultPortionID", "defaultPortionId", "default_portion_id", "defaultportionid"):
+        value = data.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return "0"
+
+
 def _form_decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _scale_per_100g(value: Decimal | None, grams_per_portion: Decimal | None) -> Decimal | None:
+    if value is None or grams_per_portion is None or grams_per_portion <= 0 or grams_per_portion == Decimal("100"):
+        return value
+    return value * Decimal("100") / grams_per_portion
 
 
 def _bare_weight_portion_description(description: str) -> bool:
@@ -154,6 +208,10 @@ def _looks_like_true(text: str) -> bool:
     if normalized in {"true", "1", "ok", "yes"}:
         return True
     return normalized.isdigit() and int(normalized) > 0
+
+
+def _should_retry_with_fresh_login(response: httpx.Response) -> bool:
+    return response.status_code in AUTH_RETRY_STATUS_CODES or 300 <= response.status_code < 400
 
 
 def parse_recipe_initial_save_response(text: str) -> str:
@@ -235,6 +293,27 @@ class FatSecretClient:
         return self._parse_recipe_list(response.text)
 
     async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        try:
+            return await self.search_food(query, page=page)
+        except (FatSecretError, ValueError, httpx.HTTPError):
+            logger.debug("app food search failed for %s, falling back to legacy search", query, exc_info=True)
+        return await self._search_recipes_legacy(query, page=page)
+
+    async def search_food(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        """Search foods through the same JSON endpoint used by the FatSecret mobile app."""
+        payload = {
+            "searchExpression": query,
+            "pageNumber": max(0, page),
+            "pageSize": FOOD_SEARCH_PAGE_SIZE,
+        }
+        response = await self._post_app_json(FOOD_SEARCH_DATA_URL, payload, "food search")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid food search JSON") from exc
+        return self._parse_food_search_data(data)
+
+    async def _search_recipes_legacy(self, query: str, page: int = 0) -> list[FoodSearchResult]:
         response = await self._post_android("RecipeSearch.aspx", {"fl": "2", "q": query, "pg": str(page)})
         summaries = self._parse_recipe_list(response.text)
         results: list[FoodSearchResult] = []
@@ -251,6 +330,7 @@ class FatSecretClient:
                     carbohydrate_per_portion=item.carbohydrate_per_portion,
                     protein_per_portion=item.protein_per_portion,
                     fat_per_portion=item.fat_per_portion,
+                    raw={"_source_endpoint": "legacy_recipe_search"},
                 )
             )
         return results
@@ -343,7 +423,7 @@ class FatSecretClient:
         common.update(fields)
         url = f"https://android.fatsecret.com/android/{page}"
         response = await self._http.post(url, data=common, headers=self._headers("application/x-www-form-urlencoded"))
-        if response.status_code in {401, 403, 500} and self._session_from_cache:
+        if _should_retry_with_fresh_login(response) and self._session_from_cache:
             self._session = None
             self._session_from_cache = False
             session = await self.login()
@@ -352,6 +432,22 @@ class FatSecretClient:
             response = await self._http.post(url, data=common, headers=self._headers("application/x-www-form-urlencoded"))
         if response.status_code != 200:
             raise FatSecretError(f"{self.account.label}: {page} failed with HTTP {response.status_code}")
+        return response
+
+    async def _post_app_json(self, url: str, payload: dict[str, Any], label: str) -> httpx.Response:
+        await self.ensure_logged_in()
+        query = self._build_query(include_auth=True, include_build=True)
+        full_url = f"{url}?{urlencode(query)}"
+        response = await self._http.post(full_url, json=payload, headers=self._headers("application/json"))
+        if _should_retry_with_fresh_login(response) and self._session_from_cache:
+            self._session = None
+            self._session_from_cache = False
+            await self.login()
+            query = self._build_query(include_auth=True, include_build=True)
+            full_url = f"{url}?{urlencode(query)}"
+            response = await self._http.post(full_url, json=payload, headers=self._headers("application/json"))
+        if response.status_code != 200:
+            raise FatSecretError(f"{self.account.label}: {label} failed with HTTP {response.status_code}")
         return response
 
     def _common_form(self, session: FatSecretSession) -> dict[str, str]:
@@ -486,6 +582,72 @@ class FatSecretClient:
             )
         return recipe
 
+    def _parse_food_search_data(self, data: Any) -> list[FoodSearchResult]:
+        if not isinstance(data, dict):
+            return []
+        raw_summaries = data.get("summaries") or data.get("summary") or data.get("items") or []
+        if isinstance(raw_summaries, dict):
+            raw_summaries = raw_summaries.get("summary") or raw_summaries.get("items") or []
+        if not isinstance(raw_summaries, list):
+            return []
+
+        root_brand = _clean_food_text(data.get("manufacturername") or data.get("manufacturerName") or "")
+        results: list[FoodSearchResult] = []
+        for item in raw_summaries:
+            if not isinstance(item, dict):
+                continue
+            raw_title = _first_present(item, "title", "name", "foodName", "food_name")
+            title = _clean_food_text(raw_title)
+            raw_id = _first_present(item, "id", "foodId", "food_id", "recipeId")
+            if not raw_id or not title:
+                continue
+
+            grams_per_portion = _decimal_value(
+                _first_present(item, "gramsPerPortion", "grams_per_portion", "gramsperportion"),
+                None,
+            )
+            serving_amount = _decimal_value(_first_present(item, "servingAmount", "serving_amount"), None)
+            serving_unit = _clean_food_text(_first_present(item, "servingAmountUnit", "serving_amount_unit") or "")
+            portion_description = _default_portion_description(item)
+            if not portion_description and serving_amount is not None and serving_unit:
+                portion_description = f"{_form_decimal(serving_amount)}{serving_unit}"
+            if not portion_description and grams_per_portion is not None:
+                portion_description = f"{_form_decimal(grams_per_portion)}г"
+
+            energy = _decimal_value(_first_present(item, "energyPerPortion", "energy", "calories"), None)
+            carbohydrate = _decimal_value(
+                _first_present(item, "carbohydratePerPortion", "carbohydrate", "carbs"),
+                None,
+            )
+            protein = _decimal_value(_first_present(item, "proteinPerPortion", "protein"), None)
+            fat = _decimal_value(_first_present(item, "fatPerPortion", "fat"), None)
+            raw = dict(item)
+            raw["_source_endpoint"] = "food_search_data"
+            if root_brand:
+                raw["_rootManufacturerName"] = root_brand
+
+            results.append(
+                FoodSearchResult(
+                    food_id=str(raw_id),
+                    title=title,
+                    description=_clean_food_text(
+                        item.get("shortDescription") or item.get("description") or item.get("pathName") or ""
+                    ),
+                    brand=_food_brand(item) or root_brand,
+                    default_portion_id=_default_portion_id(item),
+                    default_portion_description=portion_description,
+                    source=str(item.get("source") or ""),
+                    is_own=_bool_value(_first_present(item, "isOwn", "is_own", "isown")),
+                    grams_per_portion=grams_per_portion,
+                    energy_per_portion=_scale_per_100g(energy, grams_per_portion),
+                    carbohydrate_per_portion=_scale_per_100g(carbohydrate, grams_per_portion),
+                    protein_per_portion=_scale_per_100g(protein, grams_per_portion),
+                    fat_per_portion=_scale_per_100g(fat, grams_per_portion),
+                    raw=raw,
+                )
+            )
+        return results
+
     def _parse_autocomplete(self, data: Any) -> list[FoodSearchResult]:
         suggestions = data.get("suggestions", []) if isinstance(data, dict) else []
         results: list[FoodSearchResult] = []
@@ -495,8 +657,12 @@ class FatSecretClient:
                 continue
             if not isinstance(item, dict):
                 continue
-            raw_title = item.get("title") or item.get("name") or item.get("value") or item.get("label")
-            raw_id = item.get("id") or item.get("recipeId") or item.get("food_id") or item.get("foodId")
+            raw_title = _first_present(item, "title", "name", "value", "label")
+            raw_id = _first_present(item, "id", "recipeId", "food_id", "foodId")
+            grams_per_portion = _decimal_value(
+                _first_present(item, "gramsPerPortion", "grams_per_portion", "gramsperportion"),
+                None,
+            )
             if raw_title:
                 results.append(
                     FoodSearchResult(
@@ -511,28 +677,25 @@ class FatSecretClient:
                             or "0"
                         ),
                         default_portion_description=_default_portion_description(item),
-                        energy_per_portion=_decimal(
-                            str(
-                                item.get("energyPerPortion")
-                                or item.get("energy")
-                                or item.get("calories")
-                                or item.get("kcal")
-                                or ""
-                            ),
-                            None,
+                        energy_per_portion=_scale_per_100g(
+                            _decimal_value(_first_present(item, "energyPerPortion", "energy", "calories", "kcal"), None),
+                            grams_per_portion,
                         ),
-                        carbohydrate_per_portion=_decimal(
-                            str(item.get("carbohydratePerPortion") or item.get("carbohydrate") or item.get("carbs") or ""),
-                            None,
+                        carbohydrate_per_portion=_scale_per_100g(
+                            _decimal_value(_first_present(item, "carbohydratePerPortion", "carbohydrate", "carbs"), None),
+                            grams_per_portion,
                         ),
-                        protein_per_portion=_decimal(
-                            str(item.get("proteinPerPortion") or item.get("protein") or ""),
-                            None,
+                        protein_per_portion=_scale_per_100g(
+                            _decimal_value(_first_present(item, "proteinPerPortion", "protein"), None),
+                            grams_per_portion,
                         ),
-                        fat_per_portion=_decimal(
-                            str(item.get("fatPerPortion") or item.get("fat") or ""),
-                            None,
+                        fat_per_portion=_scale_per_100g(
+                            _decimal_value(_first_present(item, "fatPerPortion", "fat"), None),
+                            grams_per_portion,
                         ),
+                        source=str(item.get("source") or ""),
+                        is_own=_bool_value(_first_present(item, "isOwn", "is_own", "isown")),
+                        grams_per_portion=grams_per_portion,
                         raw=item,
                     )
                 )
@@ -544,6 +707,16 @@ class FatSecretClient:
             if not matches:
                 raise FatSecretError(f"{self.account.label}: no recipe/food match for {result.title}")
             result = matches[0]
+        if result.raw.get("_source_endpoint") == "food_search_data" or any(
+            value is not None
+            for value in (
+                result.energy_per_portion,
+                result.carbohydrate_per_portion,
+                result.protein_per_portion,
+                result.fat_per_portion,
+            )
+        ):
+            return result
         recipe = await self.get_recipe(result.food_id)
         detail_brand = _metadata_value(recipe.description, "mname")
         detail_portion_description = recipe.default_portion_description or _metadata_value(recipe.description, "ssize")
@@ -558,6 +731,9 @@ class FatSecretClient:
                 else result.default_portion_id or "0"
             ),
             default_portion_description=detail_portion_description or result.default_portion_description,
+            source=result.source,
+            is_own=result.is_own,
+            grams_per_portion=result.grams_per_portion,
             energy_per_portion=result.energy_per_portion,
             carbohydrate_per_portion=result.carbohydrate_per_portion,
             protein_per_portion=result.protein_per_portion,
