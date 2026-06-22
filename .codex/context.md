@@ -7,7 +7,7 @@ Updated: 2026-06-21
 - Local path: repository root
 - Branch: `main`
 - Remote: `https://github.com/Kabagun/fatsecret-bot.git`
-- Latest deployed commit at time of writing: `aa9ee1c fix: keep recipe drafts with unresolved ingredients`
+- Latest deployed commit should be verified with `git log` on `main` and the live checkout.
 - Project package: `fatsecret-bot`
 - Runtime: Python, `python-telegram-bot`, `httpx`, SQLite storage
 
@@ -132,6 +132,10 @@ Android form endpoints still used:
 - `ingredientsave`
 - `recipedelete`
 
+For recipe creation, mobile-search food ids may be good for display/KБЖУ but rejected by
+`ingredientsave`. If an ingredient add returns false, the bot retries once with a compatible id
+from legacy `RecipeSearch.aspx` via `search_addable_foods`.
+
 Cached-session retry behavior:
 
 - retry with fresh login on `401`, `403`, `500`
@@ -190,7 +194,9 @@ Current unresolved ingredient flow:
   - `Заполнить`: search FatSecret candidates with the original grams preserved.
   - `Удалить`: remove the unresolved line from the draft.
 - `Создать рецепт` is hidden/blocked until all unresolved lines are filled or deleted.
-- If all FatSecret accounts reject recipe creation, the local draft is deleted.
+- Recipe creation is all-or-nothing across connected FatSecret accounts.
+- If any account rejects an ingredient or metadata save, created remote recipes are deleted and the local draft is deleted.
+- Telegram user_data keeps the draft in the chat flow so the user can return to review and replace the bad ingredient.
 
 ## Recent Fixes
 
@@ -205,13 +211,17 @@ Current unresolved ingredient flow:
   - added fill/delete controls for unknown ingredients
   - blocked creation until unknown ingredients are fixed
 
+- rollback/addable-id fix after `aa9ee1c`
+  - recipe creation rolls back created remote recipes if any ingredient is rejected
+  - list-created ingredients retry with legacy addable ids when mobile-search ids are not accepted by `ingredientsave`
+
 ## Verification Baseline
 
 Latest full local test run before this context file:
 
 ```text
 python -m pytest
-81 passed
+84 passed
 ```
 
 Latest deploy verification before this context file:

@@ -152,10 +152,11 @@ class FakeCreateClient:
         )
         self.created_recipe: Recipe | None = None
         self.saved_ingredients: list[Ingredient] = []
+        self.deleted_recipe_ids: list[str] = []
 
     async def create_recipe(self, recipe: Recipe) -> str:
         self.created_recipe = recipe
-        return "remote-1"
+        return f"remote-{self.account.key}"
 
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         self.saved_ingredients.append(ingredient)
@@ -164,8 +165,37 @@ class FakeCreateClient:
     async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
         return True
 
+    async def delete_recipe(self, remote_recipe_id: str) -> bool:
+        self.deleted_recipe_ids.append(remote_recipe_id)
+        return True
+
     async def close(self) -> None:
         return None
+
+
+class FakeRejectIngredientCreateClient(FakeCreateClient):
+    def __init__(self, account_key: str, rejected_title: str) -> None:
+        super().__init__(account_key)
+        self.rejected_title = rejected_title
+
+    async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
+        self.saved_ingredients.append(ingredient)
+        return ingredient.title != self.rejected_title
+
+
+class FakeLegacyAddableCreateClient(FakeCreateClient):
+    def __init__(self, account_key: str, addable: FoodSearchResult) -> None:
+        super().__init__(account_key)
+        self.addable = addable
+        self.addable_queries: list[str] = []
+
+    async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
+        self.saved_ingredients.append(ingredient)
+        return ingredient.food_id == self.addable.food_id
+
+    async def search_addable_foods(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        self.addable_queries.append(query)
+        return [self.addable]
 
 
 def _device() -> FatSecretDeviceConfig:
@@ -1001,6 +1031,121 @@ def test_create_recipe_from_list_deletes_local_recipe_when_every_account_fails(t
             raise AssertionError("expected FatSecretError")
 
         assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_rolls_back_remote_when_ingredient_is_rejected(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeRejectIngredientCreateClient("tg11", "Морская Соль")
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Соль",
+                grams=Decimal("9"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-salt",
+                    title="Морская Соль",
+                    portion_id="0",
+                    amount=Decimal("0.09"),
+                    portion_description="100г",
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        try:
+            asyncio.run(engine.create_recipe_from_list("group", "Котлета тест", items, updated_by=11))
+        except FatSecretError as exc:
+            assert "FatSecret не принял ингредиент «Морская Соль»" in str(exc)
+            assert "созданный рецепт remote-tg11 удален после ошибки" in str(exc)
+        else:
+            raise AssertionError("expected FatSecretError")
+
+        assert client.deleted_recipe_ids == ["remote-tg11"]
+        assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_rolls_back_successful_accounts_when_any_account_fails(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        first = FakeCreateClient("tg11")
+        second = FakeRejectIngredientCreateClient("tg22", "Лук")
+        engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Лук",
+                grams=Decimal("119"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-onion",
+                    title="Лук",
+                    portion_id="0",
+                    amount=Decimal("1.19"),
+                    portion_description="100г",
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        try:
+            asyncio.run(engine.create_recipe_from_list("group", "Котлета тест", items, updated_by=11))
+        except FatSecretError as exc:
+            assert "FatSecret не принял ингредиент «Лук»" in str(exc)
+            assert "созданный рецепт remote-tg11 удален после ошибки" in str(exc)
+            assert "созданный рецепт remote-tg22 удален после ошибки" in str(exc)
+        else:
+            raise AssertionError("expected FatSecretError")
+
+        assert first.deleted_recipe_ids == ["remote-tg11"]
+        assert second.deleted_recipe_ids == ["remote-tg22"]
+        assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_retries_ingredient_with_legacy_addable_id(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeLegacyAddableCreateClient(
+            "tg11",
+            FoodSearchResult(food_id="legacy-onion", title="Лук Репчатый"),
+        )
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Лук",
+                grams=Decimal("119"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="app-onion",
+                    title="Лук",
+                    portion_id="0",
+                    amount=Decimal("1.19"),
+                    portion_description="100г",
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        created = asyncio.run(engine.create_recipe_from_list("group", "Котлета тест", items, updated_by=11))
+        recipe = storage.get_recipe(created.recipe_id)
+
+        assert [item.food_id for item in client.saved_ingredients] == ["app-onion", "legacy-onion"]
+        assert client.deleted_recipe_ids == []
+        assert recipe is not None
+        assert recipe.ingredients[0].food_id == "legacy-onion"
+        assert recipe.ingredients[0].title == "Лук Репчатый"
     finally:
         storage.close()
 

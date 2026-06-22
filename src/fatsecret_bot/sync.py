@@ -424,6 +424,19 @@ def _copy_recipe_from_remote(recipe_id: str, remote: Recipe) -> Recipe:
     return recipe
 
 
+def _ingredient_with_search_result(ingredient: Ingredient, result: FoodSearchResult) -> Ingredient:
+    return Ingredient(
+        id=ingredient.id,
+        recipe_id=ingredient.recipe_id,
+        food_id=result.food_id,
+        title=result.title or ingredient.title,
+        portion_id="0",
+        amount=ingredient.amount,
+        portion_description="100г",
+        remote_ingredient_id=ingredient.remote_ingredient_id,
+    )
+
+
 class RecipeSyncEngine:
     def __init__(self, storage: Storage, device: FatSecretDeviceConfig, timezone: str = "Europe/Minsk") -> None:
         self.storage = storage
@@ -854,6 +867,51 @@ class RecipeSyncEngine:
         candidates.sort(key=lambda item: _food_result_rank(query, item))
         return candidates[0] if _food_result_has_detail(candidates[0]) else await client.resolve_food_detail(candidates[0])
 
+    async def _legacy_addable_ingredient(
+        self,
+        client: FatSecretClient,
+        ingredient: Ingredient,
+    ) -> Ingredient | None:
+        search_addable = getattr(client, "search_addable_foods", None)
+        if search_addable is None:
+            return None
+        candidates: list[FoodSearchResult] = []
+        seen_queries: set[str] = set()
+        for query in _query_variants(ingredient.title):
+            normalized_query = normalize_title(query)
+            if normalized_query in seen_queries:
+                continue
+            seen_queries.add(normalized_query)
+            try:
+                candidates.extend(await search_addable(query, page=0))
+            except Exception:  # noqa: BLE001 - add fallback should not hide the original ingredient failure.
+                logger.debug("legacy addable ingredient search failed for %s", query, exc_info=True)
+        candidates = [
+            item
+            for item in _dedupe_food_results(candidates)
+            if item.food_id and _matches_requested_food(ingredient.title, item.title, _food_search_text(item))
+        ]
+        candidates.sort(key=lambda item: _food_result_rank(ingredient.title, item))
+        for candidate in candidates:
+            if candidate.food_id != ingredient.food_id:
+                return _ingredient_with_search_result(ingredient, candidate)
+        return None
+
+    async def _add_ingredient_with_fallback(
+        self,
+        client: FatSecretClient,
+        remote_id: str,
+        ingredient: Ingredient,
+    ) -> Ingredient | None:
+        if await client.add_ingredient(remote_id, ingredient):
+            return ingredient
+        fallback = await self._legacy_addable_ingredient(client, ingredient)
+        if fallback is None:
+            return None
+        if await client.add_ingredient(remote_id, fallback):
+            return fallback
+        return None
+
     async def create_recipe_from_list(
         self,
         group_id: str,
@@ -895,24 +953,52 @@ class RecipeSyncEngine:
         recipe.steps = list(steps or [])
 
         results: list[AccountSyncResult] = []
+        successful: list[tuple[str, FatSecretClient, str]] = []
+        failed: list[AccountSyncResult] = []
         try:
             for account_key, client in clients.items():
+                remote_id: str | None = None
                 try:
                     remote_id = await client.create_recipe(recipe)
-                    self.storage.set_remote_recipe_id(recipe.id, account_key, remote_id, last_synced_version=0)
-                    recipe.remote_ids[account_key] = remote_id
-                    for ingredient in recipe.ingredients:
-                        ok = await client.add_ingredient(remote_id, ingredient)
-                        if not ok:
+                    for index, ingredient in enumerate(list(recipe.ingredients)):
+                        accepted_ingredient = await self._add_ingredient_with_fallback(client, remote_id, ingredient)
+                        if accepted_ingredient is None:
                             raise FatSecretError(f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}».")
+                        if accepted_ingredient.food_id != ingredient.food_id:
+                            recipe.ingredients[index] = accepted_ingredient
+                            self.storage.replace_ingredients(recipe.id, recipe.ingredients)
                     ok = await client.save_recipe_meta(recipe, remote_id)
                     if not ok:
                         raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
-                    self.storage.mark_synced(recipe.id, account_key, remote_id, recipe.version)
+                    successful.append((account_key, client, remote_id))
                     results.append(AccountSyncResult(account_key, remote_id, True, "создан"))
                 except Exception as exc:  # noqa: BLE001 - keep per-account creation isolated.
-                    self.storage.record_sync(recipe.id, account_key, "error", str(exc))
-                    results.append(AccountSyncResult(account_key, recipe.remote_ids.get(account_key), False, str(exc)))
+                    rollback_message = await self._rollback_created_recipe(client, remote_id)
+                    message = str(exc)
+                    if rollback_message:
+                        message = f"{message} {rollback_message}"
+                    failed.append(AccountSyncResult(account_key, None, False, message))
+            if failed:
+                for account_key, client, remote_id in successful:
+                    rollback_message = await self._rollback_created_recipe(client, remote_id)
+                    failed.append(
+                        AccountSyncResult(
+                            account_key,
+                            None,
+                            False,
+                            rollback_message or f"{client.account.label}: создание отменено после ошибки.",
+                        )
+                    )
+                self.storage.delete_recipe(recipe.id)
+                details = "; ".join(result.message for result in failed)
+                raise FatSecretError(
+                    "FatSecret не создал рецепт во всех подключенных аккаунтах. "
+                    f"Локальный черновик удален. {details}"
+                )
+            for account_key, _client, remote_id in successful:
+                self.storage.set_remote_recipe_id(recipe.id, account_key, remote_id, last_synced_version=0)
+                recipe.remote_ids[account_key] = remote_id
+                self.storage.mark_synced(recipe.id, account_key, remote_id, recipe.version)
         finally:
             await self._close_clients(clients)
         if not self.storage.remote_ids(recipe.id):
@@ -923,6 +1009,17 @@ class RecipeSyncEngine:
                 f"Локальный черновик удален. {details}"
             )
         return RecipeCreateResult(recipe_id=recipe_id, results=results)
+
+    async def _rollback_created_recipe(self, client: FatSecretClient, remote_id: str | None) -> str:
+        if not remote_id:
+            return ""
+        try:
+            ok = await client.delete_recipe(remote_id)
+        except Exception as exc:  # noqa: BLE001 - preserve original creation error and report cleanup failure.
+            return f"{client.account.label}: созданный рецепт {remote_id} не удалось удалить после ошибки: {exc}"
+        if ok:
+            return f"{client.account.label}: созданный рецепт {remote_id} удален после ошибки."
+        return f"{client.account.label}: созданный рецепт {remote_id} не удалось удалить после ошибки."
 
     async def hydrate_recipe_from_remote(self, recipe_id: str) -> Recipe | None:
         recipe = self.storage.get_recipe(recipe_id)

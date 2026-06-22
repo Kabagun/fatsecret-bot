@@ -335,6 +335,10 @@ class FatSecretClient:
             )
         return results
 
+    async def search_addable_foods(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        """Search foods through the legacy recipe endpoint accepted by recipe ingredient actions."""
+        return await self._search_recipes_legacy(query, page=page)
+
     async def autocomplete_food(self, query: str) -> list[FoodSearchResult]:
         session = await self.ensure_logged_in()
         params = {
