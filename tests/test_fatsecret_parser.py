@@ -98,6 +98,19 @@ def test_search_recipes_uses_app_food_search_data_endpoint() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.url.path == "/api/food/v1/search/data"
+        params = dict(request.url.params)
+        assert params["c_fl"] == "1"
+        assert "c_id" not in params
+        assert "c_s" not in params
+        assert "c_d" not in params
+        assert request.headers["c_id"] == "server"
+        assert request.headers["c_s"] == "secret"
+        assert request.headers["c_d"] == "device"
+        assert request.headers["fs_device"] == "android"
+        assert request.headers["fs_dt"]
+        assert request.headers["market"] == "BY"
+        assert request.headers["fs_market_locale"] == "BY"
+        assert request.headers["fs_language_locale"] == "ru"
         assert request.content
         return httpx.Response(
             200,
@@ -150,6 +163,35 @@ def test_search_recipes_uses_app_food_search_data_endpoint() -> None:
     assert results[0].energy_per_portion == Decimal("62")
     assert results[0].protein_per_portion == Decimal("1.2")
     assert results[0].carbohydrate_per_portion == Decimal("14.2")
+
+
+def test_parse_food_search_data_keeps_app_100g_energy_when_grams_per_portion_zero() -> None:
+    results = _client()._parse_food_search_data(
+        {
+            "summaries": [
+                {
+                    "id": 31531828,
+                    "title": "Фарш Сочный",
+                    "brandName": "Green",
+                    "gramsPerPortion": 0,
+                    "servingSize": "100г",
+                    "energyPerPortion": 320,
+                    "proteinPerPortion": 15,
+                    "fatPerPortion": 29,
+                    "carbohydratePerPortion": 0,
+                }
+            ]
+        }
+    )
+
+    assert results[0].food_id == "31531828"
+    assert results[0].title == "Фарш Сочный"
+    assert results[0].brand == "Green"
+    assert results[0].default_portion_description == "100г"
+    assert results[0].energy_per_portion == Decimal("320")
+    assert results[0].protein_per_portion == Decimal("15")
+    assert results[0].fat_per_portion == Decimal("29")
+    assert results[0].carbohydrate_per_portion == Decimal("0")
 
 
 def test_resolve_food_detail_extracts_brand_and_portion_from_metadata_description() -> None:

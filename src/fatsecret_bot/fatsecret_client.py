@@ -440,16 +440,16 @@ class FatSecretClient:
 
     async def _post_app_json(self, url: str, payload: dict[str, Any], label: str) -> httpx.Response:
         await self.ensure_logged_in()
-        query = self._build_query(include_auth=True, include_build=True)
+        query = self._build_app_query()
         full_url = f"{url}?{urlencode(query)}"
-        response = await self._http.post(full_url, json=payload, headers=self._headers("application/json"))
+        response = await self._http.post(full_url, json=payload, headers=self._app_headers("application/json"))
         if _should_retry_with_fresh_login(response) and self._session_from_cache:
             self._session = None
             self._session_from_cache = False
             await self.login()
-            query = self._build_query(include_auth=True, include_build=True)
+            query = self._build_app_query()
             full_url = f"{url}?{urlencode(query)}"
-            response = await self._http.post(full_url, json=payload, headers=self._headers("application/json"))
+            response = await self._http.post(full_url, json=payload, headers=self._app_headers("application/json"))
         if response.status_code != 200:
             raise FatSecretError(f"{self.account.label}: {label} failed with HTTP {response.status_code}")
         return response
@@ -495,6 +495,11 @@ class FatSecretClient:
             )
         return query
 
+    def _build_app_query(self) -> dict[str, str]:
+        query = self._build_query(include_auth=False, include_build=True)
+        query["c_fl"] = "1"
+        return query
+
     def _headers(self, content_type: str | None = None, device_key: str | None = None) -> dict[str, str]:
         headers = {"User-Agent": self.device.user_agent}
         if content_type:
@@ -507,6 +512,29 @@ class FatSecretClient:
             headers["c_d"] = self._session.device_key
         if self.device.c_desc:
             headers["c_desc"] = self.device.c_desc
+        return headers
+
+    def _app_headers(self, content_type: str | None = None) -> dict[str, str]:
+        headers = self._headers(content_type)
+        headers.update(
+            {
+                "fs_device": "android",
+                "fs_dt": days_since_epoch(),
+                "app_version": self.device.app_version,
+                "device": self.device.device,
+                "market": self.account.market,
+                "fs_market_locale": self.account.market,
+                "fs_language_locale": self.account.language,
+            }
+        )
+        if self._session:
+            headers.update(
+                {
+                    "c_id": self._session.server_id,
+                    "c_s": self._session.secret_key,
+                    "c_d": self._session.device_key,
+                }
+            )
         return headers
 
     def _parse_recipe_list(self, xml_text: str) -> list[RecipeSummary]:

@@ -101,6 +101,13 @@ Payload:
 }
 ```
 
+For `app.ftscrt.com/api/...` JSON endpoints, app session auth must match the Android capture:
+
+- query has `c_fl=1`, `dt`, app/build, language/market/device fields
+- query does not include `c_id`, `c_s`, or `c_d`
+- headers include `Authorization`, `c_id`, `c_s`, `c_d`, `fs_device=android`, `fs_dt`,
+  `app_version`, `device`, `market`, `fs_market_locale`, and `fs_language_locale`
+
 Important response fields parsed from `summaries`:
 
 - `id`
@@ -117,8 +124,6 @@ Important response fields parsed from `summaries`:
 - `source`
 
 The bot normalizes nutrition values to 100g when `gramsPerPortion` is not 100.
-If FatSecret returns an impossible low kcal value but valid BJU, recipe-list drafts display kcal
-calculated from BJU so per-item rows and total kcal stay consistent.
 The old XML `RecipeSearch.aspx` path remains only as fallback.
 
 Android form endpoints still used:
@@ -221,7 +226,11 @@ Current unresolved ingredient flow:
 
 - recipe-list portions and kcal display fix after rollback/addable-id fix
   - `Порций: N` is required in list-created recipes and saved to FatSecret
-  - impossible low kcal from FatSecret is displayed from BJU in the draft preview
+
+- app food-search auth fix after recipe-list portions
+  - fixed `/api/food/v1/search/data` auth to send `c_id/c_s/c_d` in headers like Android
+  - removed the UI-level kcal correction that masked bad search auth/parser behavior
+  - verified live `сочный` search returns `Фарш Сочный (Green)` as `320/15/29/0`
 
 ## Verification Baseline
 

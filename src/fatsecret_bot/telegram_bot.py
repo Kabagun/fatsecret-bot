@@ -280,25 +280,6 @@ def _scaled_macro(value: Decimal | None, grams: Decimal) -> Decimal | None:
     return value * grams / Decimal("100")
 
 
-def _macro_energy(
-    protein: Decimal | None,
-    fat: Decimal | None,
-    carbohydrate: Decimal | None,
-) -> Decimal | None:
-    if protein is None or fat is None or carbohydrate is None:
-        return None
-    return protein * Decimal("4") + fat * Decimal("9") + carbohydrate * Decimal("4")
-
-
-def _correct_display_energy(item: ResolvedRecipeListItem) -> Decimal | None:
-    calculated = _macro_energy(item.protein_per_100g, item.fat_per_100g, item.carbohydrate_per_100g)
-    if item.energy_per_100g is None:
-        return calculated
-    if calculated is not None and calculated > 0 and item.energy_per_100g < calculated * Decimal("0.5"):
-        return calculated
-    return item.energy_per_100g
-
-
 def _format_item_title(item: ResolvedRecipeListItem) -> str:
     title = item.ingredient.title.strip()
     brand = item.brand.strip()
@@ -309,7 +290,7 @@ def _format_item_title(item: ResolvedRecipeListItem) -> str:
 
 def _format_macros_per_100g(item: ResolvedRecipeListItem) -> str:
     return (
-        f"{_format_decimal(_correct_display_energy(item), 0)}/"
+        f"{_format_decimal(item.energy_per_100g, 0)}/"
         f"{_format_decimal(item.protein_per_100g)}/"
         f"{_format_decimal(item.fat_per_100g)}/"
         f"{_format_decimal(item.carbohydrate_per_100g)}"
@@ -338,7 +319,7 @@ def _format_recipe_list_draft(
     unresolved: list[RecipeListItem] | None = None,
     portions: Decimal = Decimal("1"),
 ) -> str:
-    energy = _sum_known_macros([_scaled_macro(_correct_display_energy(item), item.grams) for item in items])
+    energy = _sum_known_macros([_scaled_macro(item.energy_per_100g, item.grams) for item in items])
     protein = _sum_known_macros([_scaled_macro(item.protein_per_100g, item.grams) for item in items])
     fat = _sum_known_macros([_scaled_macro(item.fat_per_100g, item.grams) for item in items])
     carbs = _sum_known_macros([_scaled_macro(item.carbohydrate_per_100g, item.grams) for item in items])
