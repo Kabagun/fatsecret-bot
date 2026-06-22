@@ -247,7 +247,7 @@ def _matches_direct_food_metadata(result: FoodSearchResult, direct_metadata: Foo
 
 
 def _food_result_has_detail(result: FoodSearchResult) -> bool:
-    return result.raw.get("_source_endpoint") == "food_search_data" or any(
+    has_macros = result.raw.get("_source_endpoint") == "food_search_data" or any(
         value is not None
         for value in (
             result.energy_per_portion,
@@ -256,6 +256,7 @@ def _food_result_has_detail(result: FoodSearchResult) -> bool:
             result.carbohydrate_per_portion,
         )
     )
+    return has_macros and _food_result_has_usable_gram_portion(result)
 
 
 def _resolved_candidate_rank(
@@ -430,9 +431,17 @@ def _ingredient_current_portion_sends_grams(ingredient: Ingredient, grams: Decim
         return False
     portion_id = ingredient.portion_id or "0"
     if portion_id == "0":
-        return True
+        return False
     normalized = ingredient.portion_description.strip().casefold()
     return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""} and _same_decimal(ingredient.amount, grams)
+
+
+def _food_result_has_usable_gram_portion(result: FoodSearchResult) -> bool:
+    if result.raw.get("_gram_portion_id"):
+        return True
+    return (result.default_portion_id or "0") != "0" and _is_explicit_weight_portion(
+        result.default_portion_description
+    )
 
 
 def _ingredient_from_food_result(
@@ -445,6 +454,19 @@ def _ingredient_from_food_result(
     title: str | None = None,
     remote_ingredient_id: str | None = None,
 ) -> Ingredient:
+    gram_portion_id = str(result.raw.get("_gram_portion_id") or "").strip()
+    if gram_portion_id:
+        return Ingredient(
+            id=id or str(uuid.uuid4()),
+            recipe_id=recipe_id,
+            food_id=food_id or result.food_id,
+            title=title or result.title,
+            portion_id=gram_portion_id,
+            amount=grams,
+            portion_description="г",
+            remote_ingredient_id=remote_ingredient_id,
+            grams=grams,
+        )
     portion_id = result.default_portion_id or "0"
     portion_description = result.default_portion_description or ""
     if portion_id != "0" and _is_explicit_weight_portion(portion_description):
@@ -1062,8 +1084,19 @@ class RecipeSyncEngine:
         ]
         candidates.sort(key=lambda item: _food_result_rank(match_query, item))
         for candidate in candidates:
-            if candidate.food_id != ingredient.food_id:
-                return _ingredient_with_search_result(ingredient, candidate)
+            try:
+                found = candidate if _food_result_has_detail(candidate) else await client.resolve_food_detail(candidate)
+            except Exception:  # noqa: BLE001 - keep add fallback usable if detail lookup fails.
+                logger.debug("legacy addable detail lookup failed for %s", candidate.title, exc_info=True)
+                found = candidate
+            converted = _ingredient_with_search_result(ingredient, found)
+            if (
+                candidate.food_id != ingredient.food_id
+                or converted.portion_id != ingredient.portion_id
+                or converted.portion_description != ingredient.portion_description
+                or converted.amount != ingredient.amount
+            ):
+                return converted
         return None
 
     async def _add_ingredient_with_fallback(
@@ -1073,9 +1106,14 @@ class RecipeSyncEngine:
         ingredient: Ingredient,
         requested_query: str | None = None,
     ) -> Ingredient | None:
-        if await client.add_ingredient(remote_id, ingredient):
-            return ingredient
-        fallback = await self._legacy_addable_ingredient(client, ingredient, requested_query)
+        grams = _ingredient_grams_or_none(ingredient)
+        prepared: Ingredient | None = None
+        if not _ingredient_current_portion_sends_grams(ingredient, grams):
+            prepared = await self._legacy_addable_ingredient(client, ingredient, requested_query)
+        first_try = prepared or ingredient
+        if await client.add_ingredient(remote_id, first_try):
+            return first_try
+        fallback = None if prepared is not None else await self._legacy_addable_ingredient(client, ingredient, requested_query)
         if fallback is None:
             return None
         if await client.add_ingredient(remote_id, fallback):
@@ -1114,6 +1152,7 @@ class RecipeSyncEngine:
                 portion_id=item.ingredient.portion_id or "0",
                 amount=item.ingredient.amount,
                 portion_description=item.ingredient.portion_description or "г",
+                grams=item.ingredient.grams,
             )
             for item in items
         ]
@@ -1142,7 +1181,7 @@ class RecipeSyncEngine:
                         )
                         if accepted_ingredient is None:
                             raise FatSecretError(f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}».")
-                        if accepted_ingredient.food_id != ingredient.food_id:
+                        if _ingredient_needs_update(ingredient, accepted_ingredient):
                             recipe.ingredients[index] = accepted_ingredient
                             self.storage.replace_ingredients(recipe.id, recipe.ingredients)
                     ok = await client.save_recipe_meta(recipe, remote_id)
@@ -1461,7 +1500,8 @@ class RecipeSyncEngine:
         for ingredient in recipe.ingredients:
             target = _find_matching_ingredient(remote.ingredients, ingredient, used_target_ids)
             if target is None:
-                ok = await client.add_ingredient(remote_id, ingredient)
+                accepted_ingredient = await self._add_ingredient_with_fallback(client, remote_id, ingredient, ingredient.title)
+                ok = accepted_ingredient is not None
                 added += 1
             elif not _ingredient_needs_update(target, ingredient):
                 used_target_ids.add(_ingredient_identity(target))
@@ -1469,7 +1509,8 @@ class RecipeSyncEngine:
                 continue
             else:
                 used_target_ids.add(_ingredient_identity(target))
-                ok = await client.add_ingredient(
+                accepted_ingredient = await self._add_ingredient_with_fallback(
+                    client,
                     remote_id,
                     Ingredient(
                         id=target.id,
@@ -1480,8 +1521,11 @@ class RecipeSyncEngine:
                         amount=ingredient.amount,
                         portion_description=ingredient.portion_description,
                         remote_ingredient_id=_ingredient_identity(target),
+                        grams=ingredient.grams,
                     ),
+                    ingredient.title,
                 )
+                ok = accepted_ingredient is not None
                 updated += 1
             if not ok:
                 raise FatSecretError(

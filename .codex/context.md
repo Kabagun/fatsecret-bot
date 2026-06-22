@@ -168,10 +168,24 @@ Candidate order:
 List-created recipe ingredients are sent to FatSecret as gram portions:
 
 - If search metadata has a real gram `defaultPortionID`, keep that id and send `portionamount = grams`.
+- If search metadata default is not grams, load `RecipeAndroidPage.aspx` detail and use the `recipeportion`
+  whose description is `г` / `gram` when FatSecret exposes one.
 - If FatSecret only has synthetic `100г` with `portion_id = "0"`, send `portionamount = grams / 100`.
 - Do not force `portion_id = "0"` for every ingredient: FatSecret rejects some foods, such as onion/salt, unless their real gram portion id is used.
 
 This avoids FatSecret interpreting `300` as 300 servings or eggs as 50 pieces.
+
+Captured Android behavior for adding `Яйцо 55г` into recipe `Жульен`:
+
+```text
+RecipeActionAndroidPage.aspx
+action=ingredientsave
+prid=89341471
+rid=3092
+entryname=Яйцо
+portionid=51772
+portionamount=55.0
+```
 
 Ingredient amount normalization:
 
@@ -257,13 +271,18 @@ Current unresolved ingredient flow:
   - parallelized read-only ingredient detail normalization with a bounded gather
   - serialized cached-session relogin so parallel read requests do not spam authenticate
 
+- recipe detail gram portion fix after live egg capture
+  - `RecipeAndroidPage.aspx` `recipeportion` entries are parsed for real gram portion ids
+  - list-created recipes preserve normalized grams in local drafts
+  - add/sync prepares real gram portion ids before first `ingredientsave`
+
 ## Verification Baseline
 
 Latest full local test run before this context file:
 
 ```text
 python -m pytest
-96 passed
+98 passed
 ```
 
 Latest deploy verification before this context file:

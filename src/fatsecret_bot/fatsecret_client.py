@@ -173,6 +173,42 @@ def _default_portion_id(data: dict[str, Any]) -> str:
     return "0"
 
 
+def _explicit_weight_portion_description(description: str) -> bool:
+    normalized = description.strip().casefold()
+    return normalized in {"г", "гр", "g", "gram", "grams", "грам"} or _portion_unit_size(description) is not None
+
+
+def _recipe_portions(root: ET.Element) -> list[dict[str, str]]:
+    portions: list[dict[str, str]] = []
+    for node in root.findall(".//recipeportion"):
+        portion_id = _text(node, "id")
+        description = _text(node, "description")
+        if not portion_id or not description:
+            continue
+        portions.append(
+            {
+                "id": portion_id,
+                "description": description,
+                "singleDescription": _text(node, "singleDescription"),
+                "multipleDescription": _text(node, "multipleDescription"),
+                "gramWeight": _text(node, "gramWeight"),
+                "defaultAmount": _text(node, "defaultAmount"),
+            }
+        )
+    return portions
+
+
+def _gram_recipe_portion(portions: list[dict[str, str]]) -> dict[str, str] | None:
+    explicit_weight: dict[str, str] | None = None
+    for portion in portions:
+        description = portion.get("description", "")
+        if _bare_weight_portion_description(description):
+            return portion
+        if explicit_weight is None and _explicit_weight_portion_description(description):
+            explicit_weight = portion
+    return explicit_weight
+
+
 def _form_decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
@@ -800,7 +836,7 @@ class FatSecretClient:
             if not matches:
                 raise FatSecretError(f"{self.account.label}: no recipe/food match for {result.title}")
             result = matches[0]
-        if result.raw.get("_source_endpoint") == "food_search_data" or any(
+        has_macro_detail = any(
             value is not None
             for value in (
                 result.energy_per_portion,
@@ -808,30 +844,81 @@ class FatSecretClient:
                 result.protein_per_portion,
                 result.fat_per_portion,
             )
-        ):
+        )
+        has_gram_portion = bool(result.raw.get("_gram_portion_id")) or _explicit_weight_portion_description(
+            result.default_portion_description
+        )
+        if has_macro_detail and has_gram_portion:
             return result
-        recipe = await self.get_recipe(result.food_id)
-        detail_brand = _metadata_value(recipe.description, "mname")
-        detail_portion_description = recipe.default_portion_description or _metadata_value(recipe.description, "ssize")
+        response = await self._post_android(
+            "RecipeAndroidPage.aspx",
+            {"rid": result.food_id, "images": "true", "fl": "7"},
+        )
+        return self._parse_food_detail(response.text, result)
+
+    def _parse_food_detail(self, xml_text: str, fallback: FoodSearchResult) -> FoodSearchResult:
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid food detail XML") from exc
+
+        raw_short_description = _text(root, "shortDescription")
+        short_description = _clean_food_text(raw_short_description)
+        detail_brand = _metadata_value(raw_short_description, "mname")
+        detail_portion_description = _text(root, "defaultPortionDescription") or _metadata_value(
+            raw_short_description,
+            "ssize",
+        )
+        portions = _recipe_portions(root)
+        raw = dict(fallback.raw)
+        raw["_source_endpoint"] = "recipe_android_page"
+        if portions:
+            raw["_recipe_portions"] = portions
+        gram_portion = _gram_recipe_portion(portions)
+        if gram_portion is not None:
+            raw["_gram_portion_id"] = gram_portion["id"]
+            raw["_gram_portion_description"] = gram_portion["description"]
+            raw["_gram_portion_default_amount"] = gram_portion.get("defaultAmount", "")
+            raw["_gram_portion_gram_weight"] = gram_portion.get("gramWeight", "")
+        if not detail_portion_description:
+            default_portion_id = _text(root, "defaultPortionID", fallback.default_portion_id or "0")
+            for portion in portions:
+                if portion["id"] == default_portion_id:
+                    detail_portion_description = portion["description"]
+                    break
+
+        grams_per_portion = _decimal(_text(root, "gramsPerPortion"), fallback.grams_per_portion)
         return FoodSearchResult(
-            food_id=result.food_id,
-            title=recipe.title or result.title,
-            description=result.description,
-            brand=result.brand or detail_brand,
+            food_id=fallback.food_id,
+            title=_text(root, "title") or fallback.title,
+            description=fallback.description or short_description,
+            brand=fallback.brand or detail_brand,
             default_portion_id=(
-                recipe.default_portion_id
-                if recipe.default_portion_id and recipe.default_portion_id != "0"
-                else result.default_portion_id or "0"
+                _text(root, "defaultPortionID", fallback.default_portion_id or "0")
+                or fallback.default_portion_id
+                or "0"
             ),
-            default_portion_description=detail_portion_description or result.default_portion_description,
-            source=result.source,
-            is_own=result.is_own,
-            grams_per_portion=result.grams_per_portion,
-            energy_per_portion=result.energy_per_portion,
-            carbohydrate_per_portion=result.carbohydrate_per_portion,
-            protein_per_portion=result.protein_per_portion,
-            fat_per_portion=result.fat_per_portion,
-            raw=result.raw,
+            default_portion_description=detail_portion_description or fallback.default_portion_description,
+            source=fallback.source or _text(root, "source"),
+            is_own=fallback.is_own,
+            grams_per_portion=grams_per_portion,
+            energy_per_portion=_scale_per_100g(
+                _decimal(_text(root, "energyPerPortion"), fallback.energy_per_portion),
+                grams_per_portion,
+            ),
+            carbohydrate_per_portion=_scale_per_100g(
+                _decimal(_text(root, "carbohydratePerPortion"), fallback.carbohydrate_per_portion),
+                grams_per_portion,
+            ),
+            protein_per_portion=_scale_per_100g(
+                _decimal(_text(root, "proteinPerPortion"), fallback.protein_per_portion),
+                grams_per_portion,
+            ),
+            fat_per_portion=_scale_per_100g(
+                _decimal(_text(root, "fatPerPortion"), fallback.fat_per_portion),
+                grams_per_portion,
+            ),
+            raw=raw,
         )
 
     @staticmethod

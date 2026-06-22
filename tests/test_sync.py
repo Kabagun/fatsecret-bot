@@ -1136,16 +1136,30 @@ def test_recipe_list_candidates_forces_gram_portion_for_non_weight_remote_defaul
                     default_portion_id="large",
                     default_portion_description="большой",
                 )
-            ]
+            ],
+            details={
+                "food-egg": FoodSearchResult(
+                    food_id="food-egg",
+                    title="Яйцо",
+                    default_portion_id="large",
+                    default_portion_description="большой",
+                    energy_per_portion=Decimal("147"),
+                    protein_per_portion=Decimal("12.58"),
+                    fat_per_portion=Decimal("9.94"),
+                    carbohydrate_per_portion=Decimal("0.77"),
+                    raw={"_gram_portion_id": "51772", "_gram_portion_description": "г"},
+                )
+            },
         )
         engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
 
         candidates = asyncio.run(engine.recipe_list_candidates("group", "яйцо куриное", Decimal("50"), limit=1))
 
         assert candidates[0].ingredient.title == "Яйцо"
-        assert candidates[0].ingredient.portion_id == "0"
-        assert candidates[0].ingredient.amount == Decimal("0.5")
-        assert candidates[0].ingredient.portion_description == "100г"
+        assert candidates[0].ingredient.portion_id == "51772"
+        assert candidates[0].ingredient.amount == Decimal("50")
+        assert candidates[0].ingredient.portion_description == "г"
+        assert candidates[0].ingredient.grams == Decimal("50")
     finally:
         storage.close()
 
@@ -1366,14 +1380,65 @@ def test_create_recipe_from_list_retries_ingredient_with_legacy_addable_id(tmp_p
         created = asyncio.run(engine.create_recipe_from_list("group", "Котлета тест", items, updated_by=11))
         recipe = storage.get_recipe(created.recipe_id)
 
-        assert [item.food_id for item in client.saved_ingredients] == ["app-onion", "legacy-onion"]
-        assert client.saved_ingredients[1].portion_id == "59173"
-        assert client.saved_ingredients[1].amount == Decimal("119")
-        assert client.saved_ingredients[1].portion_description == "г"
+        assert [item.food_id for item in client.saved_ingredients] == ["legacy-onion"]
+        assert client.saved_ingredients[0].portion_id == "59173"
+        assert client.saved_ingredients[0].amount == Decimal("119")
+        assert client.saved_ingredients[0].portion_description == "г"
         assert client.deleted_recipe_ids == []
         assert recipe is not None
         assert recipe.ingredients[0].food_id == "legacy-onion"
         assert recipe.ingredients[0].title == "Лук Репчатый"
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_prepares_real_gram_portion_before_add(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeLegacyAddableCreateClient(
+            "tg11",
+            FoodSearchResult(
+                food_id="food-egg",
+                title="Яйцо",
+                default_portion_id="10270",
+                default_portion_description="средний",
+                energy_per_portion=Decimal("147"),
+                protein_per_portion=Decimal("12.58"),
+                fat_per_portion=Decimal("9.94"),
+                carbohydrate_per_portion=Decimal("0.77"),
+                raw={"_gram_portion_id": "51772", "_gram_portion_description": "г"},
+            ),
+        )
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Яйцо",
+                grams=Decimal("55"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-egg",
+                    title="Яйцо",
+                    portion_id="0",
+                    amount=Decimal("0.55"),
+                    portion_description="100г",
+                    grams=Decimal("55"),
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        created = asyncio.run(engine.create_recipe_from_list("group", "Омлет", items, updated_by=11))
+        recipe = storage.get_recipe(created.recipe_id)
+
+        assert client.saved_ingredients[0].food_id == "food-egg"
+        assert client.saved_ingredients[0].portion_id == "51772"
+        assert client.saved_ingredients[0].amount == Decimal("55")
+        assert client.saved_ingredients[0].portion_description == "г"
+        assert recipe is not None
+        assert recipe.ingredients[0].portion_id == "51772"
+        assert recipe.ingredients[0].grams == Decimal("55")
     finally:
         storage.close()
 

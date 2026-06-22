@@ -61,6 +61,56 @@ def test_parse_recipe_list_extracts_brand_and_default_portion_from_metadata() ->
     assert recipes[0].default_portion_description == "100г"
 
 
+def test_parse_food_detail_extracts_real_gram_portion_from_recipe_page() -> None:
+    xml = """
+    <recipe>
+      <id>3092</id>
+      <title>Яйцо</title>
+      <source>FNDDS</source>
+      <energyPerPortion>147.00</energyPerPortion>
+      <carbohydratePerPortion>0.77</carbohydratePerPortion>
+      <proteinPerPortion>12.58</proteinPerPortion>
+      <fatPerPortion>9.94</fatPerPortion>
+      <gramsPerPortion>100.000</gramsPerPortion>
+      <defaultPortionID>10270</defaultPortionID>
+      <recipeportion>
+        <id>10270</id>
+        <description>средний</description>
+        <gramWeight>44.000</gramWeight>
+        <defaultAmount>1.000</defaultAmount>
+      </recipeportion>
+      <recipeportion>
+        <id>51772</id>
+        <description>г</description>
+        <gramWeight>100.000</gramWeight>
+        <defaultAmount>100.000</defaultAmount>
+      </recipeportion>
+      <recipeportion>
+        <id>11206</id>
+        <description>большой</description>
+        <gramWeight>50.000</gramWeight>
+        <defaultAmount>1.000</defaultAmount>
+      </recipeportion>
+    </recipe>
+    """
+
+    detail = _client()._parse_food_detail(
+        xml,
+        FoodSearchResult(
+            food_id="3092",
+            title="Яйцо",
+            default_portion_id="10270",
+            default_portion_description="средний",
+        ),
+    )
+
+    assert detail.raw["_gram_portion_id"] == "51772"
+    assert detail.raw["_gram_portion_description"] == "г"
+    assert detail.energy_per_portion == Decimal("147.00")
+    assert detail.default_portion_id == "10270"
+    assert detail.default_portion_description == "средний"
+
+
 def test_parse_recipe_ingredients() -> None:
     xml = """
     <recipe>
