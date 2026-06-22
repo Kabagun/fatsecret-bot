@@ -904,6 +904,71 @@ def test_recipe_list_candidates_keeps_remote_default_portion_description(tmp_pat
         storage.close()
 
 
+def test_recipe_list_candidates_uses_remote_gram_portion_id(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [
+                FoodSearchResult(
+                    food_id="33908",
+                    title="Соль",
+                    default_portion_id="29654",
+                    default_portion_description="100г",
+                    energy_per_portion=Decimal("0"),
+                    protein_per_portion=Decimal("0"),
+                    fat_per_portion=Decimal("0"),
+                    carbohydrate_per_portion=Decimal("0"),
+                )
+            ]
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates("group", "соль", Decimal("9"), limit=1))
+
+        assert candidates[0].ingredient.food_id == "33908"
+        assert candidates[0].ingredient.portion_id == "29654"
+        assert candidates[0].ingredient.amount == Decimal("9")
+        assert candidates[0].ingredient.portion_description == "г"
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_uses_cached_food_gram_portion_id_from_metadata(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("33908", "Соль", 2)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="33908",
+                    title="Соль",
+                    default_portion_id="29654",
+                    default_portion_description="100г",
+                    energy_per_portion=Decimal("0"),
+                    protein_per_portion=Decimal("0"),
+                    fat_per_portion=Decimal("0"),
+                    carbohydrate_per_portion=Decimal("0"),
+                )
+            ],
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "соль", Decimal("9"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.food_id == "33908"
+        assert candidates[0].ingredient.portion_id == "29654"
+        assert candidates[0].ingredient.amount == Decimal("9")
+        assert candidates[0].ingredient.portion_description == "г"
+    finally:
+        storage.close()
+
+
 def test_recipe_list_candidates_forces_gram_portion_for_non_weight_remote_default(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -1118,7 +1183,12 @@ def test_create_recipe_from_list_retries_ingredient_with_legacy_addable_id(tmp_p
         engine = RecipeSyncEngine(storage, _device())
         client = FakeLegacyAddableCreateClient(
             "tg11",
-            FoodSearchResult(food_id="legacy-onion", title="Лук Репчатый"),
+            FoodSearchResult(
+                food_id="legacy-onion",
+                title="Лук Репчатый",
+                default_portion_id="59173",
+                default_portion_description="100г",
+            ),
         )
         engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
         items = [
@@ -1142,6 +1212,9 @@ def test_create_recipe_from_list_retries_ingredient_with_legacy_addable_id(tmp_p
         recipe = storage.get_recipe(created.recipe_id)
 
         assert [item.food_id for item in client.saved_ingredients] == ["app-onion", "legacy-onion"]
+        assert client.saved_ingredients[1].portion_id == "59173"
+        assert client.saved_ingredients[1].amount == Decimal("119")
+        assert client.saved_ingredients[1].portion_description == "г"
         assert client.deleted_recipe_ids == []
         assert recipe is not None
         assert recipe.ingredients[0].food_id == "legacy-onion"

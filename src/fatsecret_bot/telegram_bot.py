@@ -270,7 +270,9 @@ def _format_decimal(value: Decimal | None, digits: int = 1) -> str:
     if value is None:
         return "-"
     quantum = Decimal("1") if digits == 0 else Decimal("0." + ("0" * (digits - 1)) + "1")
-    text = str(value.quantize(quantum)).rstrip("0").rstrip(".")
+    text = str(value.quantize(quantum))
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
     return text or "0"
 
 

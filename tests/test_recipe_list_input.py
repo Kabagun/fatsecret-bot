@@ -130,6 +130,30 @@ def test_format_resolved_item_keeps_zero_energy_visible() -> None:
     assert _format_resolved_item(item) == "- Вода | 100г: 0/0/0/0 | масса: 420г"
 
 
+def test_format_resolved_item_preserves_integer_trailing_zeroes() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="фарш",
+        grams=Decimal("631"),
+        ingredient=Ingredient(
+            id="i1",
+            recipe_id="",
+            food_id="food-mince",
+            title="Фарш Сочный",
+            portion_id="0",
+            amount=Decimal("6.31"),
+            portion_description="100г",
+        ),
+        source="FatSecret",
+        brand="Green",
+        energy_per_100g=Decimal("320"),
+        protein_per_100g=Decimal("15"),
+        fat_per_100g=Decimal("29"),
+        carbohydrate_per_100g=Decimal("0"),
+    )
+
+    assert _format_resolved_item(item) == "- Фарш Сочный (Green) | 100г: 320/15/29/0 | масса: 631г"
+
+
 def test_parse_recipe_steps_keeps_first_100_non_empty_lines() -> None:
     steps = "\n".join(f"Шаг {index}" for index in range(1, 102))
 

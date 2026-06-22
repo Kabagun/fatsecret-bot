@@ -166,9 +166,9 @@ Candidate order:
 
 List-created recipe ingredients are sent to FatSecret as gram portions:
 
-- `portion_id = "0"`
-- `portion_description = "100г"`
-- `amount = grams / 100`
+- If search metadata has a real gram `defaultPortionID`, keep that id and send `portionamount = grams`.
+- If FatSecret only has synthetic `100г` with `portion_id = "0"`, send `portionamount = grams / 100`.
+- Do not force `portion_id = "0"` for every ingredient: FatSecret rejects some foods, such as onion/salt, unless their real gram portion id is used.
 
 This avoids FatSecret interpreting `300` as 300 servings or eggs as 50 pieces.
 
@@ -232,13 +232,18 @@ Current unresolved ingredient flow:
   - removed the UI-level kcal correction that masked bad search auth/parser behavior
   - verified live `сочный` search returns `Фарш Сочный (Green)` as `320/15/29/0`
 
+- recipe-list gram portion and display fix after app food-search auth fix
+  - fixed integer formatting so `320` and `110` do not display as `32` and `11`
+  - kept real FatSecret gram `defaultPortionID` for list-created ingredients
+  - live probes showed `portionid=0` rejected for `Лук`/`Соль`, while real ids were accepted
+
 ## Verification Baseline
 
 Latest full local test run before this context file:
 
 ```text
 python -m pytest
-86 passed
+89 passed
 ```
 
 Latest deploy verification before this context file:
