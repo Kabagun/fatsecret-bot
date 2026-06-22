@@ -1,6 +1,6 @@
 # FatSecret Bot Context
 
-Updated: 2026-06-21
+Updated: 2026-06-22
 
 ## Repository
 
@@ -117,6 +117,8 @@ Important response fields parsed from `summaries`:
 - `source`
 
 The bot normalizes nutrition values to 100g when `gramsPerPortion` is not 100.
+If FatSecret returns an impossible low kcal value but valid BJU, recipe-list drafts display kcal
+calculated from BJU so per-item rows and total kcal stay consistent.
 The old XML `RecipeSearch.aspx` path remains only as fallback.
 
 Android form endpoints still used:
@@ -170,6 +172,7 @@ This avoids FatSecret interpreting `300` as 300 servings or eggs as 50 pieces.
 Input format:
 
 ```text
+Порций: 4
 Филе куриное 366
 Лук 119
 Масло 5
@@ -181,6 +184,7 @@ Input format:
 
 Parsing rules:
 
+- The first non-step block must include `Порций: N`.
 - Last number in each ingredient line is grams.
 - Everything before the last number is the ingredient query.
 - Steps start after `Шаги:`, `Приготовление:`, or `Способ приготовления:`.
@@ -215,13 +219,17 @@ Current unresolved ingredient flow:
   - recipe creation rolls back created remote recipes if any ingredient is rejected
   - list-created ingredients retry with legacy addable ids when mobile-search ids are not accepted by `ingredientsave`
 
+- recipe-list portions and kcal display fix after rollback/addable-id fix
+  - `Порций: N` is required in list-created recipes and saved to FatSecret
+  - impossible low kcal from FatSecret is displayed from BJU in the draft preview
+
 ## Verification Baseline
 
 Latest full local test run before this context file:
 
 ```text
 python -m pytest
-84 passed
+86 passed
 ```
 
 Latest deploy verification before this context file:

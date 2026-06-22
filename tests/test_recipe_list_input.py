@@ -45,8 +45,9 @@ def test_parse_recipe_list_lines_reports_bad_lines() -> None:
 
 
 def test_parse_recipe_list_payload_splits_ingredients_and_steps() -> None:
-    items, bad_lines, steps = _parse_recipe_list_payload(
+    portions, items, bad_lines, steps = _parse_recipe_list_payload(
         """
+        Порций: 4
         Филе 300
         Куркума 5
 
@@ -58,12 +59,28 @@ def test_parse_recipe_list_payload_splits_ingredients_and_steps() -> None:
         """
     )
 
+    assert portions == Decimal("4")
     assert bad_lines == []
     assert [(item.query, item.grams) for item in items] == [
         ("Филе", Decimal("300")),
         ("Куркума", Decimal("5")),
     ]
     assert steps == ["Нарезать филе", "Запечь", "Подать", "Лишнее"]
+
+
+def test_parse_recipe_list_payload_requires_portions_separately() -> None:
+    portions, items, bad_lines, steps = _parse_recipe_list_payload(
+        """
+        Филе 300
+        Шаги:
+        Запечь
+        """
+    )
+
+    assert portions is None
+    assert bad_lines == []
+    assert [(item.query, item.grams) for item in items] == [("Филе", Decimal("300"))]
+    assert steps == ["Запечь"]
 
 
 def test_format_resolved_item_shows_macros_per_100g_and_brand() -> None:
@@ -113,6 +130,33 @@ def test_format_resolved_item_keeps_zero_energy_visible() -> None:
     assert _format_resolved_item(item) == "- Вода | 100г: 0/0/0/0 | масса: 420г"
 
 
+def test_format_resolved_item_corrects_impossible_low_energy_from_macros() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="фарш",
+        grams=Decimal("631"),
+        ingredient=Ingredient(
+            id="i1",
+            recipe_id="",
+            food_id="food-mince",
+            title="Фарш Сочный",
+            portion_id="0",
+            amount=Decimal("6.31"),
+            portion_description="100г",
+        ),
+        source="FatSecret",
+        brand="Green",
+        energy_per_100g=Decimal("32"),
+        protein_per_100g=Decimal("15"),
+        fat_per_100g=Decimal("29"),
+        carbohydrate_per_100g=Decimal("0"),
+    )
+
+    text = _format_recipe_list_draft("Котлета", [item], portions=Decimal("4"))
+
+    assert "- Фарш Сочный (Green) | 100г: 321/15/29/0 | масса: 631г" in text
+    assert "Итого ккал/Б/Ж/У: 2026/94.6/183/0" in text
+
+
 def test_parse_recipe_steps_keeps_first_100_non_empty_lines() -> None:
     steps = "\n".join(f"Шаг {index}" for index in range(1, 102))
 
@@ -140,8 +184,9 @@ def test_format_recipe_list_draft_includes_steps() -> None:
         carbohydrate_per_100g=Decimal("0"),
     )
 
-    text = _format_recipe_list_draft("Тест", [item], ["Смешать", "Запечь"])
+    text = _format_recipe_list_draft("Тест", [item], ["Смешать", "Запечь"], portions=Decimal("2"))
 
+    assert "Порций: 2" in text
     assert "<b>Шаги</b>" in text
     assert "1. Смешать" in text
     assert "2. Запечь" in text

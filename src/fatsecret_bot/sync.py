@@ -918,6 +918,8 @@ class RecipeSyncEngine:
         title: str,
         items: list[ResolvedRecipeListItem],
         updated_by: int,
+        *,
+        portions: Decimal = Decimal("1"),
         steps: list[str] | None = None,
     ) -> RecipeCreateResult:
         """Create a recipe from a validated ingredient list on every FatSecret account in a group."""
@@ -926,7 +928,7 @@ class RecipeSyncEngine:
         recipe_id = self.storage.create_recipe(
             title=title,
             description=description,
-            portions=Decimal("1"),
+            portions=portions,
             prep_time=0,
             cook_time=0,
             updated_by=updated_by,
