@@ -398,13 +398,39 @@ def _is_explicit_weight_portion(description: str) -> bool:
 
 
 def _ingredient_grams(ingredient: Ingredient) -> Decimal:
+    value = _ingredient_grams_or_none(ingredient)
+    return value if value is not None else ingredient.amount
+
+
+def _ingredient_grams_or_none(ingredient: Ingredient) -> Decimal | None:
+    if ingredient.grams is not None:
+        return ingredient.grams
     unit_size = _portion_unit_size(ingredient.portion_description)
     if unit_size is not None and unit_size > 0:
         return ingredient.amount * unit_size
     normalized = ingredient.portion_description.strip().casefold()
     if normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}:
         return ingredient.amount
-    return ingredient.amount
+    return None
+
+
+def _food_result_portion_grams(result: FoodSearchResult) -> Decimal | None:
+    if result.grams_per_portion is not None and result.grams_per_portion > 0:
+        return result.grams_per_portion
+    unit_size = _portion_unit_size(result.default_portion_description)
+    if unit_size is not None and unit_size > 0:
+        return unit_size
+    return None
+
+
+def _ingredient_current_portion_sends_grams(ingredient: Ingredient, grams: Decimal | None) -> bool:
+    if grams is None:
+        return False
+    portion_id = ingredient.portion_id or "0"
+    if portion_id == "0":
+        return True
+    normalized = ingredient.portion_description.strip().casefold()
+    return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""} and _same_decimal(ingredient.amount, grams)
 
 
 def _ingredient_from_food_result(
@@ -429,6 +455,7 @@ def _ingredient_from_food_result(
             amount=grams,
             portion_description="г",
             remote_ingredient_id=remote_ingredient_id,
+            grams=grams,
         )
     return Ingredient(
         id=id or str(uuid.uuid4()),
@@ -439,6 +466,7 @@ def _ingredient_from_food_result(
         amount=_gram_portion_amount(grams),
         portion_description="100г",
         remote_ingredient_id=remote_ingredient_id,
+        grams=grams,
     )
 
 
@@ -453,6 +481,7 @@ def _copy_remote_ingredients(recipe_id: str, ingredients: list[Ingredient]) -> l
             amount=item.amount,
             portion_description=item.portion_description,
             remote_ingredient_id=item.remote_ingredient_id,
+            grams=item.grams,
         )
         for item in ingredients
     ]
@@ -480,6 +509,8 @@ def _ingredient_with_search_result(ingredient: Ingredient, result: FoodSearchRes
         _ingredient_grams(ingredient),
         id=ingredient.id,
         recipe_id=ingredient.recipe_id,
+        food_id=result.food_id or ingredient.food_id,
+        title=result.title or ingredient.title,
         remote_ingredient_id=ingredient.remote_ingredient_id,
     )
 
@@ -558,6 +589,7 @@ class RecipeSyncEngine:
                 for summary in summaries:
                     try:
                         recipe = await client.get_recipe(summary.remote_id)
+                        recipe.ingredients = await self._normalize_recipe_ingredients(client, recipe.ingredients)
                     except Exception:  # noqa: BLE001 - keep one broken recipe from poisoning the whole cache.
                         logger.debug(
                             "food usage cache recipe load failed for %s/%s",
@@ -590,6 +622,90 @@ class RecipeSyncEngine:
         if self.storage.fatsecret_account_count(group_id) == 0:
             return
         await self.refresh_food_usage_cache(group_id)
+
+    async def _normalize_recipe_ingredients(
+        self,
+        client: FatSecretClient,
+        ingredients: list[Ingredient],
+    ) -> list[Ingredient]:
+        normalized: list[Ingredient] = []
+        for ingredient in ingredients:
+            normalized.append(await self._normalize_recipe_ingredient(client, ingredient))
+        return normalized
+
+    async def _normalize_recipe_ingredient(
+        self,
+        client: FatSecretClient,
+        ingredient: Ingredient,
+    ) -> Ingredient:
+        grams = _ingredient_grams_or_none(ingredient)
+        metadata: FoodSearchResult | None = None
+        if ingredient.food_id and not _ingredient_current_portion_sends_grams(ingredient, grams):
+            try:
+                metadata = await client.resolve_food_detail(
+                    FoodSearchResult(
+                        food_id=ingredient.food_id,
+                        title=ingredient.title,
+                        default_portion_id=ingredient.portion_id or "0",
+                        default_portion_description=ingredient.portion_description,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - keep the recipe usable if one food detail lookup fails.
+                logger.debug("ingredient gram normalization detail lookup failed for %s", ingredient.title, exc_info=True)
+
+        if grams is None and metadata is not None:
+            portion_grams = _food_result_portion_grams(metadata)
+            if portion_grams is not None:
+                grams = ingredient.amount * portion_grams
+
+        if grams is None:
+            return Ingredient(
+                id=ingredient.id,
+                recipe_id=ingredient.recipe_id,
+                food_id=ingredient.food_id,
+                title=ingredient.title,
+                portion_id=ingredient.portion_id,
+                amount=ingredient.amount,
+                portion_description=ingredient.portion_description,
+                remote_ingredient_id=ingredient.remote_ingredient_id,
+                grams=None,
+            )
+
+        if metadata is not None:
+            return _ingredient_from_food_result(
+                metadata,
+                grams,
+                id=ingredient.id,
+                recipe_id=ingredient.recipe_id,
+                food_id=metadata.food_id or ingredient.food_id,
+                title=metadata.title or ingredient.title,
+                remote_ingredient_id=ingredient.remote_ingredient_id,
+            )
+
+        portion_id = ingredient.portion_id or "0"
+        if portion_id != "0" and _is_explicit_weight_portion(ingredient.portion_description):
+            return Ingredient(
+                id=ingredient.id,
+                recipe_id=ingredient.recipe_id,
+                food_id=ingredient.food_id,
+                title=ingredient.title,
+                portion_id=portion_id,
+                amount=grams,
+                portion_description="г",
+                remote_ingredient_id=ingredient.remote_ingredient_id,
+                grams=grams,
+            )
+        return Ingredient(
+            id=ingredient.id,
+            recipe_id=ingredient.recipe_id,
+            food_id=ingredient.food_id,
+            title=ingredient.title,
+            portion_id="0",
+            amount=_gram_portion_amount(grams),
+            portion_description="100г",
+            remote_ingredient_id=ingredient.remote_ingredient_id,
+            grams=grams,
+        )
 
     async def load_remote_recipe_index(self, group_id: str) -> list[Recipe]:
         """Load and merge current cookbook recipe summaries from all FatSecret accounts in a group."""
@@ -625,6 +741,7 @@ class RecipeSyncEngine:
                 if client is None:
                     continue
                 remote = await client.get_recipe(remote_id)
+                remote.ingredients = await self._normalize_recipe_ingredients(client, remote.ingredients)
                 recipe = _copy_recipe_from_remote(recipe_ref.id, remote)
                 recipe.title = recipe.title or recipe_ref.title
                 recipe.group_id = recipe_ref.group_id
@@ -1085,6 +1202,7 @@ class RecipeSyncEngine:
                 if client is None:
                     continue
                 remote = await client.get_recipe(remote_id)
+                remote.ingredients = await self._normalize_recipe_ingredients(client, remote.ingredients)
                 remote.ingredients = _copy_remote_ingredients(recipe_id, remote.ingredients)
                 self.storage.update_recipe_from_remote(
                     recipe_id=recipe_id,
@@ -1127,6 +1245,7 @@ class RecipeSyncEngine:
                 raise FatSecretError("Аккаунт-источник больше не подключен.")
 
             source_remote = await source_client.get_recipe(source_remote_id)
+            source_remote.ingredients = await self._normalize_recipe_ingredients(source_client, source_remote.ingredients)
             source_recipe = _copy_recipe_from_remote(recipe.id, source_remote)
             source_recipe.title = source_recipe.title or recipe.title
             source_recipe.description = _sync_description(timezone=self.timezone)
@@ -1187,6 +1306,7 @@ class RecipeSyncEngine:
                 raise FatSecretError("Аккаунт-источник больше не подключен.")
 
             source_remote = await source_client.get_recipe(source_remote_id)
+            source_remote.ingredients = await self._normalize_recipe_ingredients(source_client, source_remote.ingredients)
             recipe = _copy_recipe_from_remote(recipe_ref.id, source_remote)
             recipe.title = recipe.title or recipe_ref.title
             recipe.description = _sync_description(timezone=self.timezone)

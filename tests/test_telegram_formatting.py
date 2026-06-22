@@ -37,6 +37,7 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
                 portion_id="p2",
                 amount=Decimal("0.060"),
                 portion_description="serving",
+                grams=Decimal("6"),
             ),
             Ingredient(
                 id="i3",
@@ -55,7 +56,7 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     assert "Remote:" not in text
     assert "Порций: 2;" in text
     assert "- Яичный Белок: 125.25г" in text
-    assert "- Соус: 0.06 порции" in text
+    assert "- Соус: 6г" in text
     assert "- Кетчуп: 300г" in text
     assert "<b>Шаги</b>" in text
     assert "1. Смешать" in text

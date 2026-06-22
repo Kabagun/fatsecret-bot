@@ -172,6 +172,14 @@ List-created recipe ingredients are sent to FatSecret as gram portions:
 
 This avoids FatSecret interpreting `300` as 300 servings or eggs as 50 pieces.
 
+Ingredient amount normalization:
+
+- `Ingredient.amount` plus `portion_id`/`portion_description` stays the FatSecret transport format.
+- `Ingredient.grams` is the normalized display/sync mass when it can be known.
+- Parser fills `grams` from explicit gram descriptions, `gramsPerPortion`, `servingAmount`, or similar response fields.
+- Existing FatSecret recipes are normalized on hydration/sync: if an ingredient is stored as portions, the bot asks FatSecret food detail for gram portion metadata and sends the target account gram amounts when possible.
+- If FatSecret gives a portion with no gram size and detail lookup cannot resolve it, keep the original portion text instead of inventing grams.
+
 ## Create Recipe From List
 
 Input format:
@@ -237,13 +245,18 @@ Current unresolved ingredient flow:
   - kept real FatSecret gram `defaultPortionID` for list-created ingredients
   - live probes showed `portionid=0` rejected for `Лук`/`Соль`, while real ids were accepted
 
+- remote ingredient gram normalization after recipe-list gram portion fix
+  - added normalized `Ingredient.grams` alongside FatSecret transport fields
+  - persisted/backfilled gram values in SQLite when they can be calculated
+  - remote recipes now display known grams instead of portions and sync known portion ingredients as gram amounts
+
 ## Verification Baseline
 
 Latest full local test run before this context file:
 
 ```text
 python -m pytest
-89 passed
+92 passed
 ```
 
 Latest deploy verification before this context file:

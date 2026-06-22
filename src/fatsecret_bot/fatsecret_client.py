@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
 FOOD_SEARCH_PAGE_SIZE = 10
 AUTH_RETRY_STATUS_CODES = {401, 403, 500}
+PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
 
 
 def days_since_epoch(today: dt.date | None = None) -> str:
@@ -86,6 +87,14 @@ def _text(parent: ET.Element, tag: str, default: str = "") -> str:
 
 def _strip_tags(value: str) -> str:
     return re.sub(r"<[^>]+>", "", value).strip()
+
+
+def _first_xml_decimal(parent: ET.Element, *tags: str) -> Decimal | None:
+    for tag in tags:
+        value = _decimal(_text(parent, tag), None)
+        if value is not None:
+            return value
+    return None
 
 
 _METADATA_SEPARATOR = "S#E{P<A*R*A>T}O!R"
@@ -176,6 +185,39 @@ def _scale_per_100g(value: Decimal | None, grams_per_portion: Decimal | None) ->
 def _bare_weight_portion_description(description: str) -> bool:
     normalized = description.strip().casefold()
     return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}
+
+
+def _portion_unit_size(description: str) -> Decimal | None:
+    match = PORTION_UNIT_RE.search(description.replace("\xa0", " "))
+    if match is None:
+        return None
+    try:
+        return Decimal(match.group(1).replace(",", "."))
+    except InvalidOperation:
+        return None
+
+
+def _ingredient_grams(amount: Decimal, portion_description: str, node: ET.Element | None = None) -> Decimal | None:
+    if node is not None:
+        explicit_grams = _first_xml_decimal(node, "grams", "gram", "weight")
+        if explicit_grams is not None:
+            return explicit_grams
+        grams_per_portion = _first_xml_decimal(
+            node,
+            "gramsPerPortion",
+            "gramsperportion",
+            "servingamount",
+            "servingAmount",
+        )
+        if grams_per_portion is not None and grams_per_portion > 0:
+            return amount * grams_per_portion
+
+    unit_size = _portion_unit_size(portion_description)
+    if unit_size is not None and unit_size > 0:
+        return amount * unit_size
+    if _bare_weight_portion_description(portion_description):
+        return amount
+    return None
 
 
 def _ingredient_portion_amount(ingredient: Ingredient) -> Decimal:
@@ -610,6 +652,11 @@ class FatSecretClient:
                     amount=_decimal(_text(node, "portionamount"), Decimal("0")) or Decimal("0"),
                     portion_description=_text(node, "portiondescription"),
                     remote_ingredient_id=_text(node, "id") or None,
+                    grams=_ingredient_grams(
+                        _decimal(_text(node, "portionamount"), Decimal("0")) or Decimal("0"),
+                        _text(node, "portiondescription"),
+                        node,
+                    ),
                 )
             )
         return recipe

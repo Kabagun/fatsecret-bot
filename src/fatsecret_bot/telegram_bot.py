@@ -22,7 +22,7 @@ from telegram.ext import (
     filters,
 )
 
-from .models import MAX_RECIPE_STEPS, FatSecretAccountConfig, Recipe, RecipeGroup
+from .models import MAX_RECIPE_STEPS, FatSecretAccountConfig, Ingredient, Recipe, RecipeGroup
 from .storage import Storage, normalize_title
 from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 
@@ -82,7 +82,7 @@ def _format_steps_lines(steps: list[str], limit: int = DISPLAY_RECIPE_STEPS_LIMI
 
 def _format_recipe(recipe: Recipe) -> str:
     ingredients = "\n".join(
-        f"- {html.escape(item.title)}: {html.escape(_format_ingredient_amount(item.amount, item.portion_description))}"
+        f"- {html.escape(item.title)}: {html.escape(_format_ingredient_amount(item))}"
         for item in recipe.ingredients
     )
     if not ingredients:
@@ -128,7 +128,12 @@ def _format_ingredient_unit(amount: Decimal, portion_description: str) -> str:
     return unit
 
 
-def _format_ingredient_amount(amount: Decimal, portion_description: str) -> str:
+def _format_ingredient_amount(ingredient: Ingredient) -> str:
+    amount = ingredient.amount
+    grams = ingredient.grams
+    portion_description = ingredient.portion_description
+    if grams is not None:
+        return f"{_format_decimal_plain(grams)}г"
     portion_unit = _portion_description_unit(portion_description)
     if portion_unit is not None:
         unit_size, unit = portion_unit

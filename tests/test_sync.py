@@ -10,7 +10,13 @@ from fatsecret_bot.sync import FatSecretError, RecipeSyncEngine, ResolvedRecipeL
 
 
 class FakeFatSecretClient:
-    def __init__(self, target: Recipe, account_key: str = "target", delete_ok: bool = True) -> None:
+    def __init__(
+        self,
+        target: Recipe,
+        account_key: str = "target",
+        delete_ok: bool = True,
+        details: dict[str, FoodSearchResult] | None = None,
+    ) -> None:
         self.account = FatSecretAccountConfig(
             key=account_key,
             label=account_key,
@@ -24,6 +30,7 @@ class FakeFatSecretClient:
         self.saved_ingredients: list[Ingredient] = []
         self.deleted_recipe_ids: list[str] = []
         self.saved_meta: list[Recipe] = []
+        self.details = details or {}
 
     async def get_recipe(self, remote_id: str) -> Recipe:
         assert remote_id == self.target.id
@@ -41,6 +48,9 @@ class FakeFatSecretClient:
     async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
         self.saved_meta.append(recipe)
         return True
+
+    async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
+        return self.details.get(result.food_id, result)
 
     async def close(self) -> None:
         return None
@@ -289,6 +299,57 @@ def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> No
         assert client.saved_ingredients[0].remote_ingredient_id == "iid-1"
         assert client.saved_ingredients[0].amount == Decimal("125")
         assert client.saved_ingredients[1].remote_ingredient_id is None
+    finally:
+        storage.close()
+
+
+def test_sync_recipe_normalizes_portion_ingredients_to_grams(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Соус", "", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+        storage.set_remote_recipe_id(recipe_id, "tg11", "remote-source", last_synced_version=1)
+        storage.set_remote_recipe_id(recipe_id, "tg22", "remote-target", last_synced_version=1)
+        source_recipe = Recipe(id="remote-source", title="Соус")
+        source_recipe.ingredients = [
+            Ingredient(
+                id="iid-1",
+                recipe_id="remote-source",
+                food_id="food-sauce",
+                title="Соус",
+                portion_id="serving-portion",
+                amount=Decimal("1.5"),
+                portion_description="порции",
+                remote_ingredient_id="iid-1",
+            )
+        ]
+        target_recipe = Recipe(id="remote-target", title="Соус")
+        source = FakeFatSecretClient(
+            source_recipe,
+            account_key="tg11",
+            details={
+                "food-sauce": FoodSearchResult(
+                    food_id="food-sauce",
+                    title="Соус",
+                    default_portion_id="gram-portion",
+                    default_portion_description="100г",
+                    grams_per_portion=Decimal("100"),
+                )
+            },
+        )
+        target = FakeFatSecretClient(target_recipe, account_key="tg22")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": source, "tg22": target}  # type: ignore[method-assign]
+
+        results = asyncio.run(engine.sync_recipe_from_source(recipe_id, "tg11"))
+        synced_recipe = storage.get_recipe(recipe_id)
+
+        assert all(result.ok for result in results)
+        assert target.saved_ingredients[0].portion_id == "gram-portion"
+        assert target.saved_ingredients[0].amount == Decimal("150.0")
+        assert target.saved_ingredients[0].portion_description == "г"
+        assert target.saved_ingredients[0].grams == Decimal("150.0")
+        assert synced_recipe is not None
+        assert synced_recipe.ingredients[0].grams == Decimal("150.0")
     finally:
         storage.close()
 

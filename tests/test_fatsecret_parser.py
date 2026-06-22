@@ -90,6 +90,30 @@ def test_parse_recipe_ingredients() -> None:
     assert recipe.steps == ["Смешать", "Запечь", "Подать"]
     assert recipe.ingredients[0].food_id == "4881229"
     assert recipe.ingredients[0].portion_id == "4751539"
+    assert recipe.ingredients[0].grams == Decimal("100.0")
+
+
+def test_parse_recipe_ingredient_normalizes_serving_with_grams_per_portion() -> None:
+    xml = """
+    <recipe>
+      <id>999</id>
+      <title>Омлет</title>
+      <recipeingredient>
+        <id>1</id>
+        <associatedrecipeid>4881229</associatedrecipeid>
+        <name>Соус</name>
+        <portionid>serving-1</portionid>
+        <portionamount>1.5</portionamount>
+        <portiondescription>порции</portiondescription>
+        <gramsPerPortion>100</gramsPerPortion>
+      </recipeingredient>
+    </recipe>
+    """
+    recipe = _client()._parse_recipe(xml)
+
+    assert recipe.ingredients[0].amount == Decimal("1.5")
+    assert recipe.ingredients[0].portion_description == "порции"
+    assert recipe.ingredients[0].grams == Decimal("150.0")
 
 
 def test_search_recipes_uses_app_food_search_data_endpoint() -> None:

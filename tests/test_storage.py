@@ -245,6 +245,23 @@ def test_migration_normalizes_legacy_zero_portion_gram_ingredients(tmp_path) -> 
         assert recipe is not None
         assert recipe.ingredients[0].amount == Decimal("0.05")
         assert recipe.ingredients[0].portion_description == "100г"
+        assert recipe.ingredients[0].grams == Decimal("5")
+    finally:
+        storage.close()
+
+
+def test_ingredient_grams_are_persisted(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("1"), 0, 0, updated_by=1)
+        storage.add_ingredient(recipe_id, "food-sauce", "Соус", "p1", Decimal("1.5"), "порции", grams=Decimal("150"))
+
+        recipe = storage.get_recipe(recipe_id)
+
+        assert recipe is not None
+        assert recipe.ingredients[0].amount == Decimal("1.5")
+        assert recipe.ingredients[0].portion_description == "порции"
+        assert recipe.ingredients[0].grams == Decimal("150")
     finally:
         storage.close()
 

@@ -63,6 +63,7 @@ class Ingredient:
     amount: Decimal
     portion_description: str = ""
     remote_ingredient_id: str | None = None
+    grams: Decimal | None = None
 
 
 @dataclass

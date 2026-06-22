@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import secrets
 import sqlite3
 import string
@@ -23,6 +24,7 @@ from .models import (
 
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
+PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
 
 
 def normalize_title(title: str) -> str:
@@ -57,6 +59,34 @@ def _decimal_to_text(value: Decimal) -> str:
 def _bare_weight_portion_description(description: str) -> bool:
     normalized = description.strip().casefold()
     return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}
+
+
+def _portion_unit_size(description: str) -> Decimal | None:
+    match = PORTION_UNIT_RE.search(description.replace("\xa0", " "))
+    if match is None:
+        return None
+    try:
+        return Decimal(match.group(1).replace(",", "."))
+    except InvalidOperation:
+        return None
+
+
+def _ingredient_grams(amount: Decimal, portion_description: str) -> Decimal | None:
+    unit_size = _portion_unit_size(portion_description)
+    if unit_size is not None and unit_size > 0:
+        return amount * unit_size
+    if _bare_weight_portion_description(portion_description):
+        return amount
+    return None
+
+
+def _decimal_or_none(value: str | None) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        return None
 
 
 def _new_invite_code() -> str:
@@ -138,6 +168,7 @@ class Storage:
                 amount TEXT NOT NULL DEFAULT '0',
                 portion_description TEXT NOT NULL DEFAULT '',
                 remote_ingredient_id TEXT,
+                grams TEXT,
                 position INTEGER NOT NULL DEFAULT 0
             );
 
@@ -184,6 +215,7 @@ class Storage:
         self._ensure_column("fatsecret_accounts", "session_updated_at", "TEXT")
         self._ensure_column("recipes", "group_id", "TEXT")
         self._ensure_column("recipes", "steps", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("ingredients", "grams", "TEXT")
         self._conn.execute("DROP INDEX IF EXISTS idx_recipes_normalized_title")
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_group_title ON recipes(group_id, normalized_title)"
@@ -194,6 +226,7 @@ class Storage:
         )
         self._backfill_default_group()
         self._normalize_zero_portion_gram_ingredients()
+        self._backfill_ingredient_grams()
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -282,6 +315,26 @@ class Storage:
                 WHERE id = ?
                 """,
                 (_decimal_to_text(amount / Decimal("100")), row["id"]),
+            )
+
+    def _backfill_ingredient_grams(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT id, amount, portion_description, grams
+            FROM ingredients
+            WHERE grams IS NULL OR grams = ''
+            """
+        ).fetchall()
+        for row in rows:
+            amount = _decimal_or_none(row["amount"])
+            if amount is None:
+                continue
+            grams = _ingredient_grams(amount, row["portion_description"])
+            if grams is None:
+                continue
+            self._conn.execute(
+                "UPDATE ingredients SET grams = ? WHERE id = ?",
+                (_decimal_to_text(grams), row["id"]),
             )
 
     def _unique_invite_code(self) -> str:
@@ -951,6 +1004,7 @@ class Storage:
                 amount=Decimal(row["amount"]),
                 portion_description=row["portion_description"],
                 remote_ingredient_id=row["remote_ingredient_id"],
+                grams=_decimal_or_none(row["grams"]),
             )
             for row in rows
         ]
@@ -1101,6 +1155,7 @@ class Storage:
         portion_id: str,
         amount: Decimal,
         portion_description: str = "",
+        grams: Decimal | None = None,
     ) -> str:
         ingredient = Ingredient(
             id=str(uuid.uuid4()),
@@ -1110,6 +1165,7 @@ class Storage:
             portion_id=portion_id or "0",
             amount=amount,
             portion_description=portion_description,
+            grams=grams if grams is not None else _ingredient_grams(amount, portion_description),
         )
         position_row = self._conn.execute(
             "SELECT COALESCE(MAX(position), -1) + 1 AS next_position FROM ingredients WHERE recipe_id = ?",
@@ -1128,9 +1184,9 @@ class Storage:
             """
             INSERT INTO ingredients(
                 id, recipe_id, food_id, title, portion_id, amount,
-                portion_description, remote_ingredient_id, position
+                portion_description, remote_ingredient_id, grams, position
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ingredient.id,
@@ -1141,6 +1197,7 @@ class Storage:
                 str(ingredient.amount),
                 ingredient.portion_description,
                 ingredient.remote_ingredient_id,
+                _decimal_to_text(ingredient.grams) if ingredient.grams is not None else None,
                 position,
             ),
         )
