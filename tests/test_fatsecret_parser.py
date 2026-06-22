@@ -421,6 +421,54 @@ def test_cached_session_retries_login_once_on_redirect() -> None:
     assert [request.url.path for request in requests].count("/android/RecipeActionAndroidPage.aspx") == 2
 
 
+def test_concurrent_cached_session_redirects_share_one_login() -> None:
+    requests: list[httpx.Request] = []
+    saved: list[FatSecretSession] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/authenticate/v1/fatsecret":
+            await asyncio.sleep(0.01)
+            return httpx.Response(
+                200,
+                json={"serverId": "new-server", "deviceKey": "new-device", "secretKey": "new-secret"},
+            )
+        form = parse_qs(request.content.decode())
+        if form.get("c_id") == ["old-server"]:
+            await asyncio.sleep(0.01)
+            return httpx.Response(302, headers={"Location": "/Default.aspx"}, text="")
+        return httpx.Response(200, text="True")
+
+    async def run_deletes(client: FatSecretClient) -> list[bool]:
+        return await asyncio.gather(client.delete_recipe("111"), client.delete_recipe("222"))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+        session=FatSecretSession(server_id="old-server", device_key="old-device", secret_key="old-secret"),
+        session_saver=saved.append,
+    )
+    try:
+        results = asyncio.run(run_deletes(client))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert results == [True, True]
+    assert saved == [FatSecretSession(server_id="new-server", device_key="new-device", secret_key="new-secret")]
+    assert [request.url.path for request in requests].count("/api/authenticate/v1/fatsecret") == 1
+    assert [request.url.path for request in requests].count("/android/RecipeActionAndroidPage.aspx") == 4
+
+
 def test_add_ingredient_sends_prepared_portion_amount() -> None:
     requests: list[httpx.Request] = []
 

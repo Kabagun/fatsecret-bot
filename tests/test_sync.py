@@ -6,7 +6,13 @@ from decimal import Decimal
 
 from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe, RecipeSummary
 from fatsecret_bot.storage import Storage
-from fatsecret_bot.sync import FatSecretError, RecipeSyncEngine, ResolvedRecipeListItem, _sync_description
+from fatsecret_bot.sync import (
+    INGREDIENT_NORMALIZE_CONCURRENCY,
+    FatSecretError,
+    RecipeSyncEngine,
+    ResolvedRecipeListItem,
+    _sync_description,
+)
 
 
 class FakeFatSecretClient:
@@ -36,6 +42,9 @@ class FakeFatSecretClient:
         assert remote_id == self.target.id
         return self.target
 
+    async def ensure_logged_in(self) -> None:
+        return None
+
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         assert remote_recipe_id == self.target.id
         self.saved_ingredients.append(ingredient)
@@ -54,6 +63,22 @@ class FakeFatSecretClient:
 
     async def close(self) -> None:
         return None
+
+
+class FakeSlowDetailClient(FakeFatSecretClient):
+    def __init__(self, target: Recipe, details: dict[str, FoodSearchResult]) -> None:
+        super().__init__(target, details=details)
+        self.active_detail_calls = 0
+        self.max_active_detail_calls = 0
+
+    async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
+        self.active_detail_calls += 1
+        self.max_active_detail_calls = max(self.max_active_detail_calls, self.active_detail_calls)
+        try:
+            await asyncio.sleep(0.01)
+            return self.details.get(result.food_id, result)
+        finally:
+            self.active_detail_calls -= 1
 
 
 class FakeCookbookClient:
@@ -350,6 +375,75 @@ def test_sync_recipe_normalizes_portion_ingredients_to_grams(tmp_path) -> None:
         assert target.saved_ingredients[0].grams == Decimal("150.0")
         assert synced_recipe is not None
         assert synced_recipe.ingredients[0].grams == Decimal("150.0")
+    finally:
+        storage.close()
+
+
+def test_normalize_recipe_ingredients_resolves_details_in_parallel(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        ingredient_count = INGREDIENT_NORMALIZE_CONCURRENCY + 4
+        ingredients = [
+            Ingredient(
+                id=f"i-{index}",
+                recipe_id="recipe",
+                food_id=f"food-{index}",
+                title=f"Соус {index}",
+                portion_id="serving",
+                amount=Decimal("1"),
+                portion_description="порции",
+            )
+            for index in range(ingredient_count)
+        ]
+        client = FakeSlowDetailClient(
+            Recipe(id="recipe", title="Рецепт"),
+            {
+                f"food-{index}": FoodSearchResult(
+                    food_id=f"food-{index}",
+                    title=f"Соус {index}",
+                    default_portion_id=f"gram-{index}",
+                    default_portion_description="100г",
+                    grams_per_portion=Decimal("100"),
+                )
+                for index in range(ingredient_count)
+            },
+        )
+
+        normalized = asyncio.run(engine._normalize_recipe_ingredients(client, ingredients))
+
+        assert client.max_active_detail_calls > 1
+        assert client.max_active_detail_calls <= INGREDIENT_NORMALIZE_CONCURRENCY
+        assert [item.id for item in normalized] == [f"i-{index}" for index in range(ingredient_count)]
+        assert [item.amount for item in normalized] == [Decimal("100")] * ingredient_count
+        assert [item.portion_description for item in normalized] == ["г"] * ingredient_count
+        assert [item.grams for item in normalized] == [Decimal("100")] * ingredient_count
+    finally:
+        storage.close()
+
+
+def test_normalize_recipe_ingredients_skips_detail_lookup_for_known_gram_amounts(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        ingredients = [
+            Ingredient(
+                id=f"i-{index}",
+                recipe_id="recipe",
+                food_id=f"food-{index}",
+                title=f"Филе {index}",
+                portion_id=f"gram-{index}",
+                amount=Decimal("100"),
+                portion_description="г",
+            )
+            for index in range(3)
+        ]
+        client = FakeSlowDetailClient(Recipe(id="recipe", title="Рецепт"), {})
+
+        normalized = asyncio.run(engine._normalize_recipe_ingredients(client, ingredients))
+
+        assert client.max_active_detail_calls == 0
+        assert [item.grams for item in normalized] == [Decimal("100")] * 3
     finally:
         storage.close()
 

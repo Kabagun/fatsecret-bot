@@ -672,9 +672,8 @@ class TelegramRecipeBot:
         return True
 
     async def _ensure_main_keyboard(self, message, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if message is None or context.chat_data.get("reply_keyboard") == "main":
+        if message is None:
             return
-        await message.reply_text("Основная клавиатура снизу.", reply_markup=MAIN_KEYBOARD)
         context.chat_data["reply_keyboard"] = "main"
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

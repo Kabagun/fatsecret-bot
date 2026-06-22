@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -105,6 +106,28 @@ def test_recipe_list_keyboard_keeps_recipe_buttons_navigation_and_actions_inline
     assert "Создать из списка" not in flat_texts
     assert "Удалить несколько" in flat_texts
     assert "В меню" not in flat_texts
+
+
+def test_ensure_main_keyboard_does_not_send_extra_message() -> None:
+    class FakeMessage:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def reply_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+            self.sent.append(text)
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.chat_data: dict[str, str] = {}
+
+    bot = object.__new__(TelegramRecipeBot)
+    message = FakeMessage()
+    context = FakeContext()
+
+    asyncio.run(TelegramRecipeBot._ensure_main_keyboard(bot, message, context))
+
+    assert message.sent == []
+    assert context.chat_data["reply_keyboard"] == "main"
 
 
 def test_next_food_usage_refresh_runs_at_noon_in_bot_timezone() -> None:

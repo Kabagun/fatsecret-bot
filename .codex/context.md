@@ -147,6 +147,7 @@ Cached-session retry behavior:
 
 - retry with fresh login on `401`, `403`, `500`
 - retry with fresh login on any `3xx`, including observed `302` from `RecipeActionAndroidPage.aspx`
+- concurrent stale cached-session retries share one relogin through an auth lock
 
 ## Ingredient Matching
 
@@ -178,6 +179,7 @@ Ingredient amount normalization:
 - `Ingredient.grams` is the normalized display/sync mass when it can be known.
 - Parser fills `grams` from explicit gram descriptions, `gramsPerPortion`, `servingAmount`, or similar response fields.
 - Existing FatSecret recipes are normalized on hydration/sync: if an ingredient is stored as portions, the bot asks FatSecret food detail for gram portion metadata and sends the target account gram amounts when possible.
+- Food-detail lookups inside one recipe are parallelized with a small concurrency limit; recipe mutations such as `ingredientsave` stay sequential.
 - If FatSecret gives a portion with no gram size and detail lookup cannot resolve it, keep the original portion text instead of inventing grams.
 
 ## Create Recipe From List
@@ -250,13 +252,18 @@ Current unresolved ingredient flow:
   - persisted/backfilled gram values in SQLite when they can be calculated
   - remote recipes now display known grams instead of portions and sync known portion ingredients as gram amounts
 
+- recipe keyboard and normalization speed fix after remote ingredient normalization
+  - removed the extra `Основная клавиатура снизу.` message
+  - parallelized read-only ingredient detail normalization with a bounded gather
+  - serialized cached-session relogin so parallel read requests do not spam authenticate
+
 ## Verification Baseline
 
 Latest full local test run before this context file:
 
 ```text
 python -m pytest
-92 passed
+96 passed
 ```
 
 Latest deploy verification before this context file:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import re
@@ -15,6 +16,7 @@ from .storage import Storage, normalize_title
 logger = logging.getLogger(__name__)
 PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
 SEARCH_TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
+INGREDIENT_NORMALIZE_CONCURRENCY = 6
 
 
 @dataclass(frozen=True)
@@ -628,10 +630,19 @@ class RecipeSyncEngine:
         client: FatSecretClient,
         ingredients: list[Ingredient],
     ) -> list[Ingredient]:
-        normalized: list[Ingredient] = []
-        for ingredient in ingredients:
-            normalized.append(await self._normalize_recipe_ingredient(client, ingredient))
-        return normalized
+        if len(ingredients) <= 1:
+            return [
+                await self._normalize_recipe_ingredient(client, ingredient)
+                for ingredient in ingredients
+            ]
+        await client.ensure_logged_in()
+        semaphore = asyncio.Semaphore(INGREDIENT_NORMALIZE_CONCURRENCY)
+
+        async def normalize_one(ingredient: Ingredient) -> Ingredient:
+            async with semaphore:
+                return await self._normalize_recipe_ingredient(client, ingredient)
+
+        return list(await asyncio.gather(*(normalize_one(ingredient) for ingredient in ingredients)))
 
     async def _normalize_recipe_ingredient(
         self,

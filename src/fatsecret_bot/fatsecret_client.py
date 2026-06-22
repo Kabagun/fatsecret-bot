@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -293,12 +294,17 @@ class FatSecretClient:
         self._session: FatSecretSession | None = session
         self._session_from_cache = session is not None
         self._session_saver = session_saver
+        self._auth_lock = asyncio.Lock()
 
     async def close(self) -> None:
         if self._owns_http:
             await self._http.aclose()
 
     async def login(self) -> FatSecretSession:
+        async with self._auth_lock:
+            return await self._login_unlocked()
+
+    async def _login_unlocked(self) -> FatSecretSession:
         query = self._build_query(include_auth=False, include_build=True)
         url = f"https://app.ftscrt.com/api/authenticate/v1/fatsecret?{urlencode(query)}"
         device_key = _stable_device_key(self.device.device_identifier, self.account.key)
@@ -465,14 +471,19 @@ class FatSecretClient:
 
     async def _post_android(self, page: str, fields: dict[str, str]) -> httpx.Response:
         session = await self.ensure_logged_in()
+        used_cached_session = self._session_from_cache
         common = self._common_form(session)
         common.update(fields)
         url = f"https://android.fatsecret.com/android/{page}"
         response = await self._http.post(url, data=common, headers=self._headers("application/x-www-form-urlencoded"))
-        if _should_retry_with_fresh_login(response) and self._session_from_cache:
-            self._session = None
-            self._session_from_cache = False
-            session = await self.login()
+        if _should_retry_with_fresh_login(response) and used_cached_session:
+            async with self._auth_lock:
+                if self._session_from_cache or self._session is None:
+                    self._session = None
+                    self._session_from_cache = False
+                    session = await self._login_unlocked()
+                else:
+                    session = self._session
             common = self._common_form(session)
             common.update(fields)
             response = await self._http.post(url, data=common, headers=self._headers("application/x-www-form-urlencoded"))
@@ -482,13 +493,16 @@ class FatSecretClient:
 
     async def _post_app_json(self, url: str, payload: dict[str, Any], label: str) -> httpx.Response:
         await self.ensure_logged_in()
+        used_cached_session = self._session_from_cache
         query = self._build_app_query()
         full_url = f"{url}?{urlencode(query)}"
         response = await self._http.post(full_url, json=payload, headers=self._app_headers("application/json"))
-        if _should_retry_with_fresh_login(response) and self._session_from_cache:
-            self._session = None
-            self._session_from_cache = False
-            await self.login()
+        if _should_retry_with_fresh_login(response) and used_cached_session:
+            async with self._auth_lock:
+                if self._session_from_cache or self._session is None:
+                    self._session = None
+                    self._session_from_cache = False
+                    await self._login_unlocked()
             query = self._build_app_query()
             full_url = f"{url}?{urlencode(query)}"
             response = await self._http.post(full_url, json=payload, headers=self._app_headers("application/json"))
