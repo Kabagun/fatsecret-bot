@@ -287,12 +287,16 @@ def _scaled_macro(value: Decimal | None, grams: Decimal) -> Decimal | None:
     return value * grams / Decimal("100")
 
 
-def _format_item_title(item: ResolvedRecipeListItem) -> str:
+def _plain_item_title(item: ResolvedRecipeListItem) -> str:
     title = item.ingredient.title.strip()
     brand = item.brand.strip()
     if brand and brand.casefold() not in title.casefold():
         title = f"{title} ({brand[:60]})"
-    return html.escape(title)
+    return title
+
+
+def _format_item_title(item: ResolvedRecipeListItem) -> str:
+    return html.escape(_plain_item_title(item))
 
 
 def _format_macros_per_100g(item: ResolvedRecipeListItem) -> str:
@@ -400,7 +404,7 @@ def _recipe_list_candidate_keyboard(
     buttons = [
         [
             InlineKeyboardButton(
-                f"{page * RECIPE_LIST_CANDIDATES_PAGE_SIZE + index + 1}. {item.ingredient.title[:46]}",
+                f"{page * RECIPE_LIST_CANDIDATES_PAGE_SIZE + index + 1}. {_plain_item_title(item)[:46]}",
                 callback_data=f"recipe_list_pick:{index}",
             )
         ]

@@ -206,18 +206,26 @@ def _resolved_search_text(item: ResolvedRecipeListItem) -> str:
     return " ".join([item.ingredient.title, item.brand])
 
 
-def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int, int, int, int, int, int, int, int, int, str]:
+def _unrequested_brand_priority(query: str, brand: str) -> int:
+    if not brand.strip():
+        return 0
+    return 0 if not _missing_search_tokens(brand, query) else 1
+
+
+def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int | str, ...]:
     missing_terms, exact_title, title_missing_terms, extra_title_words, all_terms_present, all_terms_as_words, title_words, title_length, normalized_title = _rank_text(
         query,
         result.title,
         _food_search_text(result),
     )
     own_priority = 0 if result.is_own else 1
+    brand_priority = _unrequested_brand_priority(query, result.brand)
     if len(_search_tokens(query)) <= 1:
         return (
             missing_terms,
             title_missing_terms,
             own_priority,
+            brand_priority,
             exact_title,
             extra_title_words,
             all_terms_present,
@@ -229,9 +237,10 @@ def _food_result_rank(query: str, result: FoodSearchResult) -> tuple[int, int, i
     return (
         missing_terms,
         title_missing_terms,
+        extra_title_words,
+        brand_priority,
         exact_title,
         own_priority,
-        extra_title_words,
         all_terms_present,
         all_terms_as_words,
         title_words,
@@ -247,7 +256,12 @@ def _matches_direct_food_metadata(result: FoodSearchResult, direct_metadata: Foo
 
 
 def _food_result_has_detail(result: FoodSearchResult) -> bool:
-    has_macros = result.raw.get("_source_endpoint") == "food_search_data" or any(
+    has_macros = _food_result_has_macros(result)
+    return has_macros and _food_result_has_usable_gram_portion(result)
+
+
+def _food_result_has_macros(result: FoodSearchResult) -> bool:
+    return result.raw.get("_source_endpoint") == "food_search_data" or any(
         value is not None
         for value in (
             result.energy_per_portion,
@@ -256,25 +270,26 @@ def _food_result_has_detail(result: FoodSearchResult) -> bool:
             result.carbohydrate_per_portion,
         )
     )
-    return has_macros and _food_result_has_usable_gram_portion(result)
 
 
 def _resolved_candidate_rank(
     query: str,
     item: ResolvedRecipeListItem,
-) -> tuple[int, int, int, int, int, int, int, int, int, int, str]:
+) -> tuple[int | str, ...]:
     missing_terms, exact_title, title_missing_terms, extra_title_words, all_terms_present, all_terms_as_words, title_words, title_length, normalized_title = _rank_text(
         query,
         item.ingredient.title,
         _resolved_search_text(item),
     )
     source_priority = 0 if item.source == "часто использовался" else 1
+    brand_priority = _unrequested_brand_priority(query, item.brand)
     if len(_search_tokens(query)) <= 1:
         return (
             missing_terms,
             title_missing_terms,
             source_priority,
             -item.usage_count,
+            brand_priority,
             exact_title,
             extra_title_words,
             all_terms_present,
@@ -286,10 +301,11 @@ def _resolved_candidate_rank(
     return (
         missing_terms,
         title_missing_terms,
-        exact_title,
+        extra_title_words,
         source_priority,
         -item.usage_count,
-        extra_title_words,
+        brand_priority,
+        exact_title,
         all_terms_present,
         all_terms_as_words,
         title_words,
@@ -816,6 +832,8 @@ class RecipeSyncEngine:
                 )
             except Exception:  # noqa: BLE001 - fall back to search metadata if direct lookup fails.
                 logger.debug("local food direct metadata lookup failed for %s", ingredient.title, exc_info=True)
+        if direct_metadata is not None and _food_result_has_macros(direct_metadata):
+            return direct_metadata
         title_matches: list[FoodSearchResult] = []
         search_queries = [ingredient.title, query]
         if direct_metadata is not None and direct_metadata.brand:

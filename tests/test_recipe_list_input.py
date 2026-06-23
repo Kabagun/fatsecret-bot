@@ -10,6 +10,7 @@ from fatsecret_bot.telegram_bot import (
     _parse_recipe_list_lines,
     _parse_recipe_list_payload,
     _parse_recipe_steps,
+    _recipe_list_candidate_keyboard,
     _recipe_list_draft_keyboard,
 )
 
@@ -152,6 +153,29 @@ def test_format_resolved_item_preserves_integer_trailing_zeroes() -> None:
     )
 
     assert _format_resolved_item(item) == "- Фарш Сочный (Green) | 100г: 320/15/29/0 | масса: 631г"
+
+
+def test_recipe_list_candidate_keyboard_shows_brand_in_button_text() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="филе куриное",
+        grams=Decimal("366"),
+        ingredient=Ingredient(
+            id="i1",
+            recipe_id="",
+            food_id="food-chicken",
+            title="Филе Куриное",
+            portion_id="p1",
+            amount=Decimal("366"),
+            portion_description="г",
+        ),
+        source="FatSecret",
+        brand="Витконпродукт",
+    )
+
+    keyboard = _recipe_list_candidate_keyboard([item], page=1, has_next=False)
+    flat_texts = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "11. Филе Куриное (Витконпродукт)" in flat_texts
 
 
 def test_parse_recipe_steps_keeps_first_100_non_empty_lines() -> None:

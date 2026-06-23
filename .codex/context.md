@@ -163,6 +163,9 @@ Candidate order:
 - Prefer `isOwn` mobile-search results after textual match checks.
 - Reject weak matches missing requested tokens.
 - Avoid selecting foods with extra meaningful words for exact queries, for example `Куриное Филе в Сыре` for `куриное филе`.
+- For multi-word queries, do not let word order alone beat frequent generic foods: `Куриное Филе` should outrank
+  unrequested branded exact-order results like `Филе Куриное (Витконпродукт)` for `филе куриное`.
+- In ingredient replacement search buttons, show title plus brand so repeated `Филе Куриное` choices are distinguishable.
 - Keep brand/detail matching strict enough so `кетчуп махеев томатный` does not become `кетчуп махеев русский`, but `кетчуп махеев` can prefer the user's frequent Russian ketchup.
 
 List-created recipe ingredients are sent to FatSecret as gram portions:

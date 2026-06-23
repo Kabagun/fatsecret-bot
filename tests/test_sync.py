@@ -754,6 +754,54 @@ def test_recipe_list_candidates_does_not_enrich_cached_food_from_extra_title_wor
         storage.close()
 
 
+def test_recipe_list_candidates_prefers_frequent_generic_over_unrequested_brand(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("food-cached-chicken", "Куриное Филе", 9)])
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="food-vitkon",
+                    title="Филе Куриное",
+                    brand="Витконпродукт",
+                    default_portion_id="portion-vitkon",
+                    default_portion_description="100г",
+                    energy_per_portion=Decimal("109"),
+                    protein_per_portion=Decimal("21.6"),
+                    fat_per_portion=Decimal("2.5"),
+                    carbohydrate_per_portion=Decimal("0"),
+                )
+            ],
+            details={
+                "food-cached-chicken": FoodSearchResult(
+                    food_id="food-cached-chicken",
+                    title="Куриное Филе",
+                    default_portion_id="portion-chicken",
+                    default_portion_description="100г",
+                    energy_per_portion=Decimal("110"),
+                    protein_per_portion=Decimal("23.1"),
+                    fat_per_portion=Decimal("1.2"),
+                    carbohydrate_per_portion=Decimal("0"),
+                )
+            },
+        )
+        engine._build_clients = lambda group_id=None: {"search": client}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(engine.recipe_list_candidates(group.id, "филе куриное", Decimal("366"), limit=1))
+
+        assert candidates[0].source == "часто использовался"
+        assert candidates[0].ingredient.food_id == "food-cached-chicken"
+        assert candidates[0].ingredient.title == "Куриное Филе"
+        assert candidates[0].brand == ""
+        assert candidates[0].energy_per_100g == Decimal("110")
+    finally:
+        storage.close()
+
+
 def test_recipe_list_candidates_uses_remote_when_usage_cache_is_empty(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
