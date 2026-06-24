@@ -559,6 +559,23 @@ class TelegramRecipeBot:
         recipes = self._recipe_cache(context, group_id) or []
         return next((recipe for recipe in recipes if recipe.id == recipe_id), None)
 
+    def _duplicate_recipe_for_title(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        group_id: str,
+        title: str,
+    ) -> Recipe | None:
+        local = self.storage.find_recipe_by_title(group_id, title)
+        if local is not None:
+            return local
+        normalized = normalize_title(title)
+        if not normalized:
+            return None
+        return next(
+            (recipe for recipe in self._recipe_cache(context, group_id) or [] if normalize_title(recipe.title) == normalized),
+            None,
+        )
+
     def _replace_cached_recipe(
         self,
         context: ContextTypes.DEFAULT_TYPE,
@@ -1086,6 +1103,10 @@ class TelegramRecipeBot:
             )
         elif action == "recipe_list_confirm":
             await self._create_recipe_list_from_draft(query, context, update.effective_user.id)
+        elif action == "recipe_list_replace_existing":
+            await self._replace_existing_recipe_list_from_draft(query, context, update.effective_user.id)
+        elif action == "recipe_list_copy":
+            await self._copy_existing_recipe_list_from_draft(query, context, update.effective_user.id)
         elif action == "recipe_list_replace":
             await self._start_recipe_list_replace(query, context, int(value or "0"))
         elif action == "recipe_list_resolve":
@@ -2238,6 +2259,10 @@ class TelegramRecipeBot:
         context.user_data.pop("recipe_list_candidates_exhausted", None)
         context.user_data.pop("recipe_list_replace_query", None)
         context.user_data.pop("recipe_list_replace_kind", None)
+        context.user_data.pop("recipe_list_duplicate_id", None)
+        context.user_data.pop("recipe_list_duplicate_ref", None)
+        context.user_data.pop("recipe_list_replace_existing_id", None)
+        context.user_data.pop("recipe_list_replace_existing_ref", None)
         steps = context.user_data.get("recipe_list_steps")
         steps = steps if isinstance(steps, list) else []
         unresolved = context.user_data.get("recipe_list_unresolved")
@@ -2249,6 +2274,78 @@ class TelegramRecipeBot:
             reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
             parse_mode=ParseMode.HTML,
         )
+
+    async def _show_recipe_list_duplicate(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        duplicate: Recipe,
+    ) -> None:
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        group_id = context.user_data.get("group_id")
+        copy_title = self.storage.next_available_recipe_title(str(group_id), title, include_base=False)
+        context.user_data["recipe_list_duplicate_id"] = duplicate.id
+        context.user_data["recipe_list_duplicate_ref"] = duplicate
+        await query.edit_message_text(
+            "Рецепт с таким названием уже есть.\n\n"
+            "Можно обновить существующий: я сначала создам новую версию с временным именем, "
+            "потом удалю старую и переименую новую обратно.\n\n"
+            f"Для копии использую имя: {html.escape(copy_title)}",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Обновить существующий", callback_data="recipe_list_replace_existing:0")],
+                    [InlineKeyboardButton("Создать копию", callback_data="recipe_list_copy:0")],
+                    [InlineKeyboardButton("Изменить имя", callback_data="recipe_list_rename:0")],
+                    [InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _replace_existing_recipe_list_from_draft(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        telegram_id: int,
+    ) -> None:
+        duplicate_id = context.user_data.get("recipe_list_duplicate_id")
+        duplicate_ref = context.user_data.get("recipe_list_duplicate_ref")
+        if isinstance(duplicate_id, str) and self.storage.get_recipe(duplicate_id) is not None:
+            context.user_data["recipe_list_replace_existing_id"] = duplicate_id
+        elif isinstance(duplicate_ref, Recipe):
+            context.user_data["recipe_list_replace_existing_ref"] = duplicate_ref
+        else:
+            await query.edit_message_text(
+                "Не нашел рецепт для замены. Нажми создать еще раз.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]),
+            )
+            return
+        await self._create_recipe_list_from_draft(query, context, telegram_id)
+
+    async def _copy_existing_recipe_list_from_draft(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        telegram_id: int,
+    ) -> None:
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        group_id = context.user_data.get("group_id")
+        if not title or not group_id:
+            await query.edit_message_text(
+                "Черновик устарел. Начни создание заново из списка рецептов.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            )
+            return
+        context.user_data["recipe_list_title"] = self.storage.next_available_recipe_title(
+            str(group_id),
+            title,
+            include_base=False,
+        )
+        context.user_data.pop("recipe_list_duplicate_id", None)
+        context.user_data.pop("recipe_list_duplicate_ref", None)
+        context.user_data.pop("recipe_list_replace_existing_id", None)
+        context.user_data.pop("recipe_list_replace_existing_ref", None)
+        await self._create_recipe_list_from_draft(query, context, telegram_id)
 
     async def _start_recipe_list_replace(
         self,
@@ -2547,6 +2644,21 @@ class TelegramRecipeBot:
                 reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
             )
             return
+        replace_existing_id = context.user_data.get("recipe_list_replace_existing_id")
+        if replace_existing_id is not None and not isinstance(replace_existing_id, str):
+            await query.edit_message_text("Контекст замены устарел. Нажми создать еще раз.")
+            context.user_data.pop("recipe_list_replace_existing_id", None)
+            return
+        replace_existing_ref = context.user_data.get("recipe_list_replace_existing_ref")
+        if replace_existing_ref is not None and not isinstance(replace_existing_ref, Recipe):
+            await query.edit_message_text("Контекст замены устарел. Нажми создать еще раз.")
+            context.user_data.pop("recipe_list_replace_existing_ref", None)
+            return
+        if replace_existing_id is None and replace_existing_ref is None:
+            duplicate = self._duplicate_recipe_for_title(context, str(group_id), title)
+            if duplicate is not None:
+                await self._show_recipe_list_duplicate(query, context, duplicate)
+                return
         if not draft_items:
             await query.edit_message_text(
                 "В рецепте не осталось ингредиентов. Добавь хотя бы один ингредиент или отмени черновик.",
@@ -2562,6 +2674,8 @@ class TelegramRecipeBot:
                 telegram_id,
                 portions=portions,
                 steps=steps,
+                replace_existing_recipe_id=replace_existing_id,
+                replace_existing_recipe_ref=replace_existing_ref,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list create failed")
@@ -2578,6 +2692,11 @@ class TelegramRecipeBot:
                 ),
             )
             return
+        stored_recipe = self.storage.get_recipe(created.recipe_id)
+        if created.replaced_recipe_id is not None:
+            self._remove_cached_recipe(context, str(group_id), created.replaced_recipe_id)
+        if stored_recipe is not None:
+            self._replace_cached_recipe(context, str(group_id), stored_recipe)
         context.user_data.clear()
         account_labels = self._account_labels_for_group(str(group_id))
         lines = [
@@ -2585,8 +2704,30 @@ class TelegramRecipeBot:
             f"{'OK' if result.ok else 'ERROR'} {result.remote_recipe_id or ''} {result.message}"
             for result in created.results
         ]
+        if created.replaced_recipe_id is not None:
+            if created.temporary_title:
+                lines.append(f"Временное имя: {created.temporary_title}")
+            if created.title:
+                lines.append(f"Итоговое имя: {created.title}")
+            if created.replacement_results:
+                lines.append("")
+                lines.append("Удаление старого:")
+                lines.extend(
+                    f"{account_labels.get(result.account_key, result.account_key)}: "
+                    f"{'OK' if result.ok else 'ERROR'} {result.remote_recipe_id or ''} {result.message}"
+                    for result in created.replacement_results
+                )
+            if created.rename_results:
+                lines.append("")
+                lines.append("Переименование нового:")
+                lines.extend(
+                    f"{account_labels.get(result.account_key, result.account_key)}: "
+                    f"{'OK' if result.ok else 'ERROR'} {result.remote_recipe_id or ''} {result.message}"
+                    for result in created.rename_results
+                )
+        header = "Замена завершена:" if created.replaced_recipe_id is not None else "Создание завершено:"
         await query.edit_message_text(
-            "Создание завершено:\n" + "\n".join(lines),
+            header + "\n" + "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("Открыть рецепт", callback_data=f"open:{created.recipe_id}")],

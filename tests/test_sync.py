@@ -188,6 +188,7 @@ class FakeCreateClient:
         self.created_recipe: Recipe | None = None
         self.saved_ingredients: list[Ingredient] = []
         self.deleted_recipe_ids: list[str] = []
+        self.saved_meta: list[Recipe] = []
 
     async def create_recipe(self, recipe: Recipe) -> str:
         self.created_recipe = recipe
@@ -198,6 +199,18 @@ class FakeCreateClient:
         return True
 
     async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
+        self.saved_meta.append(
+            Recipe(
+                id=recipe.id,
+                title=recipe.title,
+                description=recipe.description,
+                portions=recipe.portions,
+                prep_time=recipe.prep_time,
+                cook_time=recipe.cook_time,
+                steps=list(recipe.steps),
+                group_id=recipe.group_id,
+            )
+        )
         return True
 
     async def delete_recipe(self, remote_recipe_id: str) -> bool:
@@ -1258,6 +1271,19 @@ def test_sync_description_uses_configured_timezone() -> None:
     assert value == "Последняя синхронизация: 17.06.2026 15:50"
 
 
+def test_storage_next_available_recipe_title_skips_existing_titles(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.create_recipe("Омлет", "", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+        storage.create_recipe("Омлет 2", "", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+
+        assert storage.find_recipe_by_title("group", "омлет").title == "Омлет"
+        assert storage.next_available_recipe_title("group", "Омлет") == "Омлет 3"
+        assert storage.next_available_recipe_title("group", "Новый", include_base=False) == "Новый 2"
+    finally:
+        storage.close()
+
+
 def test_sync_recipe_updates_source_description_with_last_sync(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -1276,6 +1302,163 @@ def test_sync_recipe_updates_source_description_with_last_sync(tmp_path) -> None
         assert results[0].message == "источник; дата обновлена"
         assert source.saved_meta[0].description.startswith("Последняя синхронизация: ")
         assert storage.get_recipe(recipe_id).description.startswith("Последняя синхронизация: ")
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_rejects_duplicate_title_without_replace(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.create_recipe("Омлет", "", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+        engine = RecipeSyncEngine(storage, _device())
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Яйцо",
+                grams=Decimal("50"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-egg",
+                    title="Яйцо",
+                    portion_id="51772",
+                    amount=Decimal("50"),
+                    portion_description="г",
+                    grams=Decimal("50"),
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        try:
+            asyncio.run(engine.create_recipe_from_list("group", "омлет", items, updated_by=11))
+        except FatSecretError as exc:
+            assert "Рецепт с таким именем уже есть" in str(exc)
+        else:
+            raise AssertionError("expected FatSecretError")
+
+        assert [recipe.title for recipe in storage.list_recipes("group")] == ["Омлет"]
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_replaces_existing_recipe_after_new_create(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        existing_id = storage.create_recipe("Омлет", "", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+        storage.set_remote_recipe_id(existing_id, "tg11", "old-11", last_synced_version=1)
+        storage.set_remote_recipe_id(existing_id, "tg22", "old-22", last_synced_version=1)
+        first = FakeCreateClient("tg11")
+        second = FakeCreateClient("tg22")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Яйцо",
+                grams=Decimal("50"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-egg",
+                    title="Яйцо",
+                    portion_id="51772",
+                    amount=Decimal("50"),
+                    portion_description="г",
+                    grams=Decimal("50"),
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        created = asyncio.run(
+            engine.create_recipe_from_list(
+                "group",
+                "Омлет",
+                items,
+                updated_by=11,
+                portions=Decimal("2"),
+                steps=["Взбить", "Запечь"],
+                replace_existing_recipe_id=existing_id,
+            )
+        )
+        stored = storage.get_recipe(created.recipe_id)
+
+        assert created.title == "Омлет"
+        assert created.temporary_title == "Омлет 2"
+        assert created.replaced_recipe_id == existing_id
+        assert all(result.ok for result in created.replacement_results)
+        assert all(result.ok for result in created.rename_results)
+        assert first.created_recipe is not None
+        assert first.created_recipe.title == "Омлет 2"
+        assert first.deleted_recipe_ids == ["old-11"]
+        assert second.deleted_recipe_ids == ["old-22"]
+        assert [meta.title for meta in first.saved_meta] == ["Омлет 2", "Омлет"]
+        assert stored is not None
+        assert stored.title == "Омлет"
+        assert stored.portions == Decimal("2")
+        assert stored.steps == ["Взбить", "Запечь"]
+        assert storage.get_recipe(existing_id) is None
+        assert storage.remote_ids(created.recipe_id) == {"tg11": "remote-tg11", "tg22": "remote-tg22"}
+        assert [recipe.id for recipe in storage.list_recipes("group")] == [created.recipe_id]
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_replaces_live_recipe_ref_after_new_create(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        first = FakeCreateClient("tg11")
+        second = FakeCreateClient("tg22")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+        recipe_ref = Recipe(
+            id="live-omlet",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "old-11", "tg22": "old-22"},
+        )
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Яйцо",
+                grams=Decimal("50"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-egg",
+                    title="Яйцо",
+                    portion_id="51772",
+                    amount=Decimal("50"),
+                    portion_description="г",
+                    grams=Decimal("50"),
+                ),
+                source="FatSecret",
+            )
+        ]
+
+        created = asyncio.run(
+            engine.create_recipe_from_list(
+                "group",
+                "Омлет",
+                items,
+                updated_by=11,
+                replace_existing_recipe_ref=recipe_ref,
+            )
+        )
+        stored = storage.get_recipe(created.recipe_id)
+
+        assert created.title == "Омлет"
+        assert created.temporary_title == "Омлет 2"
+        assert created.replaced_recipe_id == "live-omlet"
+        assert all(result.ok for result in created.replacement_results)
+        assert all(result.ok for result in created.rename_results)
+        assert first.created_recipe is not None
+        assert first.created_recipe.title == "Омлет 2"
+        assert first.deleted_recipe_ids == ["old-11"]
+        assert second.deleted_recipe_ids == ["old-22"]
+        assert [meta.title for meta in first.saved_meta] == ["Омлет 2", "Омлет"]
+        assert stored is not None
+        assert stored.title == "Омлет"
+        assert storage.remote_ids(created.recipe_id) == {"tg11": "remote-tg11", "tg22": "remote-tg22"}
+        assert [recipe.id for recipe in storage.list_recipes("group")] == [created.recipe_id]
     finally:
         storage.close()
 

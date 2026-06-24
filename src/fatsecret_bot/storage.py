@@ -936,6 +936,35 @@ class Storage:
         recipe.remote_ids = self.remote_ids(recipe.id)
         return recipe
 
+    def find_recipe_by_title(self, group_id: str | None, title: str) -> Recipe | None:
+        """Return the local recipe with the same normalized title inside one group."""
+        normalized = normalize_title(title)
+        row = self._conn.execute(
+            """
+            SELECT id
+            FROM recipes
+            WHERE normalized_title = ?
+                AND (group_id = ? OR (group_id IS NULL AND ? IS NULL))
+            LIMIT 1
+            """,
+            (normalized, group_id, group_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.get_recipe(row["id"])
+
+    def next_available_recipe_title(self, group_id: str | None, title: str, *, include_base: bool = True) -> str:
+        """Return title or title with a numeric suffix that does not collide locally."""
+        base_title = title.strip() or "Рецепт"
+        suffix = 2
+        candidate = base_title if include_base else f"{base_title} {suffix}"
+        if not include_base:
+            suffix += 1
+        while self.find_recipe_by_title(group_id, candidate) is not None:
+            candidate = f"{base_title} {suffix}"
+            suffix += 1
+        return candidate
+
     def list_recipes(self, group_id: str | None = None) -> list[Recipe]:
         if group_id is None:
             rows = self._conn.execute(

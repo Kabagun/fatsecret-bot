@@ -1,6 +1,6 @@
 # FatSecret Bot Context
 
-Updated: 2026-06-22
+Updated: 2026-06-24
 
 ## Repository
 
@@ -234,6 +234,23 @@ Current unresolved ingredient flow:
 - If any account rejects an ingredient or metadata save, created remote recipes are deleted and the local draft is deleted.
 - Telegram user_data keeps the draft in the chat flow so the user can return to review and replace the bad ingredient.
 
+Duplicate recipe title flow:
+
+- The local `recipes(group_id, normalized_title)` uniqueness rule is intentional: one logical recipe title maps to one recipe per group.
+- If a list-created recipe title already exists, the bot must not show raw SQLite `UNIQUE constraint failed`.
+- Telegram shows explicit actions:
+  - `Обновить существующий`
+  - `Создать копию`
+  - `Изменить имя`
+- `Создать копию` picks the next free title like `Отбивные куриные 2`.
+- `Обновить существующий` follows the safe replace order requested by the user:
+  1. create the new recipe in FatSecret with a temporary free title,
+  2. after creation succeeds, delete the old FatSecret recipe mappings,
+  3. save metadata on the new recipe to rename it back to the requested original title.
+- If deletion or rename fails after new creation, keep the new recipe and report the failed phase instead of rolling it back.
+- Live checks used one account only and test titles starting with `ааааа`; old remote ids disappeared from cookbook,
+  new remote ids remained. The second check covered the live-ref path where the old recipe had no local `recipes` row.
+
 ## Recent Fixes
 
 - `d528b96 fix: use mobile food search and retry redirects`
@@ -279,13 +296,19 @@ Current unresolved ingredient flow:
   - list-created recipes preserve normalized grams in local drafts
   - add/sync prepares real gram portion ids before first `ingredientsave`
 
+- duplicate recipe replace flow after recipe detail gram portion fix
+  - duplicate list-created titles are intercepted before SQLite insert
+  - duplicates are checked in both local SQLite rows and the current live recipe cache
+  - user can replace existing, create a copy, or rename
+  - replace flow creates a temporary-title recipe first, deletes the old remote recipe after success, then renames the new recipe back
+
 ## Verification Baseline
 
 Latest full local test run before this context file:
 
 ```text
 python -m pytest
-98 passed
+104 passed
 ```
 
 Latest deploy verification before this context file:
