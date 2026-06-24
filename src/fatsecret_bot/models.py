@@ -81,6 +81,7 @@ class Recipe:
     group_id: str | None = None
     ingredients: list[Ingredient] = field(default_factory=list)
     remote_ids: dict[str, str] = field(default_factory=dict)
+    remote_ids_by_account: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

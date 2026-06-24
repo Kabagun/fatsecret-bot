@@ -548,6 +548,14 @@ def _copy_recipe_from_remote(recipe_id: str, remote: Recipe) -> Recipe:
     return recipe
 
 
+def _remote_ids_for_account(recipe: Recipe, account_key: str) -> list[str]:
+    remote_ids = list(recipe.remote_ids_by_account.get(account_key) or [])
+    primary = recipe.remote_ids.get(account_key)
+    if primary and primary not in remote_ids:
+        remote_ids.insert(0, primary)
+    return [remote_id for remote_id in remote_ids if remote_id]
+
+
 def _ingredient_with_search_result(ingredient: Ingredient, result: FoodSearchResult) -> Ingredient:
     return _ingredient_from_food_result(
         result,
@@ -781,7 +789,8 @@ class RecipeSyncEngine:
                             group_id=group_id,
                         )
                         merged[normalized] = recipe
-                    recipe.remote_ids[account_key] = summary.remote_id
+                    recipe.remote_ids_by_account.setdefault(account_key, []).append(summary.remote_id)
+                    recipe.remote_ids.setdefault(account_key, summary.remote_id)
         finally:
             await self._close_clients(clients)
         return [merged[key] for key in sorted(merged)]
@@ -800,6 +809,10 @@ class RecipeSyncEngine:
                 recipe.title = recipe.title or recipe_ref.title
                 recipe.group_id = recipe_ref.group_id
                 recipe.remote_ids = dict(recipe_ref.remote_ids)
+                recipe.remote_ids_by_account = {
+                    account_key: list(remote_ids)
+                    for account_key, remote_ids in recipe_ref.remote_ids_by_account.items()
+                }
                 return recipe
         finally:
             await self._close_clients(clients)
@@ -1401,6 +1414,10 @@ class RecipeSyncEngine:
             source_recipe.title = source_recipe.title or recipe.title
             source_recipe.description = _sync_description(timezone=self.timezone)
             source_recipe.remote_ids = dict(recipe.remote_ids)
+            source_recipe.remote_ids_by_account = {
+                account_key: list(remote_ids)
+                for account_key, remote_ids in recipe.remote_ids_by_account.items()
+            }
             self.storage.update_recipe_from_remote(
                 recipe_id=recipe.id,
                 title=source_recipe.title,
@@ -1463,6 +1480,10 @@ class RecipeSyncEngine:
             recipe.description = _sync_description(timezone=self.timezone)
             recipe.group_id = recipe_ref.group_id
             recipe.remote_ids = dict(recipe_ref.remote_ids)
+            recipe.remote_ids_by_account = {
+                account_key: list(remote_ids)
+                for account_key, remote_ids in recipe_ref.remote_ids_by_account.items()
+            }
 
             for account_key, client in clients.items():
                 try:
@@ -1574,18 +1595,20 @@ class RecipeSyncEngine:
         clients: dict[str, FatSecretClient],
     ) -> list[AccountSyncResult]:
         results: list[AccountSyncResult] = []
-        for account_key, remote_id in list(recipe_ref.remote_ids.items()):
+        account_keys = set(recipe_ref.remote_ids) | set(recipe_ref.remote_ids_by_account)
+        for account_key in sorted(account_keys):
             client = clients.get(account_key)
-            if client is None:
-                results.append(AccountSyncResult(account_key, remote_id, False, "FatSecret аккаунт больше не подключен"))
-                continue
-            try:
-                ok = await client.delete_recipe(remote_id)
-                if not ok:
-                    raise FatSecretError(f"{client.account.label}: recipe delete returned false")
-                results.append(AccountSyncResult(account_key, remote_id, True, "удален в FatSecret"))
-            except Exception as exc:  # noqa: BLE001 - keep per-account deletion isolated.
-                results.append(AccountSyncResult(account_key, remote_id, False, str(exc)))
+            for remote_id in _remote_ids_for_account(recipe_ref, account_key):
+                if client is None:
+                    results.append(AccountSyncResult(account_key, remote_id, False, "FatSecret аккаунт больше не подключен"))
+                    continue
+                try:
+                    ok = await client.delete_recipe(remote_id)
+                    if not ok:
+                        raise FatSecretError(f"{client.account.label}: recipe delete returned false")
+                    results.append(AccountSyncResult(account_key, remote_id, True, "удален в FatSecret"))
+                except Exception as exc:  # noqa: BLE001 - keep per-account deletion isolated.
+                    results.append(AccountSyncResult(account_key, remote_id, False, str(exc)))
         return results
 
     async def _ensure_remote_recipe(

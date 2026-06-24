@@ -245,11 +245,14 @@ Duplicate recipe title flow:
 - `Создать копию` picks the next free title like `Отбивные куриные 2`.
 - `Обновить существующий` follows the safe replace order requested by the user:
   1. create the new recipe in FatSecret with a temporary free title,
-  2. after creation succeeds, delete the old FatSecret recipe mappings,
+  2. after creation succeeds, delete all old FatSecret recipe mappings with the same normalized title,
   3. save metadata on the new recipe to rename it back to the requested original title.
 - If deletion or rename fails after new creation, keep the new recipe and report the failed phase instead of rolling it back.
 - Live checks used one account only and test titles starting with `ааааа`; old remote ids disappeared from cookbook,
   new remote ids remained. The second check covered the live-ref path where the old recipe had no local `recipes` row.
+- FatSecret can already contain several recipes with the same title on one account. Live cookbook merge keeps one primary
+  `remote_ids[account]` for compatibility and also tracks all duplicate ids in `remote_ids_by_account[account]`.
+  Live delete/replace must delete every id from that list.
 
 ## Recent Fixes
 
@@ -301,6 +304,10 @@ Duplicate recipe title flow:
   - duplicates are checked in both local SQLite rows and the current live recipe cache
   - user can replace existing, create a copy, or rename
   - replace flow creates a temporary-title recipe first, deletes the old remote recipe after success, then renames the new recipe back
+
+- duplicate remote id cleanup after duplicate recipe replace flow
+  - live cookbook merge tracks multiple same-title remote ids per account
+  - live delete and duplicate-title replacement delete every old same-title id, not just the primary id
 
 ## Verification Baseline
 

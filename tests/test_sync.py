@@ -1415,6 +1415,7 @@ def test_create_recipe_from_list_replaces_live_recipe_ref_after_new_create(tmp_p
             title="Омлет",
             group_id="group",
             remote_ids={"tg11": "old-11", "tg22": "old-22"},
+            remote_ids_by_account={"tg11": ["old-11", "old-12"], "tg22": ["old-22"]},
         )
         items = [
             ResolvedRecipeListItem(
@@ -1452,7 +1453,7 @@ def test_create_recipe_from_list_replaces_live_recipe_ref_after_new_create(tmp_p
         assert all(result.ok for result in created.rename_results)
         assert first.created_recipe is not None
         assert first.created_recipe.title == "Омлет 2"
-        assert first.deleted_recipe_ids == ["old-11"]
+        assert first.deleted_recipe_ids == ["old-11", "old-12"]
         assert second.deleted_recipe_ids == ["old-22"]
         assert [meta.title for meta in first.saved_meta] == ["Омлет 2", "Омлет"]
         assert stored is not None
@@ -1679,7 +1680,13 @@ def test_load_remote_recipe_index_merges_live_cookbooks_by_title(tmp_path) -> No
     try:
         engine = RecipeSyncEngine(storage, _device())
         engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
-            "tg11": FakeCookbookClient([RecipeSummary(remote_id="111", title="Омлет")], "tg11"),
+            "tg11": FakeCookbookClient(
+                [
+                    RecipeSummary(remote_id="111", title="Омлет"),
+                    RecipeSummary(remote_id="112", title="омлет"),
+                ],
+                "tg11",
+            ),
             "tg22": FakeCookbookClient(
                 [
                     RecipeSummary(remote_id="222", title="омлет"),
@@ -1695,6 +1702,7 @@ def test_load_remote_recipe_index_merges_live_cookbooks_by_title(tmp_path) -> No
             ("Омлет", {"tg11": "111", "tg22": "222"}),
             ("Салат", {"tg22": "333"}),
         ]
+        assert recipes[0].remote_ids_by_account == {"tg11": ["111", "112"], "tg22": ["222"]}
         assert storage.list_recipes("group") == []
     finally:
         storage.close()
@@ -1720,6 +1728,7 @@ def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path
             title="Омлет",
             group_id="group",
             remote_ids={"tg11": "111", "tg22": "222"},
+            remote_ids_by_account={"tg11": ["111", "112"], "tg22": ["222"]},
         )
         engine = RecipeSyncEngine(storage, _device())
         first = FakeFatSecretClient(source_recipe, account_key="tg11")
@@ -1746,6 +1755,7 @@ def test_delete_live_recipes_everywhere_does_not_require_local_recipe_rows(tmp_p
             title="Омлет",
             group_id="group",
             remote_ids={"tg11": "111", "tg22": "222"},
+            remote_ids_by_account={"tg11": ["111", "112"], "tg22": ["222"]},
         )
         engine = RecipeSyncEngine(storage, _device())
         first = FakeFatSecretClient(Recipe(id="111", title="Омлет"), account_key="tg11")
@@ -1755,7 +1765,7 @@ def test_delete_live_recipes_everywhere_does_not_require_local_recipe_rows(tmp_p
         results = asyncio.run(engine.delete_live_recipes_everywhere([recipe_ref]))
 
         assert all(result.ok for result in results["local-live"])
-        assert first.deleted_recipe_ids == ["111"]
+        assert first.deleted_recipe_ids == ["111", "112"]
         assert second.deleted_recipe_ids == ["222"]
         assert storage.list_recipes("group") == []
     finally:

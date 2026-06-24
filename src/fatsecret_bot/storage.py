@@ -934,6 +934,7 @@ class Storage:
         )
         recipe.ingredients = self.list_ingredients(recipe.id)
         recipe.remote_ids = self.remote_ids(recipe.id)
+        recipe.remote_ids_by_account = {account_key: [remote_id] for account_key, remote_id in recipe.remote_ids.items()}
         return recipe
 
     def find_recipe_by_title(self, group_id: str | None, title: str) -> Recipe | None:
