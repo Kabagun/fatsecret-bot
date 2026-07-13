@@ -418,3 +418,50 @@ def test_delete_remote_recipe_id_removes_one_mapping(tmp_path) -> None:
         assert storage.get_recipe(recipe_id) is not None
     finally:
         storage.close()
+
+
+def test_remove_remote_recipe_mapping_deletes_recipe_only_after_last_mapping(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("2"), 5, 10, updated_by=11, group_id="g1")
+        storage.set_remote_recipe_id(recipe_id, "tg11", "111", last_synced_version=1)
+        storage.set_remote_recipe_id(recipe_id, "tg22", "222", last_synced_version=1)
+
+        assert storage.remove_remote_recipe_mapping("tg11", "111") is True
+        assert storage.remove_remote_recipe_mapping("tg11", "111") is False
+        assert storage.remote_ids(recipe_id) == {"tg22": "222"}
+        assert storage.get_recipe(recipe_id) is not None
+
+        assert storage.remove_remote_recipe_mapping("tg22", "222") is True
+        assert storage.get_recipe(recipe_id) is None
+    finally:
+        storage.close()
+
+
+def test_reconcile_group_remote_recipes_prunes_stale_mappings_and_keeps_unrelated_drafts(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Блины тонкие", "", Decimal("2"), 5, 10, updated_by=11, group_id="g1")
+        draft_id = storage.create_recipe("Черновик", "", Decimal("1"), 0, 0, updated_by=11, group_id="g1")
+        other_group_id = storage.create_recipe("Другой", "", Decimal("1"), 0, 0, updated_by=11, group_id="g2")
+        storage.set_remote_recipe_id(recipe_id, "tg11", "111", last_synced_version=1)
+        storage.set_remote_recipe_id(recipe_id, "tg22", "222", last_synced_version=1)
+        storage.set_remote_recipe_id(other_group_id, "tg11", "other-111", last_synced_version=1)
+
+        removed = storage.reconcile_group_remote_recipes(
+            "g1",
+            {"tg11": set(), "tg22": {"222"}},
+        )
+
+        assert removed == 1
+        assert storage.remote_ids(recipe_id) == {"tg22": "222"}
+        assert storage.get_recipe(recipe_id) is not None
+        assert storage.get_recipe(draft_id) is not None
+        assert storage.remote_ids(other_group_id) == {"tg11": "other-111"}
+
+        assert storage.reconcile_group_remote_recipes("g1", {"tg11": set(), "tg22": set()}) == 1
+        assert storage.get_recipe(recipe_id) is None
+        assert storage.find_recipe_by_title("g1", "Блины тонкие") is None
+        assert storage.get_recipe(draft_id) is not None
+    finally:
+        storage.close()

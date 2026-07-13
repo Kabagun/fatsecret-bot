@@ -1,6 +1,6 @@
 # FatSecret Bot Context
 
-Updated: 2026-06-24
+Updated: 2026-07-13
 
 ## Repository
 
@@ -143,11 +143,12 @@ For recipe creation, mobile-search food ids may be good for display/KБЖУ but 
 `ingredientsave`. If an ingredient add returns false, the bot retries once with a compatible id
 from legacy `RecipeSearch.aspx` via `search_addable_foods`.
 
-Cached-session retry behavior:
+Session retry behavior:
 
-- retry with fresh login on `401`, `403`, `500`
-- retry with fresh login on any `3xx`, including observed `302` from `RecipeActionAndroidPage.aspx`
-- concurrent stale cached-session retries share one relogin through an auth lock
+- each request retries once with fresh login on `401`, `403`, `500`
+- each request retries once with fresh login on any `3xx`, including observed `302` from `RecipeActionAndroidPage.aspx`
+- cached and already-fresh sessions use the same one-replay rule; concurrent failures share one relogin by session generation
+- final Android action errors report safe page/action/recipe ids and redirect location without auth fields
 
 ## Ingredient Matching
 
@@ -253,6 +254,12 @@ Duplicate recipe title flow:
 - FatSecret can already contain several recipes with the same title on one account. Live cookbook merge keeps one primary
   `remote_ids[account]` for compatibility and also tracks all duplicate ids in `remote_ids_by_account[account]`.
   Live delete/replace must delete every id from that list.
+- A cookbook snapshot is authoritative only after every connected account loads successfully. Missing remote mappings are
+  removed from SQLite, and a local recipe is deleted only after its last mapping disappears.
+- List creation refreshes that live snapshot before duplicate detection. Successful live and batch deletes also remove the
+  matching SQLite mappings immediately.
+- If ordinary synchronization creates a missing target but ingredient or metadata sync fails, the new target is rolled back;
+  pre-existing targets are never deleted by this rollback.
 
 ## Recent Fixes
 
@@ -309,13 +316,19 @@ Duplicate recipe title flow:
   - live cookbook merge tracks multiple same-title remote ids per account
   - live delete and duplicate-title replacement delete every old same-title id, not just the primary id
 
+- stale mapping reconciliation and sync target rollback after duplicate remote id cleanup
+  - complete cookbook snapshots prune SQLite mappings for recipes deleted outside the bot
+  - live single/batch deletes clean matching local mappings immediately
+  - final list creation refresh prevents stale duplicate prompts and unnecessary numeric suffixes
+  - per-request redirect replay handles cached and fresh sessions, and failed new targets are rolled back
+
 ## Verification Baseline
 
 Latest full local test run before this context file:
 
 ```text
 python -m pytest
-104 passed
+119 passed
 ```
 
 Latest deploy verification before this context file:

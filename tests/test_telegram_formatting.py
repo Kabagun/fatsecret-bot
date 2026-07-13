@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from fatsecret_bot.models import Ingredient, Recipe
 from fatsecret_bot.storage import Storage
+from fatsecret_bot.sync import RecipeCreateResult
 from fatsecret_bot.telegram_bot import TelegramRecipeBot, _format_recipe, _recipe_actions_keyboard
 
 
@@ -146,6 +147,101 @@ def test_next_food_usage_refresh_runs_at_noon_in_bot_timezone() -> None:
 
     assert before_noon == dt.datetime(2026, 6, 21, 12, 0, tzinfo=timezone)
     assert after_noon == dt.datetime(2026, 6, 22, 12, 0, tzinfo=timezone)
+
+
+def test_recipe_list_create_refreshes_live_titles_and_ignores_reconciled_stale_recipe(tmp_path) -> None:
+    class FakeQuery:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def edit_message_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+            self.messages.append(text)
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.user_data = {
+                "recipe_list_title": "Блины тонкие",
+                "group_id": "group",
+                "recipe_list_draft": [object()],
+                "recipe_list_unresolved": [],
+                "recipe_list_portions": Decimal("1"),
+                "recipe_list_steps": [],
+            }
+            self.chat_data: dict[str, object] = {}
+
+    class FakeEngine:
+        def __init__(self, storage: Storage) -> None:
+            self.storage = storage
+            self.created_titles: list[str] = []
+
+        async def load_remote_recipe_index(self, group_id: str) -> list[Recipe]:
+            self.storage.reconcile_group_remote_recipes(group_id, {"tg11": set()})
+            return []
+
+        async def create_recipe_from_list(self, group_id: str, title: str, items, updated_by: int, **kwargs):  # noqa: ANN001, ANN003
+            self.created_titles.append(title)
+            recipe_id = self.storage.create_recipe(title, "", Decimal("1"), 0, 0, updated_by, group_id)
+            return RecipeCreateResult(recipe_id=recipe_id, results=[], title=title)
+
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        stale_id = storage.create_recipe("Блины тонкие", "", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+        storage.set_remote_recipe_id(stale_id, "tg11", "old-111", last_synced_version=1)
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = FakeEngine(storage)
+        query = FakeQuery()
+        context = FakeContext()
+
+        asyncio.run(TelegramRecipeBot._create_recipe_list_from_draft(bot, query, context, 11))
+
+        assert bot.sync_engine.created_titles == ["Блины тонкие"]
+        assert storage.get_recipe(stale_id) is None
+        assert all("Рецепт с таким названием уже есть" not in message for message in query.messages)
+    finally:
+        storage.close()
+
+
+def test_recipe_list_create_still_prompts_for_current_live_duplicate(tmp_path) -> None:
+    class FakeQuery:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def edit_message_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+            self.messages.append(text)
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.user_data = {
+                "recipe_list_title": "Блины тонкие",
+                "group_id": "group",
+                "recipe_list_draft": [object()],
+                "recipe_list_unresolved": [],
+                "recipe_list_portions": Decimal("1"),
+                "recipe_list_steps": [],
+            }
+            self.chat_data: dict[str, object] = {}
+
+    class FakeEngine:
+        async def load_remote_recipe_index(self, group_id: str) -> list[Recipe]:
+            return [Recipe(id="live", title="Блины тонкие", group_id=group_id, remote_ids={"tg11": "111"})]
+
+        async def create_recipe_from_list(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("duplicate must block creation")
+
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = FakeEngine()
+        query = FakeQuery()
+        context = FakeContext()
+
+        asyncio.run(TelegramRecipeBot._create_recipe_list_from_draft(bot, query, context, 11))
+
+        assert query.messages[-1].startswith("Рецепт с таким названием уже есть")
+    finally:
+        storage.close()
 
 
 def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path) -> None:

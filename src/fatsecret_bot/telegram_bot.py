@@ -2654,17 +2654,33 @@ class TelegramRecipeBot:
             await query.edit_message_text("Контекст замены устарел. Нажми создать еще раз.")
             context.user_data.pop("recipe_list_replace_existing_ref", None)
             return
-        if replace_existing_id is None and replace_existing_ref is None:
-            duplicate = self._duplicate_recipe_for_title(context, str(group_id), title)
-            if duplicate is not None:
-                await self._show_recipe_list_duplicate(query, context, duplicate)
-                return
         if not draft_items:
             await query.edit_message_text(
                 "В рецепте не осталось ингредиентов. Добавь хотя бы один ингредиент или отмени черновик.",
                 reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
             )
             return
+        if replace_existing_id is None and replace_existing_ref is None:
+            await query.edit_message_text("Проверяю актуальный список рецептов в FatSecret...")
+            try:
+                live_recipes = await self.sync_engine.load_remote_recipe_index(str(group_id))
+            except Exception as exc:  # noqa: BLE001 - creation must not rely on stale duplicate data.
+                logger.exception("live recipe duplicate check failed")
+                await query.edit_message_text(
+                    f"Не удалось проверить актуальные названия рецептов: {exc}",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")],
+                            [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
+                        ]
+                    ),
+                )
+                return
+            self._set_recipe_cache(context, str(group_id), live_recipes)
+            duplicate = self._duplicate_recipe_for_title(context, str(group_id), title)
+            if duplicate is not None:
+                await self._show_recipe_list_duplicate(query, context, duplicate)
+                return
         await query.edit_message_text("Создаю рецепт в FatSecret аккаунтах группы...")
         try:
             created = await self.sync_engine.create_recipe_from_list(

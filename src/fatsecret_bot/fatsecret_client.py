@@ -293,6 +293,14 @@ def _should_retry_with_fresh_login(response: httpx.Response) -> bool:
     return response.status_code in AUTH_RETRY_STATUS_CODES or 300 <= response.status_code < 400
 
 
+def _safe_redirect_location(response: httpx.Response) -> str:
+    location = response.headers.get("Location")
+    if not location:
+        return "<missing>"
+    path_only = location.split("#", 1)[0].split("?", 1)[0]
+    return path_only.replace("\r", "").replace("\n", "")[:200] or "<empty>"
+
+
 def parse_recipe_initial_save_response(text: str) -> str:
     normalized = text.strip()
     if normalized.upper().startswith("SUCCESS:"):
@@ -328,7 +336,7 @@ class FatSecretClient:
         self._http = http or httpx.AsyncClient(timeout=30)
         self._owns_http = http is None
         self._session: FatSecretSession | None = session
-        self._session_from_cache = session is not None
+        self._session_generation = 0
         self._session_saver = session_saver
         self._auth_lock = asyncio.Lock()
 
@@ -355,22 +363,38 @@ class FatSecretClient:
             raise FatSecretError(f"{self.account.label}: login failed with HTTP {response.status_code}")
         data = response.json()
         try:
-            self._session = FatSecretSession(
+            session = FatSecretSession(
                 server_id=str(data["serverId"]),
                 device_key=str(data["deviceKey"]),
                 secret_key=str(data["secretKey"]),
             )
-            self._session_from_cache = False
+            self._session = session
+            self._session_generation += 1
             if self._session_saver is not None:
-                self._session_saver(self._session)
+                self._session_saver(session)
         except KeyError as exc:
             raise FatSecretError(f"{self.account.label}: login response has no {exc.args[0]}") from exc
-        return self._session
+        return session
 
     async def ensure_logged_in(self) -> FatSecretSession:
-        if self._session is None:
-            return await self.login()
-        return self._session
+        if self._session is not None:
+            return self._session
+        async with self._auth_lock:
+            if self._session is None:
+                return await self._login_unlocked()
+            return self._session
+
+    async def _session_for_replay(
+        self,
+        request_session: FatSecretSession,
+        request_generation: int,
+    ) -> FatSecretSession:
+        async with self._auth_lock:
+            if self._session is request_session and self._session_generation == request_generation:
+                return await self._login_unlocked()
+            if self._session is None:
+                return await self._login_unlocked()
+            return self._session
 
     async def cookbook(self) -> list[RecipeSummary]:
         response = await self._post_android("CookBookAndroidPage.aspx", {"fl": "4"})
@@ -507,41 +531,64 @@ class FatSecretClient:
 
     async def _post_android(self, page: str, fields: dict[str, str]) -> httpx.Response:
         session = await self.ensure_logged_in()
-        used_cached_session = self._session_from_cache
+        session_generation = self._session_generation
         common = self._common_form(session)
         common.update(fields)
         url = f"https://android.fatsecret.com/android/{page}"
-        response = await self._http.post(url, data=common, headers=self._headers("application/x-www-form-urlencoded"))
-        if _should_retry_with_fresh_login(response) and used_cached_session:
-            async with self._auth_lock:
-                if self._session_from_cache or self._session is None:
-                    self._session = None
-                    self._session_from_cache = False
-                    session = await self._login_unlocked()
-                else:
-                    session = self._session
+        response = await self._http.post(
+            url,
+            data=common,
+            headers=self._headers("application/x-www-form-urlencoded", device_key=session.device_key),
+            follow_redirects=False,
+        )
+        replayed = False
+        if _should_retry_with_fresh_login(response):
+            session = await self._session_for_replay(session, session_generation)
             common = self._common_form(session)
             common.update(fields)
-            response = await self._http.post(url, data=common, headers=self._headers("application/x-www-form-urlencoded"))
+            response = await self._http.post(
+                url,
+                data=common,
+                headers=self._headers("application/x-www-form-urlencoded", device_key=session.device_key),
+                follow_redirects=False,
+            )
+            replayed = True
         if response.status_code != 200:
-            raise FatSecretError(f"{self.account.label}: {page} failed with HTTP {response.status_code}")
+            context = [f"page={page}"]
+            context.extend(f"{key}={fields[key]}" for key in ("action", "prid", "rid") if fields.get(key))
+            context.extend(
+                (
+                    f"Location={_safe_redirect_location(response)}",
+                    f"replayed={'yes' if replayed else 'no'}",
+                )
+            )
+            raise FatSecretError(
+                f"{self.account.label}: {page} failed with HTTP {response.status_code} "
+                f"({', '.join(context)})"
+            )
         return response
 
     async def _post_app_json(self, url: str, payload: dict[str, Any], label: str) -> httpx.Response:
-        await self.ensure_logged_in()
-        used_cached_session = self._session_from_cache
+        session = await self.ensure_logged_in()
+        session_generation = self._session_generation
         query = self._build_app_query()
         full_url = f"{url}?{urlencode(query)}"
-        response = await self._http.post(full_url, json=payload, headers=self._app_headers("application/json"))
-        if _should_retry_with_fresh_login(response) and used_cached_session:
-            async with self._auth_lock:
-                if self._session_from_cache or self._session is None:
-                    self._session = None
-                    self._session_from_cache = False
-                    await self._login_unlocked()
+        response = await self._http.post(
+            full_url,
+            json=payload,
+            headers=self._app_headers("application/json", session=session),
+            follow_redirects=False,
+        )
+        if _should_retry_with_fresh_login(response):
+            session = await self._session_for_replay(session, session_generation)
             query = self._build_app_query()
             full_url = f"{url}?{urlencode(query)}"
-            response = await self._http.post(full_url, json=payload, headers=self._app_headers("application/json"))
+            response = await self._http.post(
+                full_url,
+                json=payload,
+                headers=self._app_headers("application/json", session=session),
+                follow_redirects=False,
+            )
         if response.status_code != 200:
             raise FatSecretError(f"{self.account.label}: {label} failed with HTTP {response.status_code}")
         return response
@@ -606,8 +653,13 @@ class FatSecretClient:
             headers["c_desc"] = self.device.c_desc
         return headers
 
-    def _app_headers(self, content_type: str | None = None) -> dict[str, str]:
-        headers = self._headers(content_type)
+    def _app_headers(
+        self,
+        content_type: str | None = None,
+        session: FatSecretSession | None = None,
+    ) -> dict[str, str]:
+        active_session = session or self._session
+        headers = self._headers(content_type, device_key=active_session.device_key if active_session else None)
         headers.update(
             {
                 "fs_device": "android",
@@ -619,12 +671,12 @@ class FatSecretClient:
                 "fs_language_locale": self.account.language,
             }
         )
-        if self._session:
+        if active_session:
             headers.update(
                 {
-                    "c_id": self._session.server_id,
-                    "c_s": self._session.secret_key,
-                    "c_d": self._session.device_key,
+                    "c_id": active_session.server_id,
+                    "c_s": active_session.secret_key,
+                    "c_d": active_session.device_key,
                 }
             )
         return headers

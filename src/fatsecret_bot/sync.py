@@ -556,6 +556,23 @@ def _remote_ids_for_account(recipe: Recipe, account_key: str) -> list[str]:
     return [remote_id for remote_id in remote_ids if remote_id]
 
 
+def _remember_remote_recipe_id(recipe: Recipe, account_key: str, remote_id: str) -> None:
+    recipe.remote_ids[account_key] = remote_id
+    remote_ids = recipe.remote_ids_by_account.setdefault(account_key, [])
+    if remote_id not in remote_ids:
+        remote_ids.append(remote_id)
+
+
+def _forget_remote_recipe_id(recipe: Recipe, account_key: str, remote_id: str) -> None:
+    if recipe.remote_ids.get(account_key) == remote_id:
+        recipe.remote_ids.pop(account_key, None)
+    remote_ids = [item for item in recipe.remote_ids_by_account.get(account_key, []) if item != remote_id]
+    if remote_ids:
+        recipe.remote_ids_by_account[account_key] = remote_ids
+    else:
+        recipe.remote_ids_by_account.pop(account_key, None)
+
+
 def _ingredient_with_search_result(ingredient: Ingredient, result: FoodSearchResult) -> Ingredient:
     return _ingredient_from_food_result(
         result,
@@ -773,10 +790,12 @@ class RecipeSyncEngine:
         """Load and merge current cookbook recipe summaries from all FatSecret accounts in a group."""
         clients = self._build_clients(group_id)
         merged: dict[str, Recipe] = {}
+        live_remote_ids_by_account = {account_key: set() for account_key in clients}
         try:
             for account_key, client in clients.items():
                 summaries = await client.cookbook()
                 for summary in summaries:
+                    live_remote_ids_by_account[account_key].add(summary.remote_id)
                     normalized = normalize_title(summary.title)
                     if not normalized:
                         continue
@@ -793,6 +812,7 @@ class RecipeSyncEngine:
                     recipe.remote_ids.setdefault(account_key, summary.remote_id)
         finally:
             await self._close_clients(clients)
+        self.storage.reconcile_group_remote_recipes(group_id, live_remote_ids_by_account)
         return [merged[key] for key in sorted(merged)]
 
     async def hydrate_live_recipe(self, recipe_ref: Recipe) -> Recipe | None:
@@ -1342,15 +1362,23 @@ class RecipeSyncEngine:
         )
 
     async def _rollback_created_recipe(self, client: FatSecretClient, remote_id: str | None) -> str:
+        _, message = await self._rollback_created_recipe_with_status(client, remote_id)
+        return message
+
+    async def _rollback_created_recipe_with_status(
+        self,
+        client: FatSecretClient,
+        remote_id: str | None,
+    ) -> tuple[bool, str]:
         if not remote_id:
-            return ""
+            return False, ""
         try:
             ok = await client.delete_recipe(remote_id)
         except Exception as exc:  # noqa: BLE001 - preserve original creation error and report cleanup failure.
-            return f"{client.account.label}: созданный рецепт {remote_id} не удалось удалить после ошибки: {exc}"
+            return False, f"{client.account.label}: созданный рецепт {remote_id} не удалось удалить после ошибки: {exc}"
         if ok:
-            return f"{client.account.label}: созданный рецепт {remote_id} удален после ошибки."
-        return f"{client.account.label}: созданный рецепт {remote_id} не удалось удалить после ошибки."
+            return True, f"{client.account.label}: созданный рецепт {remote_id} удален после ошибки."
+        return False, f"{client.account.label}: созданный рецепт {remote_id} не удалось удалить после ошибки."
 
     async def hydrate_recipe_from_remote(self, recipe_id: str) -> Recipe | None:
         recipe = self.storage.get_recipe(recipe_id)
@@ -1432,8 +1460,9 @@ class RecipeSyncEngine:
             recipe.steps = list(source_recipe.steps)
 
             for account_key, client in clients.items():
+                remote_id = recipe.remote_ids.get(account_key)
+                created_target = False
                 try:
-                    remote_id = recipe.remote_ids.get(account_key)
                     if account_key == source_account_key:
                         ok = await client.save_recipe_meta(recipe, source_remote_id)
                         if not ok:
@@ -1441,8 +1470,9 @@ class RecipeSyncEngine:
                         self.storage.mark_synced(recipe.id, account_key, source_remote_id, recipe.version)
                         results.append(AccountSyncResult(account_key, source_remote_id, True, "источник; дата обновлена"))
                         continue
+                    created_target = remote_id is None
                     remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
-                    recipe.remote_ids[account_key] = remote_id
+                    _remember_remote_recipe_id(recipe, account_key, remote_id)
                     stats = await self._sync_ingredients(client, recipe, remote_id)
                     ok = await client.save_recipe_meta(recipe, remote_id)
                     if not ok:
@@ -1450,8 +1480,17 @@ class RecipeSyncEngine:
                     self.storage.mark_synced(recipe.id, account_key, remote_id, recipe.version)
                     results.append(AccountSyncResult(account_key, remote_id, True, stats.message()))
                 except Exception as exc:  # noqa: BLE001 - keep per-account sync isolated.
-                    self.storage.record_sync(recipe.id, account_key, "error", str(exc))
-                    results.append(AccountSyncResult(account_key, recipe.remote_ids.get(account_key), False, str(exc)))
+                    message = str(exc)
+                    if created_target and remote_id:
+                        rolled_back, rollback_message = await self._rollback_created_recipe_with_status(client, remote_id)
+                        if rollback_message:
+                            message = f"{message} {rollback_message}"
+                        if rolled_back:
+                            _forget_remote_recipe_id(recipe, account_key, remote_id)
+                        else:
+                            self.storage.set_remote_recipe_id(recipe.id, account_key, remote_id, last_synced_version=0)
+                    self.storage.record_sync(recipe.id, account_key, "error", message)
+                    results.append(AccountSyncResult(account_key, remote_id, False, message))
         finally:
             await self._close_clients(clients)
         return results
@@ -1486,23 +1525,32 @@ class RecipeSyncEngine:
             }
 
             for account_key, client in clients.items():
+                remote_id = recipe.remote_ids.get(account_key)
+                created_target = False
                 try:
-                    remote_id = recipe.remote_ids.get(account_key)
                     if account_key == source_account_key:
                         ok = await client.save_recipe_meta(recipe, source_remote_id)
                         if not ok:
                             raise FatSecretError(f"{client.account.label}: source recipe metadata save returned false")
                         results.append(AccountSyncResult(account_key, source_remote_id, True, "источник; дата обновлена"))
                         continue
+                    created_target = remote_id is None
                     remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
-                    recipe.remote_ids[account_key] = remote_id
+                    _remember_remote_recipe_id(recipe, account_key, remote_id)
                     stats = await self._sync_ingredients(client, recipe, remote_id)
                     ok = await client.save_recipe_meta(recipe, remote_id)
                     if not ok:
                         raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
                     results.append(AccountSyncResult(account_key, remote_id, True, stats.message()))
                 except Exception as exc:  # noqa: BLE001 - keep per-account sync isolated.
-                    results.append(AccountSyncResult(account_key, recipe.remote_ids.get(account_key), False, str(exc)))
+                    message = str(exc)
+                    if created_target and remote_id:
+                        rolled_back, rollback_message = await self._rollback_created_recipe_with_status(client, remote_id)
+                        if rollback_message:
+                            message = f"{message} {rollback_message}"
+                        if rolled_back:
+                            _forget_remote_recipe_id(recipe, account_key, remote_id)
+                    results.append(AccountSyncResult(account_key, remote_id, False, message))
         finally:
             await self._close_clients(clients)
         return recipe, results
@@ -1606,6 +1654,7 @@ class RecipeSyncEngine:
                     ok = await client.delete_recipe(remote_id)
                     if not ok:
                         raise FatSecretError(f"{client.account.label}: recipe delete returned false")
+                    self.storage.remove_remote_recipe_mapping(account_key, remote_id)
                     results.append(AccountSyncResult(account_key, remote_id, True, "удален в FatSecret"))
                 except Exception as exc:  # noqa: BLE001 - keep per-account deletion isolated.
                     results.append(AccountSyncResult(account_key, remote_id, False, str(exc)))

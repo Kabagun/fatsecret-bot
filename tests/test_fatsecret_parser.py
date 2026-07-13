@@ -471,6 +471,181 @@ def test_cached_session_retries_login_once_on_redirect() -> None:
     assert [request.url.path for request in requests].count("/android/RecipeActionAndroidPage.aspx") == 2
 
 
+def test_fresh_session_retries_login_once_on_redirect() -> None:
+    requests: list[httpx.Request] = []
+    saved: list[FatSecretSession] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/authenticate/v1/fatsecret":
+            login_number = len([item for item in requests if item.url.path == request.url.path])
+            return httpx.Response(
+                200,
+                json={
+                    "serverId": f"server-{login_number}",
+                    "deviceKey": f"device-{login_number}",
+                    "secretKey": f"secret-{login_number}",
+                },
+            )
+        action_requests = [item for item in requests if item.url.path == "/android/RecipeActionAndroidPage.aspx"]
+        if len(action_requests) == 1:
+            return httpx.Response(302, headers={"Location": "/Default.aspx"}, text="")
+        return httpx.Response(200, text="True")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+        session_saver=saved.append,
+    )
+    try:
+        ok = asyncio.run(client.delete_recipe("123456"))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert ok is True
+    assert [session.server_id for session in saved] == ["server-1", "server-2"]
+    assert [request.url.path for request in requests].count("/api/authenticate/v1/fatsecret") == 2
+    assert [request.url.path for request in requests].count("/android/RecipeActionAndroidPage.aspx") == 2
+
+
+def test_sequential_redirect_after_refresh_triggers_another_login() -> None:
+    requests: list[httpx.Request] = []
+    saved: list[FatSecretSession] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/authenticate/v1/fatsecret":
+            login_number = len([item for item in requests if item.url.path == request.url.path])
+            return httpx.Response(
+                200,
+                json={
+                    "serverId": f"new-server-{login_number}",
+                    "deviceKey": f"new-device-{login_number}",
+                    "secretKey": f"new-secret-{login_number}",
+                },
+            )
+        form = parse_qs(request.content.decode())
+        if form["c_id"] == ["old-server"] or (
+            form["c_id"] == ["new-server-1"] and form["rid"] == ["222"]
+        ):
+            return httpx.Response(302, headers={"Location": "/Default.aspx"}, text="")
+        return httpx.Response(200, text="True")
+
+    async def run_deletes(client: FatSecretClient) -> list[bool]:
+        return [await client.delete_recipe("111"), await client.delete_recipe("222")]
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+        session=FatSecretSession(server_id="old-server", device_key="old-device", secret_key="old-secret"),
+        session_saver=saved.append,
+    )
+    try:
+        results = asyncio.run(run_deletes(client))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert results == [True, True]
+    assert [session.server_id for session in saved] == ["new-server-1", "new-server-2"]
+    assert [request.url.path for request in requests].count("/api/authenticate/v1/fatsecret") == 2
+    assert [request.url.path for request in requests].count("/android/RecipeActionAndroidPage.aspx") == 4
+
+
+def test_repeated_redirect_reports_safe_action_context_without_following_redirects() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/authenticate/v1/fatsecret":
+            return httpx.Response(
+                200,
+                json={"serverId": "new-server", "deviceKey": "new-device", "secretKey": "new-secret"},
+            )
+        return httpx.Response(
+            302,
+            headers={"Location": "/Default.aspx?c_s=redirect-secret&c_d=redirect-device"},
+            text="",
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "private-user", "private-password", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+        session=FatSecretSession(
+            server_id="old-server-private",
+            device_key="old-device-private",
+            secret_key="old-secret-private",
+        ),
+    )
+    try:
+        try:
+            asyncio.run(
+                client.add_ingredient(
+                    "recipe-123",
+                    Ingredient(
+                        id="ingredient-1",
+                        recipe_id="local-recipe-1",
+                        food_id="food-456",
+                        title="Ingredient",
+                        portion_id="0",
+                        amount=Decimal("1"),
+                    ),
+                )
+            )
+        except FatSecretError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected FatSecretError")
+    finally:
+        asyncio.run(http.aclose())
+
+    assert "HTTP 302" in message
+    assert "page=RecipeActionAndroidPage.aspx" in message
+    assert "action=ingredientsave" in message
+    assert "prid=recipe-123" in message
+    assert "rid=food-456" in message
+    assert "Location=/Default.aspx" in message
+    assert "replayed=yes" in message
+    assert "c_s" not in message
+    assert "c_d" not in message
+    assert "private-user" not in message
+    assert "private-password" not in message
+    assert "old-secret-private" not in message
+    assert "redirect-secret" not in message
+    assert [request.url.path for request in requests].count("/api/authenticate/v1/fatsecret") == 1
+    assert [request.url.path for request in requests].count("/android/RecipeActionAndroidPage.aspx") == 2
+    assert all(request.url.path != "/Default.aspx" for request in requests)
+
+
 def test_concurrent_cached_session_redirects_share_one_login() -> None:
     requests: list[httpx.Request] = []
     saved: list[FatSecretSession] = []

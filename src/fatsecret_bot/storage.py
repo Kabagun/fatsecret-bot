@@ -1050,12 +1050,15 @@ class Storage:
         row = self._conn.execute("SELECT 1 FROM recipes WHERE id = ?", (recipe_id,)).fetchone()
         if row is None:
             return False
+        self._delete_recipe_rows(recipe_id)
+        self._conn.commit()
+        return True
+
+    def _delete_recipe_rows(self, recipe_id: str) -> None:
         self._conn.execute("DELETE FROM ingredients WHERE recipe_id = ?", (recipe_id,))
         self._conn.execute("DELETE FROM account_recipes WHERE recipe_id = ?", (recipe_id,))
         self._conn.execute("DELETE FROM sync_events WHERE recipe_id = ?", (recipe_id,))
         self._conn.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
-        self._conn.commit()
-        return True
 
     def delete_unlinked_recipes(self, group_id: str | None = None) -> int:
         """Delete local recipes that are not mapped to any FatSecret account."""
@@ -1266,6 +1269,69 @@ class Storage:
         )
         self._conn.commit()
         return cursor.rowcount > 0
+
+    def remove_remote_recipe_mapping(self, account_key: str, remote_recipe_id: str) -> bool:
+        """Remove a mapping by its FatSecret identity and delete a recipe that becomes unlinked."""
+        rows = self._conn.execute(
+            "SELECT recipe_id FROM account_recipes WHERE account_key = ? AND remote_recipe_id = ?",
+            (account_key, remote_recipe_id),
+        ).fetchall()
+        if not rows:
+            return False
+        recipe_ids = {row["recipe_id"] for row in rows}
+        self._conn.execute(
+            "DELETE FROM account_recipes WHERE account_key = ? AND remote_recipe_id = ?",
+            (account_key, remote_recipe_id),
+        )
+        for recipe_id in recipe_ids:
+            remaining = self._conn.execute(
+                "SELECT 1 FROM account_recipes WHERE recipe_id = ? LIMIT 1",
+                (recipe_id,),
+            ).fetchone()
+            if remaining is None:
+                self._delete_recipe_rows(recipe_id)
+        self._conn.commit()
+        return True
+
+    def reconcile_group_remote_recipes(
+        self,
+        group_id: str,
+        live_remote_ids_by_account: dict[str, set[str]],
+    ) -> int:
+        """Remove stale mappings using one complete live cookbook snapshot for a group."""
+        if not live_remote_ids_by_account:
+            return 0
+        rows = self._conn.execute(
+            """
+            SELECT ar.recipe_id, ar.account_key, ar.remote_recipe_id
+            FROM account_recipes ar
+            JOIN recipes r ON r.id = ar.recipe_id
+            WHERE r.group_id = ?
+            """,
+            (group_id,),
+        ).fetchall()
+        stale = [
+            row
+            for row in rows
+            if row["account_key"] in live_remote_ids_by_account
+            and row["remote_recipe_id"] not in live_remote_ids_by_account[row["account_key"]]
+        ]
+        if not stale:
+            return 0
+        affected_recipe_ids = {row["recipe_id"] for row in stale}
+        self._conn.executemany(
+            "DELETE FROM account_recipes WHERE recipe_id = ? AND account_key = ? AND remote_recipe_id = ?",
+            [(row["recipe_id"], row["account_key"], row["remote_recipe_id"]) for row in stale],
+        )
+        for recipe_id in affected_recipe_ids:
+            remaining = self._conn.execute(
+                "SELECT 1 FROM account_recipes WHERE recipe_id = ? LIMIT 1",
+                (recipe_id,),
+            ).fetchone()
+            if remaining is None:
+                self._delete_recipe_rows(recipe_id)
+        self._conn.commit()
+        return len(stale)
 
     def mark_synced(self, recipe_id: str, account_key: str, remote_recipe_id: str, version: int) -> None:
         self.set_remote_recipe_id(recipe_id, account_key, remote_recipe_id, version)
