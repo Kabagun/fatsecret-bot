@@ -14,9 +14,14 @@ from urllib.parse import urlencode
 import httpx
 
 from .models import (
+    CustomFoodDefinition,
     FatSecretAccountConfig,
     FatSecretDeviceConfig,
     FatSecretSession,
+    FoodDiaryBulkResult,
+    FoodDiaryDay,
+    FoodDiaryEntry,
+    FoodDiaryWriteEntry,
     FoodSearchResult,
     Ingredient,
     MAX_RECIPE_STEPS,
@@ -31,6 +36,7 @@ class FatSecretError(RuntimeError):
 
 logger = logging.getLogger(__name__)
 FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
+DIARY_BULK_UPDATE_URL = "https://app.ftscrt.com/api/user-data/v1/update-journal-entries"
 FOOD_SEARCH_PAGE_SIZE = 10
 AUTH_RETRY_STATUS_CODES = {401, 403, 500}
 PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
@@ -317,6 +323,14 @@ def parse_recipe_initial_save_response(text: str) -> str:
     raise FatSecretError(f"unexpected recipe create response: {normalized[:120]}")
 
 
+def _parse_custom_food_save_response(text: str) -> str:
+    normalized = text.strip().strip('"')
+    match = re.search(r"(?:SUCCESS\s*:\s*)?(\d+)", normalized, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    raise FatSecretError(f"FatSecret не вернул id созданного личного продукта: {normalized[:160]}")
+
+
 def _stable_device_key(device_identifier: str, account_key: str) -> str:
     seed = uuid.uuid5(uuid.NAMESPACE_URL, f"fatsecret-bot:{account_key}:{device_identifier}")
     return f"|{device_identifier}|{seed.hex}"
@@ -399,6 +413,77 @@ class FatSecretClient:
     async def cookbook(self) -> list[RecipeSummary]:
         response = await self._post_android("CookBookAndroidPage.aspx", {"fl": "4"})
         return self._parse_recipe_list(response.text)
+
+    async def get_food_diary_day(self, date: dt.date) -> FoodDiaryDay:
+        """Load one food diary day through the Android journal endpoint."""
+        response = await self._post_android(
+            "RecipeJournalDayAndroidPage.aspx",
+            {
+                "dt": days_since_epoch(date),
+                "fl": "7",
+                "guid": "00000000-0000-0000-0000-000000000000",
+            },
+        )
+        return self._parse_food_diary_day(response.text, date)
+
+    async def bulk_update_food_diary(
+        self,
+        date: dt.date,
+        entries: list[FoodDiaryWriteEntry],
+    ) -> FoodDiaryBulkResult:
+        """Append food rows to one diary date using FatSecret's mobile bulk endpoint."""
+        payload = {
+            "recordedDate": int(days_since_epoch(date)),
+            "recipes": [
+                {
+                    "id": 0,
+                    "reference": entry.reference,
+                    "recipeid": int(entry.recipe_id),
+                    "name": entry.name,
+                    "recipeportionid": int(entry.recipe_portion_id),
+                    "portionamount": float(entry.portion_amount),
+                    "meal": entry.meal,
+                    **(
+                        {"servingDescription": entry.serving_description}
+                        if entry.serving_description
+                        else {}
+                    ),
+                }
+                for entry in entries
+            ],
+            "deletes": [],
+        }
+        response = await self._post_app_json(DIARY_BULK_UPDATE_URL, payload, "diary bulk update")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid diary bulk update JSON") from exc
+        return self._parse_food_diary_bulk_result(data)
+
+    async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
+        """Read a user-created food as a portable per-100g definition."""
+        response = await self._post_android(
+            "RecipeAndroidPage.aspx",
+            {"rid": remote_id, "images": "true", "fl": "7"},
+        )
+        return self._parse_custom_food_definition(response.text, remote_id)
+
+    async def create_custom_food(self, definition: CustomFoodDefinition) -> str:
+        """Create a user-owned food and return its new FatSecret recipe id."""
+        form = {
+            "action": "saveregional",
+            "manufacturerType": "0",
+            "manufacturerName": definition.manufacturer_name,
+            "productName": definition.title,
+            "tags": "",
+            "isSalt": "false",
+            "servingType": definition.serving_type,
+            "servingSize": definition.serving_size,
+            "metricServingSize": definition.metric_serving_size,
+            **{name: _form_decimal(value) for name, value in definition.nutrients.items()},
+        }
+        response = await self._post_android("RecipeCustomEntryActionAndroidPage.aspx", form)
+        return _parse_custom_food_save_response(response.text)
 
     async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
         try:
@@ -718,6 +803,124 @@ class FatSecretClient:
                 )
             )
         return recipes
+
+    def _parse_food_diary_day(self, xml_text: str, date: dt.date) -> FoodDiaryDay:
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid food diary XML") from exc
+        entries: list[FoodDiaryEntry] = []
+        for node in root.findall(".//recipejournalentry"):
+            recipe_id = _text(node, "recipeid")
+            entry_id = _text(node, "id")
+            if not recipe_id or not entry_id:
+                continue
+            entries.append(
+                FoodDiaryEntry(
+                    entry_id=entry_id,
+                    recipe_id=recipe_id,
+                    meal=_int(_text(node, "meal")),
+                    name=_text(node, "name"),
+                    recipe_source=_text(node, "recipeSource"),
+                    recipe_portion_id=_text(node, "recipePortionID", "0"),
+                    portion_amount=_decimal(_text(node, "portionAmount"), Decimal("0")) or Decimal("0"),
+                    serving_description=_text(node, "servingDescription"),
+                )
+            )
+        return FoodDiaryDay(date=date, guid=_text(root, "guid"), entries=entries)
+
+    def _parse_food_diary_bulk_result(self, data: Any) -> FoodDiaryBulkResult:
+        if not isinstance(data, dict):
+            raise FatSecretError(f"{self.account.label}: invalid diary bulk update response")
+        inserted_raw = data.get("insertedEntries") or {}
+        inserted: dict[str, str] = {}
+        if isinstance(inserted_raw, dict):
+            inserted = {str(reference): str(entry_id) for reference, entry_id in inserted_raw.items()}
+        elif isinstance(inserted_raw, list):
+            for item in inserted_raw:
+                if not isinstance(item, dict):
+                    continue
+                reference = _first_present(item, "reference", "key")
+                entry_id = _first_present(item, "id", "entryId", "value")
+                if reference is not None and entry_id is not None:
+                    inserted[str(reference)] = str(entry_id)
+
+        failed: dict[str, str] = {}
+        failed_raw = data.get("failedEntries") or []
+        if isinstance(failed_raw, dict):
+            failed_raw = [failed_raw]
+        if isinstance(failed_raw, list):
+            for item in failed_raw:
+                if not isinstance(item, dict):
+                    continue
+                message = str(
+                    _first_present(item, "errorDescription", "error", "errorCode")
+                    or "FatSecret rejected diary entry"
+                )
+                references = item.get("references") or item.get("reference") or []
+                if not isinstance(references, list):
+                    references = [references]
+                for reference in references:
+                    if reference is not None:
+                        failed[str(reference)] = message
+        return FoodDiaryBulkResult(
+            inserted_entries=inserted,
+            failed_entries=failed,
+            previous_guid=str(data.get("previousGuid") or ""),
+            new_guid=str(data.get("newGuid") or ""),
+        )
+
+    def _parse_custom_food_definition(self, xml_text: str, remote_id: str) -> CustomFoodDefinition:
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid custom food XML") from exc
+        if not _bool_value(_text(root, "isOwn")) and _text(root, "source").casefold() != "facebook":
+            raise FatSecretError(f"{self.account.label}: food {remote_id} is not a user-created product")
+        grams = _decimal(_text(root, "gramsPerPortion"), Decimal("100")) or Decimal("100")
+        scale = Decimal("100") / grams if grams > 0 else Decimal("1")
+        source_tags = {
+            "calories": "energyPerPortion",
+            "totalFat": "fatPerPortion",
+            "saturatedFat": "saturatedFatPerPortion",
+            "polyunsaturatedFat": "polyunsaturatedFatPerPortion",
+            "monounsaturatedFat": "monounsaturatedFatPerPortion",
+            "transFat": "transFatPerPortion",
+            "cholesterol": "cholesterolPerPortion",
+            "sodium": "sodiumPerPortion",
+            "potassium": "potassiumPerPortion",
+            "carbohydrate": "carbohydratePerPortion",
+            "fiber": "fiberPerPortion",
+            "sugar": "sugarPerPortion",
+            "addedSugars": "addedSugarsPerPortion",
+            "protein": "proteinPerPortion",
+            "vitaminAMcg": "vitaminAMcgPerPortion",
+            "vitaminCMg": "vitaminCPerPortion",
+            "vitaminD": "vitaminDPerPortion",
+            "calciumMg": "calciumPerPortion",
+            "ironMg": "ironPerPortion",
+        }
+        nutrients = {
+            name: value * scale
+            for name, tag in source_tags.items()
+            if (value := _decimal(_text(root, tag), None)) is not None
+        }
+        if not nutrients:
+            raise FatSecretError(f"{self.account.label}: custom food {remote_id} has no nutrition data")
+        short_description = _text(root, "shortDescription")
+        return CustomFoodDefinition(
+            source_recipe_id=remote_id,
+            title=_text(root, "title"),
+            manufacturer_name=(
+                _text(root, "manufacturerName")
+                or _text(root, "manufacturer")
+                or _metadata_value(short_description, "mname")
+            ),
+            serving_type="Per100g",
+            serving_size="100",
+            metric_serving_size="100g",
+            nutrients=nutrients,
+        )
 
     def _parse_recipe(self, xml_text: str) -> Recipe:
         try:

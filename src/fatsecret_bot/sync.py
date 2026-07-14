@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
+import json
 import logging
 import re
 import uuid
@@ -10,13 +12,25 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .fatsecret_client import FatSecretClient, FatSecretError
-from .models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe
+from .models import (
+    DiaryCopyDateResult,
+    DiaryCopyPreview,
+    DiaryCopyResult,
+    FatSecretAccountConfig,
+    FatSecretDeviceConfig,
+    FoodDiaryEntry,
+    FoodDiaryWriteEntry,
+    FoodSearchResult,
+    Ingredient,
+    Recipe,
+)
 from .storage import Storage, normalize_title
 
 logger = logging.getLogger(__name__)
 PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
 SEARCH_TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 INGREDIENT_NORMALIZE_CONCURRENCY = 6
+MAX_DIARY_COPY_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -84,6 +98,66 @@ class RecipeCreateResult:
     replaced_recipe_id: str | None = None
     replacement_results: list[AccountSyncResult] = field(default_factory=list)
     rename_results: list[AccountSyncResult] = field(default_factory=list)
+
+
+def _inclusive_dates(start: dt.date, end: dt.date) -> list[dt.date]:
+    return [start + dt.timedelta(days=offset) for offset in range((end - start).days + 1)]
+
+
+def _food_diary_entry_to_dict(entry: FoodDiaryEntry) -> dict[str, object]:
+    return {
+        "entry_id": entry.entry_id,
+        "recipe_id": entry.recipe_id,
+        "meal": entry.meal,
+        "name": entry.name,
+        "recipe_source": entry.recipe_source,
+        "recipe_portion_id": entry.recipe_portion_id,
+        "portion_amount": str(entry.portion_amount),
+        "serving_description": entry.serving_description,
+    }
+
+
+def _food_diary_entry_from_dict(data: dict[str, object]) -> FoodDiaryEntry:
+    return FoodDiaryEntry(
+        entry_id=str(data.get("entry_id") or ""),
+        recipe_id=str(data.get("recipe_id") or ""),
+        meal=int(data.get("meal") or 0),
+        name=str(data.get("name") or ""),
+        recipe_source=str(data.get("recipe_source") or ""),
+        recipe_portion_id=str(data.get("recipe_portion_id") or "0"),
+        portion_amount=Decimal(str(data.get("portion_amount") or "0")),
+        serving_description=str(data.get("serving_description") or ""),
+    )
+
+
+def _diary_copy_date_result_to_dict(result: DiaryCopyDateResult) -> dict[str, object]:
+    return {
+        "account_key": result.account_key,
+        "date": result.date.isoformat(),
+        "inserted": result.inserted,
+        "failed": result.failed,
+        "message": result.message,
+    }
+
+
+def _diary_copy_result_from_dict(run_id: str, status: str, data: dict[str, object]) -> DiaryCopyResult:
+    raw_dates = data.get("dates")
+    dates = (
+        [
+            DiaryCopyDateResult(
+                account_key=str(item.get("account_key") or ""),
+                date=dt.date.fromisoformat(str(item.get("date"))),
+                inserted=int(item.get("inserted") or 0),
+                failed=int(item.get("failed") or 0),
+                message=str(item.get("message") or ""),
+            )
+            for item in raw_dates
+            if isinstance(item, dict)
+        ]
+        if isinstance(raw_dates, list)
+        else []
+    )
+    return DiaryCopyResult(run_id=run_id, status=status, dates=dates)
 
 
 def _same_decimal(left: Decimal, right: Decimal) -> bool:
@@ -622,6 +696,241 @@ class RecipeSyncEngine:
             await client.login()
         finally:
             await client.close()
+
+    async def prepare_diary_copy(
+        self,
+        group_id: str,
+        initiated_by: int,
+        source_account_key: str,
+        source_date: dt.date,
+        target_start: dt.date,
+        target_end: dt.date,
+    ) -> DiaryCopyPreview:
+        """Load the source diary and persist an immutable copy preview."""
+        if target_end < target_start:
+            raise FatSecretError("Конечная дата не может быть раньше начальной.")
+        days = (target_end - target_start).days + 1
+        if days > MAX_DIARY_COPY_DAYS:
+            raise FatSecretError(f"За один раз можно выбрать не больше {MAX_DIARY_COPY_DAYS} дней.")
+        accounts = self.storage.list_fatsecret_accounts(group_id)
+        if len(accounts) != 2:
+            raise FatSecretError("Для копирования дневника подключи оба FatSecret аккаунта группы.")
+        account_by_key = {account.key: account for account in accounts}
+        source_account = account_by_key.get(source_account_key)
+        if source_account is None:
+            raise FatSecretError("Аккаунт-источник больше не подключен к активной группе.")
+
+        client = self._build_client(source_account)
+        try:
+            source_day = await client.get_food_diary_day(source_date)
+        finally:
+            await client.close()
+        if not source_day.entries:
+            raise FatSecretError("В выбранный день у аккаунта-источника нет записей еды.")
+
+        request = {
+            "account_keys": [account.key for account in accounts],
+            "entries": [_food_diary_entry_to_dict(entry) for entry in source_day.entries],
+        }
+        run_id = self.storage.create_diary_copy_run(
+            group_id,
+            initiated_by,
+            source_account_key,
+            source_date,
+            target_start,
+            target_end,
+            request,
+        )
+        skipped_source_day = target_start <= source_date <= target_end
+        operations = len(accounts) * days - int(skipped_source_day)
+        return DiaryCopyPreview(
+            run_id=run_id,
+            source_account_key=source_account_key,
+            source_date=source_date,
+            target_start=target_start,
+            target_end=target_end,
+            source_entries=source_day.entries,
+            target_operations=operations,
+            skipped_source_day=skipped_source_day,
+        )
+
+    async def execute_diary_copy(self, run_id: str) -> DiaryCopyResult:
+        """Execute one confirmed diary copy once and persist its terminal result."""
+        run = self.storage.diary_copy_run(run_id)
+        if run is None:
+            raise FatSecretError("Операция копирования устарела или не найдена.")
+        if run["status"] in {"completed", "partial", "failed"}:
+            result = run.get("result")
+            if isinstance(result, dict):
+                return _diary_copy_result_from_dict(run_id, str(run["status"]), result)
+            raise FatSecretError("Сохраненный результат операции поврежден.")
+
+        request = run.get("request")
+        if not isinstance(request, dict):
+            raise FatSecretError("Параметры операции повреждены.")
+        entries_raw = request.get("entries")
+        if not isinstance(entries_raw, list):
+            raise FatSecretError("Список еды операции поврежден.")
+        entries = [_food_diary_entry_from_dict(item) for item in entries_raw if isinstance(item, dict)]
+        account_keys = [str(value) for value in request.get("account_keys", [])]
+        source_account_key = str(run["source_account_key"])
+        source_date = dt.date.fromisoformat(str(run["source_date"]))
+        target_start = dt.date.fromisoformat(str(run["target_start"]))
+        target_end = dt.date.fromisoformat(str(run["target_end"]))
+        if not self.storage.claim_diary_copy_run(run_id):
+            raise FatSecretError("Эта операция уже выполняется. Повторное нажатие ничего не добавит.")
+
+        clients: dict[str, FatSecretClient] = {}
+        date_results: list[DiaryCopyDateResult] = []
+        mapping_cache: dict[tuple[str, str], tuple[str, str]] = {}
+        try:
+            clients = self._build_clients(str(run["group_id"]))
+            if set(account_keys) != set(clients):
+                raise FatSecretError("Состав FatSecret аккаунтов изменился после подтверждения. Начни заново.")
+            source_client = clients.get(source_account_key)
+            if source_client is None:
+                raise FatSecretError("Аккаунт-источник больше не подключен.")
+            for target_account_key in account_keys:
+                target_client = clients[target_account_key]
+                for target_date in _inclusive_dates(target_start, target_end):
+                    if target_account_key == source_account_key and target_date == source_date:
+                        continue
+                    try:
+                        writes: list[FoodDiaryWriteEntry] = []
+                        for index, entry in enumerate(entries):
+                            mapped_recipe_id, mapped_portion_id = await self._map_diary_entry(
+                                source_account_key,
+                                target_account_key,
+                                entry,
+                                source_client,
+                                target_client,
+                                mapping_cache,
+                            )
+                            writes.append(
+                                FoodDiaryWriteEntry(
+                                    reference=f"{run_id[:16]}-{target_account_key}-{target_date:%Y%m%d}-{index}",
+                                    recipe_id=mapped_recipe_id,
+                                    name=entry.name,
+                                    recipe_portion_id=mapped_portion_id,
+                                    portion_amount=entry.portion_amount,
+                                    meal=entry.meal,
+                                    serving_description=entry.serving_description,
+                                )
+                            )
+                        response = await target_client.bulk_update_food_diary(target_date, writes)
+                        failed = len(response.failed_entries)
+                        inserted = len(writes) - failed
+                        message = "добавлено" if not failed else "; ".join(sorted(set(response.failed_entries.values())))
+                        date_results.append(
+                            DiaryCopyDateResult(
+                                account_key=target_account_key,
+                                date=target_date,
+                                inserted=inserted,
+                                failed=failed,
+                                message=message,
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report and continue other dates/accounts.
+                        logger.exception("diary copy failed for %s on %s", target_account_key, target_date)
+                        date_results.append(
+                            DiaryCopyDateResult(
+                                account_key=target_account_key,
+                                date=target_date,
+                                inserted=0,
+                                failed=len(entries),
+                                message=str(exc),
+                            )
+                        )
+        except Exception as exc:  # noqa: BLE001 - persist a terminal idempotency result.
+            result_data = {"dates": [_diary_copy_date_result_to_dict(item) for item in date_results], "error": str(exc)}
+            self.storage.finish_diary_copy_run(run_id, "failed", result_data)
+            raise
+        finally:
+            if clients:
+                await self._close_clients(clients)
+
+        failed_count = sum(item.failed for item in date_results)
+        status = "completed" if failed_count == 0 else "partial"
+        result_data = {"dates": [_diary_copy_date_result_to_dict(item) for item in date_results]}
+        self.storage.finish_diary_copy_run(run_id, status, result_data)
+        return DiaryCopyResult(run_id=run_id, status=status, dates=date_results)
+
+    async def _map_diary_entry(
+        self,
+        source_account_key: str,
+        target_account_key: str,
+        entry: FoodDiaryEntry,
+        source_client: FatSecretClient,
+        target_client: FatSecretClient,
+        cache: dict[tuple[str, str], tuple[str, str]],
+    ) -> tuple[str, str]:
+        cache_key = (target_account_key, entry.recipe_id)
+        if cache_key in cache:
+            return cache[cache_key]
+        if target_account_key == source_account_key:
+            mapped = (entry.recipe_id, entry.recipe_portion_id)
+            cache[cache_key] = mapped
+            return mapped
+
+        if entry.recipe_source.casefold() == "facebook" or entry.recipe_portion_id == "-1":
+            target_food_id = self.storage.custom_food_mapping(
+                source_account_key,
+                entry.recipe_id,
+                target_account_key,
+            )
+            if target_food_id is None:
+                definition = await source_client.get_custom_food_definition(entry.recipe_id)
+                target_food_id = await target_client.create_custom_food(definition)
+                content_hash = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "title": definition.title,
+                            "manufacturer": definition.manufacturer_name,
+                            "nutrients": {key: str(value) for key, value in sorted(definition.nutrients.items())},
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                self.storage.set_custom_food_mapping(
+                    source_account_key,
+                    entry.recipe_id,
+                    target_account_key,
+                    target_food_id,
+                    content_hash,
+                )
+            mapped = (target_food_id, "-1")
+            cache[cache_key] = mapped
+            return mapped
+
+        local_recipe_id = self.storage.local_recipe_id_for_remote(source_account_key, entry.recipe_id)
+        if local_recipe_id is None:
+            mapped = (entry.recipe_id, entry.recipe_portion_id)
+            cache[cache_key] = mapped
+            return mapped
+        recipe = self.storage.get_recipe(local_recipe_id)
+        if recipe is None:
+            raise FatSecretError(f"Локальная карточка рецепта {entry.name} потеряна.")
+        target_recipe_id = recipe.remote_ids.get(target_account_key)
+        if target_recipe_id is None:
+            source_recipe = await source_client.get_recipe(entry.recipe_id)
+            source_recipe.ingredients = await self._normalize_recipe_ingredients(source_client, source_recipe.ingredients)
+            source_recipe.id = recipe.id
+            source_recipe.group_id = recipe.group_id
+            target_recipe_id = await target_client.create_recipe(source_recipe)
+            try:
+                await self._sync_ingredients(target_client, source_recipe, target_recipe_id)
+                if not await target_client.save_recipe_meta(source_recipe, target_recipe_id):
+                    raise FatSecretError(f"{target_client.account.label}: recipe metadata save returned false")
+            except Exception:
+                await self._rollback_created_recipe_with_status(target_client, target_recipe_id)
+                raise
+            self.storage.mark_synced(recipe.id, target_account_key, target_recipe_id, recipe.version)
+        target_recipe = await target_client.get_recipe(target_recipe_id)
+        target_portion_id = target_recipe.default_portion_id or entry.recipe_portion_id
+        mapped = (target_recipe_id, target_portion_id)
+        cache[cache_key] = mapped
+        return mapped
 
     async def refresh_account_recipes(self, account: FatSecretAccountConfig, group_id: str | None = None) -> int:
         """Import cookbook recipes for one connected FatSecret account."""

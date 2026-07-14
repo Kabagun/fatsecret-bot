@@ -206,6 +206,32 @@ class Storage:
                 group_id TEXT PRIMARY KEY,
                 refreshed_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS custom_food_mappings (
+                source_account_key TEXT NOT NULL,
+                source_food_id TEXT NOT NULL,
+                target_account_key TEXT NOT NULL,
+                target_food_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (source_account_key, source_food_id, target_account_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS diary_copy_runs (
+                id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                initiated_by INTEGER NOT NULL,
+                source_account_key TEXT NOT NULL,
+                source_date TEXT NOT NULL,
+                target_start TEXT NOT NULL,
+                target_end TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         self._ensure_column("telegram_users", "active_group_id", "TEXT")
@@ -223,6 +249,10 @@ class Storage:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_food_usage_cache_group_count "
             "ON food_usage_cache(group_id, use_count DESC, normalized_title ASC)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_diary_copy_runs_group_created "
+            "ON diary_copy_runs(group_id, created_at DESC)"
         )
         self._backfill_default_group()
         self._normalize_zero_portion_gram_ingredients()
@@ -728,6 +758,10 @@ class Storage:
         if row is None:
             return False
         self._conn.execute("DELETE FROM account_recipes WHERE account_key = ?", (row["account_key"],))
+        self._conn.execute(
+            "DELETE FROM custom_food_mappings WHERE source_account_key = ? OR target_account_key = ?",
+            (row["account_key"], row["account_key"]),
+        )
         self._conn.execute("DELETE FROM fatsecret_accounts WHERE telegram_id = ?", (telegram_id,))
         self._conn.commit()
         return True
@@ -741,6 +775,10 @@ class Storage:
         if row is None:
             return False
         self._conn.execute("DELETE FROM account_recipes WHERE account_key = ?", (account_key,))
+        self._conn.execute(
+            "DELETE FROM custom_food_mappings WHERE source_account_key = ? OR target_account_key = ?",
+            (account_key, account_key),
+        )
         self._conn.execute("DELETE FROM fatsecret_accounts WHERE account_key = ?", (account_key,))
         self._conn.commit()
         return True
@@ -1332,6 +1370,149 @@ class Storage:
                 self._delete_recipe_rows(recipe_id)
         self._conn.commit()
         return len(stale)
+
+    def local_recipe_id_for_remote(self, account_key: str, remote_recipe_id: str) -> str | None:
+        """Return the local recipe id mapped to one account-specific FatSecret id."""
+        row = self._conn.execute(
+            "SELECT recipe_id FROM account_recipes WHERE account_key = ? AND remote_recipe_id = ? LIMIT 1",
+            (account_key, remote_recipe_id),
+        ).fetchone()
+        return str(row["recipe_id"]) if row is not None else None
+
+    def custom_food_mapping(
+        self,
+        source_account_key: str,
+        source_food_id: str,
+        target_account_key: str,
+    ) -> str | None:
+        """Return a previously cloned personal-food id for a target account."""
+        row = self._conn.execute(
+            """
+            SELECT target_food_id
+            FROM custom_food_mappings
+            WHERE source_account_key = ? AND source_food_id = ? AND target_account_key = ?
+            """,
+            (source_account_key, source_food_id, target_account_key),
+        ).fetchone()
+        return str(row["target_food_id"]) if row is not None else None
+
+    def set_custom_food_mapping(
+        self,
+        source_account_key: str,
+        source_food_id: str,
+        target_account_key: str,
+        target_food_id: str,
+        content_hash: str = "",
+    ) -> None:
+        """Persist the account-to-account mapping for one cloned personal food."""
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO custom_food_mappings(
+                source_account_key, source_food_id, target_account_key, target_food_id,
+                content_hash, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_account_key, source_food_id, target_account_key) DO UPDATE SET
+                target_food_id = excluded.target_food_id,
+                content_hash = excluded.content_hash,
+                updated_at = excluded.updated_at
+            """,
+            (
+                source_account_key,
+                source_food_id,
+                target_account_key,
+                target_food_id,
+                content_hash,
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+
+    def create_diary_copy_run(
+        self,
+        group_id: str,
+        initiated_by: int,
+        source_account_key: str,
+        source_date: dt.date,
+        target_start: dt.date,
+        target_end: dt.date,
+        request: dict[str, object],
+    ) -> str:
+        """Create a pending, persistent diary copy operation and return its id."""
+        run_id = uuid.uuid4().hex
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO diary_copy_runs(
+                id, group_id, initiated_by, source_account_key, source_date,
+                target_start, target_end, request_json, status, result_json,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+            """,
+            (
+                run_id,
+                group_id,
+                initiated_by,
+                source_account_key,
+                source_date.isoformat(),
+                target_start.isoformat(),
+                target_end.isoformat(),
+                json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return run_id
+
+    def diary_copy_run(self, run_id: str) -> dict[str, object] | None:
+        """Load one diary copy run including its immutable request and stored result."""
+        row = self._conn.execute("SELECT * FROM diary_copy_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "group_id": str(row["group_id"]),
+            "initiated_by": int(row["initiated_by"]),
+            "source_account_key": str(row["source_account_key"]),
+            "source_date": str(row["source_date"]),
+            "target_start": str(row["target_start"]),
+            "target_end": str(row["target_end"]),
+            "request": json.loads(row["request_json"]),
+            "status": str(row["status"]),
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+        }
+
+    def claim_diary_copy_run(self, run_id: str) -> bool:
+        """Atomically move a pending diary copy run to running for callback idempotency."""
+        cursor = self._conn.execute(
+            "UPDATE diary_copy_runs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'pending'",
+            (_now(), run_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def finish_diary_copy_run(self, run_id: str, status: str, result: dict[str, object]) -> None:
+        """Persist the terminal result of a diary copy operation."""
+        if status not in {"completed", "partial", "failed"}:
+            raise ValueError(f"Unsupported diary copy status: {status}")
+        self._conn.execute(
+            """
+            UPDATE diary_copy_runs
+            SET status = ?, result_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                _now(),
+                run_id,
+            ),
+        )
+        self._conn.commit()
 
     def mark_synced(self, recipe_id: str, account_key: str, remote_recipe_id: str, version: int) -> None:
         self.set_remote_recipe_id(recipe_id, account_key, remote_recipe_id, version)

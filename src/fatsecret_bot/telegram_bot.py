@@ -22,7 +22,15 @@ from telegram.ext import (
     filters,
 )
 
-from .models import MAX_RECIPE_STEPS, FatSecretAccountConfig, Ingredient, Recipe, RecipeGroup
+from .models import (
+    MAX_RECIPE_STEPS,
+    DiaryCopyPreview,
+    DiaryCopyResult,
+    FatSecretAccountConfig,
+    Ingredient,
+    Recipe,
+    RecipeGroup,
+)
 from .storage import Storage, normalize_title
 from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 
@@ -38,7 +46,7 @@ RECIPE_CACHE_GROUP_KEY = "recipe_cache_group_id"
 RECIPE_CACHE_LOADED_KEY = "recipe_cache_loaded_at"
 RECIPE_RENDER_KEY = "recipe_render_key"
 RECIPE_SEARCH_IDS_KEY = "recipe_search_ids"
-MAIN_BUTTONS = {"Поиск рецептов", "Рецепты", "Создать из списка", "Группы", "Аккаунты"}
+MAIN_BUTTONS = {"Поиск рецептов", "Рецепты", "Создать из списка", "Меню / Дневник", "Группы", "Аккаунты"}
 LIST_WIDTH_LINE = "--------------------------------"
 PORTION_DESCRIPTION_RE = re.compile(
     r"^\s*(?P<size>\d+(?:[\.,]\d+)?)\s*(?P<unit>г|гр|g|gram|грам|мл|ml)\b",
@@ -63,10 +71,43 @@ RECIPE_STEP_PREFIX_RE = re.compile(r"^\s*(?:\d+[\).]\s*|[-*]\s*)?(?P<step>.+?)\s
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Поиск рецептов", "Создать из списка"],
+        ["Меню / Дневник"],
         ["Группы", "Аккаунты"],
     ],
     resize_keyboard=True,
 )
+
+DIARY_DATE_TOKEN = r"(?:\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|сегодня|завтра|вчера)"
+DIARY_RANGE_RE = re.compile(
+    rf"^\s*(?P<start>{DIARY_DATE_TOKEN})(?:\s*(?:\.\.|—|–|\s-\s)\s*(?P<end>{DIARY_DATE_TOKEN}))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_diary_date(value: str, today: dt.date | None = None) -> dt.date:
+    current = today or dt.date.today()
+    normalized = value.strip().casefold()
+    if normalized == "сегодня":
+        return current
+    if normalized == "завтра":
+        return current + dt.timedelta(days=1)
+    if normalized == "вчера":
+        return current - dt.timedelta(days=1)
+    for date_format in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(normalized, date_format).date()
+        except ValueError:
+            continue
+    raise ValueError("Дата должна быть в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД.")
+
+
+def _parse_diary_range(value: str, today: dt.date | None = None) -> tuple[dt.date, dt.date]:
+    match = DIARY_RANGE_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("Диапазон: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ; для одного дня укажи одну дату.")
+    start = _parse_diary_date(match.group("start"), today=today)
+    end = _parse_diary_date(match.group("end") or match.group("start"), today=today)
+    return start, end
 
 
 def _format_steps_lines(steps: list[str], limit: int = DISPLAY_RECIPE_STEPS_LIMIT) -> list[str]:
@@ -467,6 +508,7 @@ class TelegramRecipeBot:
         app.add_handler(CommandHandler("recipes", self.recipes))
         app.add_handler(CommandHandler("refresh", self.refresh))
         app.add_handler(CommandHandler("groups", self.groups))
+        app.add_handler(CommandHandler("diary", self.diary))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         return app
@@ -709,7 +751,7 @@ class TelegramRecipeBot:
             )
             return
         await update.effective_message.reply_text(
-            "Готов. Создавай и редактируй рецепты в FatSecret, а здесь обновляй список и синхронизируй выбранный рецепт.",
+            "Готов. Здесь можно синхронизировать рецепты и через «Меню / Дневник» скопировать заполненный день на оба аккаунта и диапазон до 7 дней.",
             reply_markup=MAIN_KEYBOARD,
         )
         context.chat_data["reply_keyboard"] = "main"
@@ -854,6 +896,174 @@ class TelegramRecipeBot:
         if await self._require_active_group(update) is None:
             return
         await self._send_recipe_list(update, context, page=0)
+
+    async def diary(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Start copying one account's food diary to both group accounts."""
+        if not await self._require_user(update):
+            return
+        group = await self._require_active_group(update)
+        if group is None:
+            return
+        accounts = self.storage.list_fatsecret_accounts(group.id)
+        context.user_data.clear()
+        if len(accounts) != 2:
+            await update.effective_message.reply_text(
+                "Для копирования дневника подключи оба FatSecret аккаунта группы.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(account.label[:50], callback_data=f"diarysrc:{account.key}")]
+            for account in accounts
+        ]
+        buttons.append([InlineKeyboardButton("Отмена", callback_data="diarycancel:0")])
+        await update.effective_message.reply_text(
+            "<b>Копирование меню / дневника</b>\n\nВыбери FatSecret аккаунт, где уже заполнен исходный день.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _select_diary_source(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        telegram_id: int,
+        source_account_key: str,
+    ) -> None:
+        group = self.storage.active_group_for_user(telegram_id)
+        accounts = self.storage.list_fatsecret_accounts(group.id) if group is not None else []
+        account = next((item for item in accounts if item.key == source_account_key), None)
+        if group is None or account is None or len(accounts) != 2:
+            context.user_data.clear()
+            await query.edit_message_text("Аккаунты или активная группа изменились. Начни копирование заново.")
+            return
+        context.user_data.clear()
+        context.user_data.update(
+            {
+                "mode": "diary_source_date",
+                "group_id": group.id,
+                "diary_source_account_key": account.key,
+            }
+        )
+        await query.edit_message_text(
+            f"Источник: <b>{html.escape(account.label)}</b>.\n\n"
+            "Пришли дату заполненного дня: <code>ДД.ММ.ГГГГ</code>, <code>сегодня</code> или <code>вчера</code>.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="diarycancel:0")]]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _prepare_diary_preview(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        try:
+            target_start, target_end = _parse_diary_range(
+                text,
+                today=dt.datetime.now(self._refresh_timezone()).date(),
+            )
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        group_id = str(context.user_data.get("group_id") or "")
+        source_account_key = str(context.user_data.get("diary_source_account_key") or "")
+        source_date_text = str(context.user_data.get("diary_source_date") or "")
+        if not group_id or not source_account_key or not source_date_text:
+            context.user_data.clear()
+            await update.effective_message.reply_text("Контекст копирования потерян. Нажми «Меню / Дневник» заново.")
+            return
+        status = await update.effective_message.reply_text("Загружаю исходный дневник и готовлю проверку...")
+        try:
+            preview = await self.sync_engine.prepare_diary_copy(
+                group_id=group_id,
+                initiated_by=update.effective_user.id,
+                source_account_key=source_account_key,
+                source_date=dt.date.fromisoformat(source_date_text),
+                target_start=target_start,
+                target_end=target_end,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("diary copy preview failed")
+            await status.edit_text(f"Не удалось подготовить копирование: {exc}")
+            return
+        context.user_data["mode"] = "diary_confirm"
+        context.user_data["diary_run_id"] = preview.run_id
+        await status.edit_text(
+            self._format_diary_preview(preview, group_id),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Скопировать", callback_data=f"diaryrun:{preview.run_id}")],
+                    [InlineKeyboardButton("Отмена", callback_data="diarycancel:0")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    def _format_diary_preview(self, preview: DiaryCopyPreview, group_id: str) -> str:
+        labels = self._account_labels_for_group(group_id)
+        meal_counts: dict[int, int] = {}
+        for entry in preview.source_entries:
+            meal_counts[entry.meal] = meal_counts.get(entry.meal, 0) + 1
+        meal_names = {1: "завтрак", 2: "обед", 3: "ужин", 4: "перекусы"}
+        meals = ", ".join(
+            f"{meal_names.get(meal, f'приём {meal}')}: {count}"
+            for meal, count in sorted(meal_counts.items())
+        )
+        skipped = (
+            "\nИсходный аккаунт в исходную дату пропущен, чтобы не создать самодубликат."
+            if preview.skipped_source_day
+            else ""
+        )
+        total_rows = len(preview.source_entries) * preview.target_operations
+        return (
+            "<b>Проверка копирования дневника</b>\n\n"
+            f"Источник: {html.escape(labels.get(preview.source_account_key, preview.source_account_key))}, "
+            f"{preview.source_date:%d.%m.%Y}\n"
+            f"Целевые даты: {preview.target_start:%d.%m.%Y} — {preview.target_end:%d.%m.%Y}\n"
+            f"Записей еды в источнике: {len(preview.source_entries)} ({html.escape(meals)})\n"
+            f"Операций аккаунт/дата: {preview.target_operations}; будет добавлено строк: {total_rows}.\n\n"
+            "Уже существующие записи сохранятся; новые строки добавятся к ним. "
+            "Вода, упражнения, фото и заметки не копируются."
+            f"{skipped}"
+        )
+
+    async def _execute_diary_copy(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        telegram_id: int,
+        run_id: str,
+    ) -> None:
+        run = self.storage.diary_copy_run(run_id)
+        active_group = self.storage.active_group_for_user(telegram_id)
+        if run is None or active_group is None or run["group_id"] != active_group.id:
+            context.user_data.clear()
+            await query.edit_message_text("Операция устарела или относится к другой группе.")
+            return
+        await query.edit_message_text("Копирую дневник. Личные рецепты и продукты при необходимости синхронизируются...")
+        try:
+            result = await self.sync_engine.execute_diary_copy(run_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("diary copy execution failed")
+            await query.edit_message_text(f"Копирование не выполнено: {exc}")
+            return
+        context.user_data.clear()
+        await query.edit_message_text(self._format_diary_result(result, active_group.id))
+
+    def _format_diary_result(self, result: DiaryCopyResult, group_id: str) -> str:
+        labels = self._account_labels_for_group(group_id)
+        inserted = sum(item.inserted for item in result.dates)
+        failed = sum(item.failed for item in result.dates)
+        heading = "Копирование завершено" if failed == 0 else "Копирование завершено частично"
+        lines = [f"{heading}. Добавлено: {inserted}; ошибок: {failed}.", ""]
+        for item in result.dates:
+            label = labels.get(item.account_key, item.account_key)
+            lines.append(
+                f"- {label}, {item.date:%d.%m.%Y}: +{item.inserted}, ошибок {item.failed}"
+                + (f" — {item.message}" if item.message and item.failed else "")
+            )
+        return "\n".join(lines)
 
     def _recipe_page(self, recipes: list[Recipe], page: int) -> tuple[list[Recipe], int, int]:
         total_count = len(recipes)
@@ -1078,6 +1288,14 @@ class TelegramRecipeBot:
                 "Вышел из FatSecret аккаунта в боте." if removed else "FatSecret аккаунт уже отключен или не найден.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
             )
+        elif action == "diarysrc":
+            await self._select_diary_source(query, context, update.effective_user.id, value)
+        elif action == "diaryrun":
+            await self._execute_diary_copy(query, context, update.effective_user.id, value)
+        elif action == "diarycancel":
+            context.user_data.clear()
+            await query.edit_message_text("Копирование дневника отменено.")
+            await self._ensure_main_keyboard(query.message, context)
         elif action == "list":
             context.user_data.pop("current_recipe_id", None)
             context.user_data.pop("recipe_page_action", None)
@@ -1841,6 +2059,9 @@ class TelegramRecipeBot:
             page = int(context.user_data.get("recipe_list_page") or 0)
             await self._send_batch_delete(update, context, page)
             return
+        if mode is None and text == "Меню / Дневник":
+            await self.diary(update, context)
+            return
         if mode is None and text == "Аккаунты":
             await self.accounts(update, context)
             return
@@ -1873,6 +2094,25 @@ class TelegramRecipeBot:
             await self._handle_fatsecret_label(update, context, text)
         elif mode == "account_label":
             await self._handle_account_label(update, context, text)
+        elif mode == "diary_source_date":
+            try:
+                source_date = _parse_diary_date(
+                    text,
+                    today=dt.datetime.now(self._refresh_timezone()).date(),
+                )
+            except ValueError as exc:
+                await update.effective_message.reply_text(str(exc))
+                return
+            context.user_data["diary_source_date"] = source_date.isoformat()
+            context.user_data["mode"] = "diary_target_range"
+            await update.effective_message.reply_text(
+                "Теперь пришли целевой диапазон до 7 дней:\n"
+                "<code>15.07.2026 - 17.07.2026</code>\n"
+                "или одну дату для одного дня. Можно использовать <code>сегодня</code>/<code>завтра</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+        elif mode == "diary_target_range":
+            await self._prepare_diary_preview(update, context, text)
         else:
             await update.effective_message.reply_text(
                 "Выбери действие кнопками ниже.",
