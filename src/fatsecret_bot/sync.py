@@ -46,7 +46,7 @@ class IngredientSyncStats:
     added: int = 0
     updated: int = 0
     unchanged: int = 0
-    extras: int = 0
+    deleted: int = 0
 
     def message(self) -> str:
         """Return a compact user-facing summary of ingredient propagation."""
@@ -57,8 +57,8 @@ class IngredientSyncStats:
             parts.append(f"обновлено ингредиентов: {self.updated}")
         if self.unchanged:
             parts.append(f"без изменений: {self.unchanged}")
-        if self.extras:
-            parts.append(f"лишних ингредиентов в целевом рецепте: {self.extras} (не удалял)")
+        if self.deleted:
+            parts.append(f"удалено лишних ингредиентов: {self.deleted}")
         return "; ".join(parts) if parts else "ингредиентов нет"
 
 
@@ -1986,6 +1986,7 @@ class RecipeSyncEngine:
         added = 0
         updated = 0
         unchanged = 0
+        deleted = 0
         for ingredient in recipe.ingredients:
             target = _find_matching_ingredient(remote.ingredients, ingredient, used_target_ids)
             if target is None:
@@ -2021,5 +2022,17 @@ class RecipeSyncEngine:
                     f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}». "
                     "Если это свой продукт, нужен capture API создания собственного продукта."
                 )
-        extras = sum(1 for target in remote.ingredients if _ingredient_identity(target) not in used_target_ids)
-        return IngredientSyncStats(added=added, updated=updated, unchanged=unchanged, extras=extras)
+        extras = [target for target in remote.ingredients if _ingredient_identity(target) not in used_target_ids]
+        for target in extras:
+            remote_ingredient_id = target.remote_ingredient_id
+            if not remote_ingredient_id:
+                raise FatSecretError(
+                    f"{client.account.label}: у лишнего ингредиента «{target.title}» нет FatSecret iid; "
+                    "точная синхронизация невозможна"
+                )
+            if not await client.delete_ingredient(remote_id, remote_ingredient_id):
+                raise FatSecretError(
+                    f"{client.account.label}: FatSecret не удалил лишний ингредиент «{target.title}»"
+                )
+            deleted += 1
+        return IngredientSyncStats(added=added, updated=updated, unchanged=unchanged, deleted=deleted)

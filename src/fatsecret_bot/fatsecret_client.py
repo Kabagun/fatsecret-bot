@@ -604,6 +604,17 @@ class FatSecretClient:
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
         return _looks_like_true(response.text)
 
+    async def delete_ingredient(self, remote_recipe_id: str, remote_ingredient_id: str) -> bool:
+        """Delete one ingredient from a recipe in the current FatSecret account."""
+        form = {
+            "action": "ingredientdelete",
+            "fl": "5",
+            "prid": remote_recipe_id,
+            "iid": remote_ingredient_id,
+        }
+        response = await self._post_android("RecipeActionAndroidPage.aspx", form)
+        return _looks_like_true(response.text)
+
     async def delete_recipe(self, remote_recipe_id: str) -> bool:
         """Delete a recipe from the current account's FatSecret cookbook."""
         form = {

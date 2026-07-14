@@ -21,6 +21,7 @@ class FakeFatSecretClient:
         target: Recipe,
         account_key: str = "target",
         delete_ok: bool = True,
+        ingredient_delete_ok: bool = True,
         details: dict[str, FoodSearchResult] | None = None,
     ) -> None:
         self.account = FatSecretAccountConfig(
@@ -33,7 +34,9 @@ class FakeFatSecretClient:
         )
         self.target = target
         self.delete_ok = delete_ok
+        self.ingredient_delete_ok = ingredient_delete_ok
         self.saved_ingredients: list[Ingredient] = []
+        self.deleted_ingredient_ids: list[str] = []
         self.deleted_recipe_ids: list[str] = []
         self.saved_meta: list[Recipe] = []
         self.details = details or {}
@@ -49,6 +52,11 @@ class FakeFatSecretClient:
         assert remote_recipe_id == self.target.id
         self.saved_ingredients.append(ingredient)
         return True
+
+    async def delete_ingredient(self, remote_recipe_id: str, remote_ingredient_id: str) -> bool:
+        assert remote_recipe_id == self.target.id
+        self.deleted_ingredient_ids.append(remote_ingredient_id)
+        return self.ingredient_delete_ok
 
     async def delete_recipe(self, remote_recipe_id: str) -> bool:
         self.deleted_recipe_ids.append(remote_recipe_id)
@@ -353,10 +361,43 @@ def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> No
         assert stats.added == 1
         assert stats.updated == 1
         assert stats.unchanged == 0
-        assert stats.extras == 1
+        assert stats.deleted == 1
         assert client.saved_ingredients[0].remote_ingredient_id == "iid-1"
         assert client.saved_ingredients[0].amount == Decimal("125")
         assert client.saved_ingredients[1].remote_ingredient_id is None
+        assert client.deleted_ingredient_ids == ["iid-extra"]
+    finally:
+        storage.close()
+
+
+def test_sync_ingredients_fails_when_extra_cannot_be_deleted(tmp_path) -> None:
+    source = Recipe(id="local", title="Завтрак")
+    target = Recipe(id="remote-target", title="Завтрак")
+    target.ingredients = [
+        Ingredient(
+            id="iid-extra",
+            recipe_id="remote-target",
+            food_id="food-extra",
+            title="Лишнее",
+            portion_id="portion-extra",
+            amount=Decimal("1"),
+            remote_ingredient_id="iid-extra",
+        )
+    ]
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeFatSecretClient(target, ingredient_delete_ok=False)
+
+        try:
+            asyncio.run(engine._sync_ingredients(client, source, target.id))
+        except FatSecretError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected FatSecretError")
+
+        assert "не удалил лишний ингредиент «Лишнее»" in message
+        assert client.deleted_ingredient_ids == ["iid-extra"]
     finally:
         storage.close()
 
@@ -1797,7 +1838,22 @@ def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path
                 amount=Decimal("2"),
             )
         ]
-        target_recipe = Recipe(id="222", title="Омлет", group_id="group")
+        target_recipe = Recipe(
+            id="222",
+            title="Омлет",
+            group_id="group",
+            ingredients=[
+                Ingredient(
+                    id="iid-extra",
+                    recipe_id="222",
+                    food_id="food-extra",
+                    title="Лишнее",
+                    portion_id="portion-extra",
+                    amount=Decimal("1"),
+                    remote_ingredient_id="iid-extra",
+                )
+            ],
+        )
         recipe_ref = Recipe(
             id="local-live",
             title="Омлет",
@@ -1817,7 +1873,52 @@ def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path
         assert [result.ok for result in results] == [True, True]
         assert first.saved_meta
         assert second.saved_ingredients[0].title == "Яйцо"
+        assert second.deleted_ingredient_ids == ["iid-extra"]
+        assert results[1].message == "добавлено ингредиентов: 1; удалено лишних ингредиентов: 1"
         assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+def test_sync_live_recipe_reports_error_when_existing_target_extra_cannot_be_deleted(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(id="111", title="Омлет", group_id="group")
+        target_recipe = Recipe(
+            id="222",
+            title="Омлет",
+            group_id="group",
+            ingredients=[
+                Ingredient(
+                    id="iid-extra",
+                    recipe_id="222",
+                    food_id="food-extra",
+                    title="Лишнее",
+                    portion_id="portion-extra",
+                    amount=Decimal("1"),
+                    remote_ingredient_id="iid-extra",
+                )
+            ],
+        )
+        recipe_ref = Recipe(
+            id="local-live",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "111", "tg22": "222"},
+            remote_ids_by_account={"tg11": ["111"], "tg22": ["222"]},
+        )
+        source = FakeFatSecretClient(source_recipe, account_key="tg11")
+        target = FakeFatSecretClient(target_recipe, account_key="tg22", ingredient_delete_ok=False)
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": source, "tg22": target}  # type: ignore[method-assign]
+
+        synced, results = asyncio.run(engine.sync_live_recipe_from_source(recipe_ref, "tg11"))
+
+        assert [result.ok for result in results] == [True, False]
+        assert "не удалил лишний ингредиент «Лишнее»" in results[1].message
+        assert target.deleted_ingredient_ids == ["iid-extra"]
+        assert target.deleted_recipe_ids == []
+        assert synced.remote_ids == {"tg11": "111", "tg22": "222"}
     finally:
         storage.close()
 

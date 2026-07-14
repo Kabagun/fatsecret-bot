@@ -740,6 +740,42 @@ def test_add_ingredient_sends_prepared_portion_amount() -> None:
     assert form["portionamount"] == ["3"]
 
 
+def test_delete_ingredient_sends_recipe_and_ingredient_ids() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="True")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        FatSecretDeviceConfig(
+            app_version="11.5.0.4",
+            device="6",
+            build_sdk="30",
+            build_api="11",
+            build_model="NE2211",
+            build_resolution="1920x1080",
+            device_identifier="NE2211",
+        ),
+        http=http,
+    )
+    client._session = FatSecretSession(server_id="server", device_key="device", secret_key="secret")
+    try:
+        ok = asyncio.run(client.delete_ingredient("recipe-1", "ingredient-2"))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert ok is True
+    assert requests[0].url.path == "/android/RecipeActionAndroidPage.aspx"
+    form = parse_qs(requests[0].content.decode())
+    assert form["action"] == ["ingredientdelete"]
+    assert form["fl"] == ["5"]
+    assert form["prid"] == ["recipe-1"]
+    assert form["iid"] == ["ingredient-2"]
+
+
 def test_add_ingredient_converts_legacy_zero_portion_grams() -> None:
     requests: list[httpx.Request] = []
 
