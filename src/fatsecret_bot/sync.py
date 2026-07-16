@@ -1554,33 +1554,6 @@ class RecipeSyncEngine:
         )
         return _ingredient_with_food_id(ingredient, mapped_food_id) if mapped_food_id else ingredient
 
-    async def _ensure_custom_food_ingredient(
-        self,
-        source_client: FatSecretClient | None,
-        target_client: FatSecretClient,
-        source_account_key: str | None,
-        target_account_key: str | None,
-        ingredient: Ingredient,
-    ) -> Ingredient:
-        mapped = self._mapped_custom_food_ingredient(source_account_key, target_account_key, ingredient)
-        if mapped.food_id != ingredient.food_id:
-            return mapped
-        if source_client is None or source_account_key is None or target_account_key is None:
-            return ingredient
-        try:
-            definition = await source_client.get_custom_food_definition(ingredient.food_id)
-        except FatSecretNotCustomFoodError:
-            return ingredient
-        target_food_id = await target_client.create_custom_food(definition)
-        self.storage.set_custom_food_mapping(
-            source_account_key,
-            ingredient.food_id,
-            target_account_key,
-            target_food_id,
-            _custom_food_content_hash(definition),
-        )
-        return _ingredient_with_food_id(ingredient, target_food_id)
-
     async def _clone_custom_food_ingredient(
         self,
         source_client: FatSecretClient,
@@ -2164,9 +2137,7 @@ class RecipeSyncEngine:
         unchanged = 0
         deleted = 0
         for source_ingredient in recipe.ingredients:
-            ingredient = await self._ensure_custom_food_ingredient(
-                source_client,
-                client,
+            ingredient = self._mapped_custom_food_ingredient(
                 source_account_key,
                 target_account_key,
                 source_ingredient,

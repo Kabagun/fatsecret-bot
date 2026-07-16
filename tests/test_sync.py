@@ -515,9 +515,9 @@ def test_sync_ingredients_clones_custom_food_before_cross_account_add_and_reuses
         )
 
         assert stats.added == 1
-        assert [item.food_id for item in target.saved_ingredients] == [cloned_food_id]
-        assert target.saved_ingredients[0].amount == Decimal("0.75")
-        assert target.saved_ingredients[0].portion_id == "0"
+        assert [item.food_id for item in target.saved_ingredients] == [source_food_id, cloned_food_id]
+        assert target.saved_ingredients[1].amount == Decimal("0.75")
+        assert target.saved_ingredients[1].portion_id == "0"
         assert target.created_custom_foods == [definition]
         assert source.custom_food_requests == [source_food_id]
         assert storage.custom_food_mapping("tg-source", source_food_id, "tg-target") == cloned_food_id
