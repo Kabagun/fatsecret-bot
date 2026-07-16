@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 from decimal import Decimal
+from typing import Callable
 from urllib.parse import parse_qs
 
 import httpx
@@ -11,11 +13,12 @@ from fatsecret_bot.fatsecret_client import (
     FatSecretClient,
     FatSecretError,
     parse_recipe_initial_save_response,
+    user_safe_error_message,
 )
 from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession, FoodSearchResult, Ingredient, Recipe
 
 
-def _client() -> FatSecretClient:
+def _client(*, today_provider: Callable[[], dt.date] | None = None) -> FatSecretClient:
     return FatSecretClient(
         FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
         FatSecretDeviceConfig(
@@ -27,6 +30,7 @@ def _client() -> FatSecretClient:
             build_resolution="1920x1080",
             device_identifier="NE2211",
         ),
+        today_provider=today_provider,
     )
 
 
@@ -114,6 +118,31 @@ def test_parse_food_detail_extracts_real_gram_portion_from_recipe_page() -> None
     assert detail.energy_per_portion == Decimal("147.00")
     assert detail.default_portion_id == "10270"
     assert detail.default_portion_description == "средний"
+
+
+def test_generic_request_date_uses_injected_timezone_date() -> None:
+    current = dt.date(2030, 1, 2)
+    client = _client(today_provider=lambda: current)
+
+    assert client._build_query(include_auth=False, include_build=False)["dt"] == "21916"
+    assert client._common_form(FatSecretSession("server", "device", "secret"))["dt"] == "21916"
+    assert client._app_headers()["fs_dt"] == "21916"
+
+
+def test_user_safe_error_message_preserves_structured_action_diagnostics_only() -> None:
+    action_error = FatSecretActionError(
+        "RecipeActionAndroidPage.aspx failed with HTTP 302 (action=ingredientsave, replayed=yes)",
+        status_code=302,
+        page="RecipeActionAndroidPage.aspx",
+        action="ingredientsave",
+        location="/ErrorLogUserFeedback.ashx",
+        replayed=True,
+    )
+
+    assert user_safe_error_message(action_error) == str(action_error)
+    assert user_safe_error_message(RuntimeError("database-password")) == (
+        "Внутренняя ошибка. Подробности записаны в журнал бота."
+    )
 
 
 def test_parse_food_detail_ignores_synthetic_negative_gram_portion() -> None:

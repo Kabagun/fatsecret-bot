@@ -8,7 +8,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -17,6 +17,7 @@ from .fatsecret_client import (
     FatSecretClient,
     FatSecretError,
     FatSecretNotCustomFoodError,
+    user_safe_error_message,
 )
 from .models import (
     CustomFoodDefinition,
@@ -31,10 +32,10 @@ from .models import (
     Ingredient,
     Recipe,
 )
+from .portions import grams_from_portion, is_explicit_weight_portion, portion_unit_size
 from .storage import Storage, normalize_title
 
 logger = logging.getLogger(__name__)
-PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
 SEARCH_TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 INGREDIENT_NORMALIZE_CONCURRENCY = 6
 MAX_DIARY_COPY_DAYS = 7
@@ -482,18 +483,8 @@ def _sync_description(now: dt.datetime | None = None, timezone: str = "Europe/Mi
     return f"Последняя синхронизация: {value:%d.%m.%Y %H:%M}"
 
 
-def _portion_unit_size(description: str) -> Decimal | None:
-    match = PORTION_UNIT_RE.search(description.replace("\xa0", " "))
-    if not match:
-        return None
-    try:
-        return Decimal(match.group(1).replace(",", "."))
-    except InvalidOperation:
-        return None
-
-
 def _amount_for_grams(grams: Decimal, portion_description: str) -> Decimal:
-    unit_size = _portion_unit_size(portion_description)
+    unit_size = portion_unit_size(portion_description)
     if unit_size is None or unit_size == 0:
         return grams
     return grams / unit_size
@@ -501,11 +492,6 @@ def _amount_for_grams(grams: Decimal, portion_description: str) -> Decimal:
 
 def _gram_portion_amount(grams: Decimal) -> Decimal:
     return _amount_for_grams(grams, "100г")
-
-
-def _is_explicit_weight_portion(description: str) -> bool:
-    normalized = description.strip().casefold()
-    return normalized in {"г", "гр", "g", "gram", "grams", "грам"} or _portion_unit_size(description) is not None
 
 
 def _ingredient_grams(ingredient: Ingredient) -> Decimal:
@@ -516,19 +502,13 @@ def _ingredient_grams(ingredient: Ingredient) -> Decimal:
 def _ingredient_grams_or_none(ingredient: Ingredient) -> Decimal | None:
     if ingredient.grams is not None:
         return ingredient.grams
-    unit_size = _portion_unit_size(ingredient.portion_description)
-    if unit_size is not None and unit_size > 0:
-        return ingredient.amount * unit_size
-    normalized = ingredient.portion_description.strip().casefold()
-    if normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}:
-        return ingredient.amount
-    return None
+    return grams_from_portion(ingredient.amount, ingredient.portion_description)
 
 
 def _food_result_portion_grams(result: FoodSearchResult) -> Decimal | None:
     if result.grams_per_portion is not None and result.grams_per_portion > 0:
         return result.grams_per_portion
-    unit_size = _portion_unit_size(result.default_portion_description)
+    unit_size = portion_unit_size(result.default_portion_description)
     if unit_size is not None and unit_size > 0:
         return unit_size
     return None
@@ -540,7 +520,7 @@ def _ingredient_current_portion_sends_grams(ingredient: Ingredient, grams: Decim
     portion_id = ingredient.portion_id or "0"
     if portion_id == "0":
         return False
-    if not _is_explicit_weight_portion(ingredient.portion_description):
+    if not is_explicit_weight_portion(ingredient.portion_description):
         return False
     return _same_decimal(
         ingredient.amount,
@@ -551,7 +531,7 @@ def _ingredient_current_portion_sends_grams(ingredient: Ingredient, grams: Decim
 def _food_result_has_usable_gram_portion(result: FoodSearchResult) -> bool:
     if result.raw.get("_gram_portion_id"):
         return True
-    return (result.default_portion_id or "0") != "0" and _is_explicit_weight_portion(
+    return (result.default_portion_id or "0") != "0" and is_explicit_weight_portion(
         result.default_portion_description
     )
 
@@ -582,7 +562,7 @@ def _ingredient_from_food_result(
         )
     portion_id = result.default_portion_id or "0"
     portion_description = result.default_portion_description or ""
-    if portion_id != "0" and _is_explicit_weight_portion(portion_description):
+    if portion_id != "0" and is_explicit_weight_portion(portion_description):
         return Ingredient(
             id=id or str(uuid.uuid4()),
             recipe_id=recipe_id,
@@ -728,6 +708,14 @@ class RecipeSyncEngine:
     async def close(self) -> None:
         return None
 
+    def _current_date(self) -> dt.date:
+        """Return today's date in the configured timezone for generic FatSecret fields."""
+        try:
+            timezone = ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError:
+            timezone = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+        return dt.datetime.now(timezone).date()
+
     def _build_clients(self, group_id: str | None = None) -> dict[str, FatSecretClient]:
         accounts = self.storage.list_fatsecret_accounts(group_id)
         if not accounts:
@@ -743,6 +731,7 @@ class RecipeSyncEngine:
                 account_key,
                 session,
             ),
+            today_provider=self._current_date,
         )
 
     async def _close_clients(self, clients: dict[str, FatSecretClient]) -> None:
@@ -868,9 +857,11 @@ class RecipeSyncEngine:
                 for target_date in _inclusive_dates(target_start, target_end):
                     if target_account_key == source_account_key and target_date == source_date:
                         continue
+                    self.storage.touch_diary_copy_run(run_id)
                     try:
                         writes: list[FoodDiaryWriteEntry] = []
                         for index, entry in enumerate(entries):
+                            self.storage.touch_diary_copy_run(run_id)
                             mapped_recipe_id, mapped_portion_id = await self._map_diary_entry(
                                 source_account_key,
                                 target_account_key,
@@ -891,9 +882,20 @@ class RecipeSyncEngine:
                                 )
                             )
                         response = await target_client.bulk_update_food_diary(target_date, writes)
-                        failed = len(response.failed_entries)
-                        inserted = len(writes) - failed
-                        message = "добавлено" if not failed else "; ".join(sorted(set(response.failed_entries.values())))
+                        expected_references = {write.reference for write in writes}
+                        inserted_references = expected_references.intersection(response.inserted_entries)
+                        inserted = len(inserted_references)
+                        failed = len(writes) - inserted
+                        explicit_failures = {
+                            reference: message
+                            for reference, message in response.failed_entries.items()
+                            if reference in expected_references and reference not in inserted_references
+                        }
+                        failure_messages = sorted(set(explicit_failures.values()))
+                        unconfirmed = failed - len(explicit_failures)
+                        if unconfirmed > 0:
+                            failure_messages.append(f"FatSecret не подтвердил записей: {unconfirmed}")
+                        message = "добавлено" if not failed else "; ".join(failure_messages)
                         date_results.append(
                             DiaryCopyDateResult(
                                 account_key=target_account_key,
@@ -911,11 +913,16 @@ class RecipeSyncEngine:
                                 date=target_date,
                                 inserted=0,
                                 failed=len(entries),
-                                message=str(exc),
+                                message=user_safe_error_message(exc),
                             )
                         )
+                    finally:
+                        self.storage.touch_diary_copy_run(run_id)
         except Exception as exc:  # noqa: BLE001 - persist a terminal idempotency result.
-            result_data = {"dates": [_diary_copy_date_result_to_dict(item) for item in date_results], "error": str(exc)}
+            result_data = {
+                "dates": [_diary_copy_date_result_to_dict(item) for item in date_results],
+                "error": user_safe_error_message(exc),
+            }
             self.storage.finish_diary_copy_run(run_id, "failed", result_data)
             raise
         finally:
@@ -1032,11 +1039,16 @@ class RecipeSyncEngine:
         ingredients: list[Ingredient] = []
         try:
             for account_key, client in clients.items():
+                detail_tasks: dict[str, asyncio.Task[FoodSearchResult]] = {}
                 summaries = await client.cookbook()
                 for summary in summaries:
                     try:
                         recipe = await client.get_recipe(summary.remote_id)
-                        recipe.ingredients = await self._normalize_recipe_ingredients(client, recipe.ingredients)
+                        recipe.ingredients = await self._normalize_recipe_ingredients(
+                            client,
+                            recipe.ingredients,
+                            detail_tasks=detail_tasks,
+                        )
                     except Exception:  # noqa: BLE001 - keep one broken recipe from poisoning the whole cache.
                         logger.debug(
                             "food usage cache recipe load failed for %s/%s",
@@ -1074,10 +1086,12 @@ class RecipeSyncEngine:
         self,
         client: FatSecretClient,
         ingredients: list[Ingredient],
+        *,
+        detail_tasks: dict[str, asyncio.Task[FoodSearchResult]] | None = None,
     ) -> list[Ingredient]:
         if len(ingredients) <= 1:
             return [
-                await self._normalize_recipe_ingredient(client, ingredient)
+                await self._normalize_recipe_ingredient(client, ingredient, detail_tasks=detail_tasks)
                 for ingredient in ingredients
             ]
         await client.ensure_logged_in()
@@ -1085,7 +1099,7 @@ class RecipeSyncEngine:
 
         async def normalize_one(ingredient: Ingredient) -> Ingredient:
             async with semaphore:
-                return await self._normalize_recipe_ingredient(client, ingredient)
+                return await self._normalize_recipe_ingredient(client, ingredient, detail_tasks=detail_tasks)
 
         return list(await asyncio.gather(*(normalize_one(ingredient) for ingredient in ingredients)))
 
@@ -1093,19 +1107,27 @@ class RecipeSyncEngine:
         self,
         client: FatSecretClient,
         ingredient: Ingredient,
+        *,
+        detail_tasks: dict[str, asyncio.Task[FoodSearchResult]] | None = None,
     ) -> Ingredient:
         grams = _ingredient_grams_or_none(ingredient)
         metadata: FoodSearchResult | None = None
         if ingredient.food_id and not _ingredient_current_portion_sends_grams(ingredient, grams):
             try:
-                metadata = await client.resolve_food_detail(
-                    FoodSearchResult(
-                        food_id=ingredient.food_id,
-                        title=ingredient.title,
-                        default_portion_id=ingredient.portion_id or "0",
-                        default_portion_description=ingredient.portion_description,
-                    )
+                detail_input = FoodSearchResult(
+                    food_id=ingredient.food_id,
+                    title=ingredient.title,
+                    default_portion_id=ingredient.portion_id or "0",
+                    default_portion_description=ingredient.portion_description,
                 )
+                if detail_tasks is None:
+                    metadata = await client.resolve_food_detail(detail_input)
+                else:
+                    task = detail_tasks.get(ingredient.food_id)
+                    if task is None:
+                        task = asyncio.create_task(client.resolve_food_detail(detail_input))
+                        detail_tasks[ingredient.food_id] = task
+                    metadata = await task
             except Exception:  # noqa: BLE001 - keep the recipe usable if one food detail lookup fails.
                 logger.debug("ingredient gram normalization detail lookup failed for %s", ingredient.title, exc_info=True)
 
@@ -1139,7 +1161,7 @@ class RecipeSyncEngine:
             )
 
         portion_id = ingredient.portion_id or "0"
-        if portion_id != "0" and _is_explicit_weight_portion(ingredient.portion_description):
+        if portion_id != "0" and is_explicit_weight_portion(ingredient.portion_description):
             return Ingredient(
                 id=ingredient.id,
                 recipe_id=ingredient.recipe_id,
@@ -1474,7 +1496,6 @@ class RecipeSyncEngine:
         finally:
             if clients is not None:
                 await self._close_clients(clients)
-        return []
 
     async def _resolve_food_from_remote(self, client: FatSecretClient, query: str) -> FoodSearchResult | None:
         candidates = await client.search_recipes(query)
@@ -1923,7 +1944,7 @@ class RecipeSyncEngine:
                     results.append(AccountSyncResult(account_key, remote_id, True, "создан"))
                 except Exception as exc:  # noqa: BLE001 - keep per-account creation isolated.
                     rollback_message = await self._rollback_created_recipe(client, remote_id)
-                    message = str(exc)
+                    message = user_safe_error_message(exc)
                     if rollback_message:
                         message = f"{message} {rollback_message}"
                     failed.append(AccountSyncResult(account_key, None, False, message))
@@ -1971,7 +1992,9 @@ class RecipeSyncEngine:
                                 raise FatSecretError(f"{client.account.label}: recipe metadata rename returned false")
                             rename_results.append(AccountSyncResult(account_key, remote_id, True, "переименован"))
                         except Exception as exc:  # noqa: BLE001 - keep created replacement accessible.
-                            rename_results.append(AccountSyncResult(account_key, remote_id, False, str(exc)))
+                            rename_results.append(
+                                AccountSyncResult(account_key, remote_id, False, user_safe_error_message(exc))
+                            )
                     if all(result.ok for result in rename_results):
                         self.storage.update_recipe_from_remote(
                             recipe_id=recipe.id,
@@ -2030,7 +2053,11 @@ class RecipeSyncEngine:
                 client.account.label,
                 remote_id,
             )
-            return False, f"{client.account.label}: созданный рецепт {remote_id} не удалось удалить после ошибки: {exc}"
+            return (
+                False,
+                f"{client.account.label}: созданный рецепт {remote_id} не удалось удалить после ошибки: "
+                f"{user_safe_error_message(exc)}",
+            )
         if ok:
             logger.info(
                 "Recipe rollback completed account=%s remote_recipe_id=%s deleted=true",
@@ -2201,7 +2228,7 @@ class RecipeSyncEngine:
                         remote_id or "-",
                         created_target,
                     )
-                    message = str(exc)
+                    message = user_safe_error_message(exc)
                     if created_target and remote_id:
                         rolled_back, rollback_message = await self._rollback_created_recipe_with_status(client, remote_id)
                         if rollback_message:
@@ -2336,7 +2363,7 @@ class RecipeSyncEngine:
                         remote_id or "-",
                         created_target,
                     )
-                    message = str(exc)
+                    message = user_safe_error_message(exc)
                     if created_target and remote_id:
                         rolled_back, rollback_message = await self._rollback_created_recipe_with_status(client, remote_id)
                         if rollback_message:
@@ -2375,7 +2402,9 @@ class RecipeSyncEngine:
                 try:
                     results[recipe_id] = await self._delete_recipe_with_clients(recipe_id, clients)
                 except Exception as exc:  # noqa: BLE001 - keep batch deletion moving.
-                    results[recipe_id] = [AccountSyncResult("local", None, False, str(exc))]
+                    results[recipe_id] = [
+                        AccountSyncResult("local", None, False, user_safe_error_message(exc))
+                    ]
         finally:
             await self._close_clients(clients)
         return results
@@ -2395,7 +2424,7 @@ class RecipeSyncEngine:
             try:
                 results[recipe.id] = await self.delete_live_recipe_everywhere(recipe)
             except Exception as exc:  # noqa: BLE001 - keep batch deletion moving.
-                results[recipe.id] = [AccountSyncResult("local", None, False, str(exc))]
+                results[recipe.id] = [AccountSyncResult("local", None, False, user_safe_error_message(exc))]
         return results
 
     async def _delete_recipe_with_clients(
@@ -2428,7 +2457,7 @@ class RecipeSyncEngine:
                 results.append(AccountSyncResult(account_key, remote_id, True, "удален в FatSecret"))
             except Exception as exc:  # noqa: BLE001 - keep per-account deletion isolated.
                 self.storage.record_sync(recipe.id, account_key, "error", str(exc))
-                results.append(AccountSyncResult(account_key, remote_id, False, str(exc)))
+                results.append(AccountSyncResult(account_key, remote_id, False, user_safe_error_message(exc)))
 
         for account_key in deleted_account_keys:
             self.storage.delete_remote_recipe_id(recipe.id, account_key)
@@ -2456,7 +2485,7 @@ class RecipeSyncEngine:
                     self.storage.remove_remote_recipe_mapping(account_key, remote_id)
                     results.append(AccountSyncResult(account_key, remote_id, True, "удален в FatSecret"))
                 except Exception as exc:  # noqa: BLE001 - keep per-account deletion isolated.
-                    results.append(AccountSyncResult(account_key, remote_id, False, str(exc)))
+                    results.append(AccountSyncResult(account_key, remote_id, False, user_safe_error_message(exc)))
         return results
 
     async def _ensure_remote_recipe(

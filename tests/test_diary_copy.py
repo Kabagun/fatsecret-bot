@@ -56,6 +56,7 @@ class FakeDiaryClient:
         self.created_custom_foods: list[CustomFoodDefinition] = []
         self.recipes: dict[str, Recipe] = {}
         self.created_recipe_id = "202"
+        self.bulk_result: FoodDiaryBulkResult | None = None
 
     async def get_food_diary_day(self, date: dt.date) -> FoodDiaryDay:
         assert self.source_day is not None
@@ -68,6 +69,8 @@ class FakeDiaryClient:
         entries: list[FoodDiaryWriteEntry],
     ) -> FoodDiaryBulkResult:
         self.bulk_calls.append((date, entries))
+        if self.bulk_result is not None:
+            return self.bulk_result
         return FoodDiaryBulkResult(
             inserted_entries={entry.reference: str(index + 1) for index, entry in enumerate(entries)},
             failed_entries={},
@@ -176,6 +179,41 @@ def test_diary_copy_appends_to_both_accounts_skips_exact_source_and_is_idempoten
         assert sum(item.inserted for item in first.dates) == 5
         assert second == first
         assert len(source.bulk_calls) + len(target.bulk_calls) == 5
+    finally:
+        storage.close()
+
+
+def test_diary_copy_counts_only_confirmed_insertions(tmp_path) -> None:
+    storage, group_id = _storage_with_group(tmp_path)
+    try:
+        source = FakeDiaryClient(_account("tg11"), _source_day())
+        target = FakeDiaryClient(_account("tg22"))
+        target.bulk_result = FoodDiaryBulkResult(inserted_entries={}, failed_entries={})
+        clients = {"tg11": source, "tg22": target}
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_client = lambda account: clients[account.key]  # type: ignore[method-assign]
+        engine._build_clients = lambda group_id=None: clients  # type: ignore[method-assign]
+
+        preview = asyncio.run(
+            engine.prepare_diary_copy(
+                group_id,
+                11,
+                "tg11",
+                dt.date(2026, 7, 14),
+                dt.date(2026, 7, 14),
+                dt.date(2026, 7, 14),
+            )
+        )
+        result = asyncio.run(engine.execute_diary_copy(preview.run_id))
+
+        assert result.status == "partial"
+        assert len(result.dates) == 1
+        assert result.dates[0].inserted == 0
+        assert result.dates[0].failed == 1
+        assert result.dates[0].message == "FatSecret не подтвердил записей: 1"
+        stored = storage.diary_copy_run(preview.run_id)
+        assert stored is not None
+        assert stored["status"] == "partial"
     finally:
         storage.close()
 

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import datetime as dt
+import os
+import sqlite3
 from decimal import Decimal
+
+import pytest
 
 from fatsecret_bot.models import FatSecretSession, RecipeSummary
 from fatsecret_bot.storage import Storage, normalize_title
@@ -238,6 +243,17 @@ def test_migration_normalizes_legacy_zero_portion_gram_ingredients(tmp_path) -> 
     finally:
         storage.close()
 
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE ingredients
+            SET amount = '5', portion_description = 'г', grams = NULL
+            WHERE recipe_id = ?
+            """,
+            (recipe_id,),
+        )
+        connection.execute("PRAGMA user_version = 0")
+
     storage = Storage(db_path)
     try:
         recipe = storage.get_recipe(recipe_id)
@@ -246,6 +262,53 @@ def test_migration_normalizes_legacy_zero_portion_gram_ingredients(tmp_path) -> 
         assert recipe.ingredients[0].amount == Decimal("0.05")
         assert recipe.ingredients[0].portion_description == "100г"
         assert recipe.ingredients[0].grams == Decimal("5")
+        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    finally:
+        storage.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are enforced on production Linux")
+def test_storage_restricts_existing_database_permissions(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    db_path.touch(mode=0o644)
+    db_path.chmod(0o644)
+
+    storage = Storage(db_path)
+    try:
+        assert db_path.stat().st_mode & 0o777 == 0o600
+        assert storage._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        storage.close()
+
+
+def test_diary_copy_claim_rejects_active_run_and_reclaims_stale_heartbeat(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        run_id = storage.create_diary_copy_run(
+            "group",
+            11,
+            "tg11",
+            dt.date(2026, 7, 14),
+            dt.date(2026, 7, 15),
+            dt.date(2026, 7, 15),
+            {"entries": []},
+        )
+        started_at = dt.datetime(2026, 7, 16, 10, 0, tzinfo=dt.UTC)
+
+        assert storage.claim_diary_copy_run(run_id, now=started_at) is True
+        assert storage.claim_diary_copy_run(run_id, now=started_at + dt.timedelta(minutes=29)) is False
+        assert storage.touch_diary_copy_run(run_id, now=started_at + dt.timedelta(minutes=20)) is True
+        assert storage.claim_diary_copy_run(run_id, now=started_at + dt.timedelta(minutes=49)) is False
+        assert storage.claim_diary_copy_run(run_id, now=started_at + dt.timedelta(minutes=51)) is True
+
+        run = storage.diary_copy_run(run_id)
+        assert run is not None
+        assert run["status"] == "running"
+        assert run["created_at"]
+        assert run["updated_at"] == (started_at + dt.timedelta(minutes=51)).isoformat()
+
+        storage.finish_diary_copy_run(run_id, "completed", {"dates": []})
+        assert storage.claim_diary_copy_run(run_id, now=started_at + dt.timedelta(days=1)) is False
     finally:
         storage.close()
 

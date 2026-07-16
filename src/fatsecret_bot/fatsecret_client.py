@@ -28,6 +28,7 @@ from .models import (
     Recipe,
     RecipeSummary,
 )
+from .portions import grams_from_portion, is_bare_weight_portion, is_explicit_weight_portion
 
 
 class FatSecretError(RuntimeError):
@@ -59,13 +60,19 @@ class FatSecretNotCustomFoodError(FatSecretError):
     """Requested FatSecret food is not owned by the current account."""
 
 
+def user_safe_error_message(exc: BaseException) -> str:
+    """Return diagnostic text only for errors designed to be shown to bot users."""
+    if isinstance(exc, FatSecretError):
+        return str(exc)
+    return "Внутренняя ошибка. Подробности записаны в журнал бота."
+
+
 logger = logging.getLogger(__name__)
 FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
 DIARY_BULK_UPDATE_URL = "https://app.ftscrt.com/api/user-data/v1/update-journal-entries"
 FOOD_SEARCH_PAGE_SIZE = 10
 AUTH_RETRY_STATUS_CODES = {401, 403, 500}
 SAFE_ANDROID_CONTEXT_FIELDS = ("action", "prid", "rid", "iid", "entryname", "portionid", "portionamount")
-PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
 
 
 def _safe_context_value(value: str, limit: int = 200) -> str:
@@ -220,11 +227,6 @@ def _default_portion_id(data: dict[str, Any]) -> str:
     return "0"
 
 
-def _explicit_weight_portion_description(description: str) -> bool:
-    normalized = description.strip().casefold()
-    return normalized in {"г", "гр", "g", "gram", "grams", "грам"} or _portion_unit_size(description) is not None
-
-
 def _recipe_portions(root: ET.Element) -> list[dict[str, str]]:
     portions: list[dict[str, str]] = []
     for node in root.findall(".//recipeportion"):
@@ -252,9 +254,9 @@ def _gram_recipe_portion(portions: list[dict[str, str]]) -> dict[str, str] | Non
         if not portion_id.isdecimal() or int(portion_id) <= 0:
             continue
         description = portion.get("description", "")
-        if _bare_weight_portion_description(description):
+        if is_bare_weight_portion(description):
             return portion
-        if explicit_weight is None and _explicit_weight_portion_description(description):
+        if explicit_weight is None and is_explicit_weight_portion(description):
             explicit_weight = portion
     return explicit_weight
 
@@ -269,26 +271,11 @@ def _scale_per_100g(value: Decimal | None, grams_per_portion: Decimal | None) ->
     return value * Decimal("100") / grams_per_portion
 
 
-def _bare_weight_portion_description(description: str) -> bool:
-    normalized = description.strip().casefold()
-    return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}
-
-
-def _portion_unit_size(description: str) -> Decimal | None:
-    match = PORTION_UNIT_RE.search(description.replace("\xa0", " "))
-    if match is None:
-        return None
-    try:
-        return Decimal(match.group(1).replace(",", "."))
-    except InvalidOperation:
-        return None
-
-
 def _ingredient_grams(amount: Decimal, portion_description: str, node: ET.Element | None = None) -> Decimal | None:
+    explicit_grams: Decimal | None = None
+    grams_per_portion: Decimal | None = None
     if node is not None:
         explicit_grams = _first_xml_decimal(node, "grams", "gram", "weight")
-        if explicit_grams is not None:
-            return explicit_grams
         grams_per_portion = _first_xml_decimal(
             node,
             "gramsPerPortion",
@@ -296,19 +283,16 @@ def _ingredient_grams(amount: Decimal, portion_description: str, node: ET.Elemen
             "servingamount",
             "servingAmount",
         )
-        if grams_per_portion is not None and grams_per_portion > 0:
-            return amount * grams_per_portion
-
-    unit_size = _portion_unit_size(portion_description)
-    if unit_size is not None and unit_size > 0:
-        return amount * unit_size
-    if _bare_weight_portion_description(portion_description):
-        return amount
-    return None
+    return grams_from_portion(
+        amount,
+        portion_description,
+        explicit_grams=explicit_grams,
+        grams_per_portion=grams_per_portion,
+    )
 
 
 def _ingredient_portion_amount(ingredient: Ingredient) -> Decimal:
-    if (ingredient.portion_id or "0") == "0" and _bare_weight_portion_description(ingredient.portion_description):
+    if (ingredient.portion_id or "0") == "0" and is_bare_weight_portion(ingredient.portion_description):
         return ingredient.amount / Decimal("100")
     return ingredient.amount
 
@@ -388,6 +372,7 @@ class FatSecretClient:
         http: httpx.AsyncClient | None = None,
         session: FatSecretSession | None = None,
         session_saver: Callable[[FatSecretSession], None] | None = None,
+        today_provider: Callable[[], dt.date] | None = None,
     ) -> None:
         self.account = account
         self.device = device
@@ -396,6 +381,7 @@ class FatSecretClient:
         self._session: FatSecretSession | None = session
         self._session_generation = 0
         self._session_saver = session_saver
+        self._today_provider = today_provider or dt.date.today
         self._auth_lock = asyncio.Lock()
 
     async def close(self) -> None:
@@ -938,7 +924,7 @@ class FatSecretClient:
             "c_fl": "1",
             "c_s": session.secret_key,
             "c_d": session.device_key,
-            "dt": days_since_epoch(),
+            "dt": days_since_epoch(self._today_provider()),
             "app_version": self.device.app_version,
             "lang": self.account.language,
             "mkt": self.account.market,
@@ -947,7 +933,7 @@ class FatSecretClient:
 
     def _build_query(self, include_auth: bool, include_build: bool) -> dict[str, str]:
         query = {
-            "dt": days_since_epoch(),
+            "dt": days_since_epoch(self._today_provider()),
             "app_version": self.device.app_version,
             "lang": self.account.language,
             "mkt": self.account.market,
@@ -1002,7 +988,7 @@ class FatSecretClient:
         headers.update(
             {
                 "fs_device": "android",
-                "fs_dt": days_since_epoch(),
+                "fs_dt": days_since_epoch(self._today_provider()),
                 "app_version": self.device.app_version,
                 "device": self.device.device,
                 "market": self.account.market,
@@ -1356,7 +1342,7 @@ class FatSecretClient:
                 result.fat_per_portion,
             )
         )
-        has_gram_portion = bool(result.raw.get("_gram_portion_id")) or _explicit_weight_portion_description(
+        has_gram_portion = bool(result.raw.get("_gram_portion_id")) or is_explicit_weight_portion(
             result.default_portion_description
         )
         if has_macro_detail and has_gram_portion:

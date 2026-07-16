@@ -22,6 +22,7 @@ from telegram.ext import (
     filters,
 )
 
+from .fatsecret_client import user_safe_error_message
 from .models import (
     MAX_RECIPE_STEPS,
     DiaryCopyPreview,
@@ -499,6 +500,7 @@ class TelegramRecipeBot:
         app = (
             Application.builder()
             .token(self.token)
+            .concurrent_updates(False)
             .post_init(self._post_init)
             .post_shutdown(self._post_shutdown)
             .build()
@@ -537,6 +539,10 @@ class TelegramRecipeBot:
         return target
 
     async def _post_init(self, app: Application) -> None:
+        if not self.allowed_user_ids:
+            logger.warning(
+                "TELEGRAM_ALLOWED_USER_IDS is empty; only users already registered in SQLite are authorized"
+            )
         if self._food_usage_refresh_task is not None and not self._food_usage_refresh_task.done():
             return
         self._food_usage_refresh_task = asyncio.create_task(
@@ -579,7 +585,7 @@ class TelegramRecipeBot:
             return True
         if self.storage.is_registered_user(telegram_id):
             return True
-        return not self.allowed_user_ids and self.storage.registered_user_count() < 2
+        return False
 
     def _recipe_cache(self, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> list[Recipe] | None:
         if context.chat_data.get(RECIPE_CACHE_GROUP_KEY) != group_id:
@@ -985,7 +991,7 @@ class TelegramRecipeBot:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("diary copy preview failed")
-            await status.edit_text(f"Не удалось подготовить копирование: {exc}")
+            await status.edit_text(f"Не удалось подготовить копирование: {user_safe_error_message(exc)}")
             return
         context.user_data["mode"] = "diary_confirm"
         context.user_data["diary_run_id"] = preview.run_id
@@ -1046,7 +1052,7 @@ class TelegramRecipeBot:
             result = await self.sync_engine.execute_diary_copy(run_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("diary copy execution failed")
-            await query.edit_message_text(f"Копирование не выполнено: {exc}")
+            await query.edit_message_text(f"Копирование не выполнено: {user_safe_error_message(exc)}")
             return
         context.user_data.clear()
         await query.edit_message_text(self._format_diary_result(result, active_group.id))
@@ -1091,7 +1097,7 @@ class TelegramRecipeBot:
             all_recipes = await self.sync_engine.load_remote_recipe_index(group.id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("live recipe list load failed")
-            await status.edit_text(f"Ошибка загрузки рецептов из FatSecret: {exc}")
+            await status.edit_text(f"Ошибка загрузки рецептов из FatSecret: {user_safe_error_message(exc)}")
             return
         self._set_recipe_cache(context, group.id, all_recipes)
         recipes, page, total_count = self._recipe_page(all_recipes, page)
@@ -1492,7 +1498,7 @@ class TelegramRecipeBot:
             recipes = await self.sync_engine.load_remote_recipe_index(group.id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("refresh failed")
-            await query.edit_message_text(f"Ошибка обновления: {exc}")
+            await query.edit_message_text(f"Ошибка обновления: {user_safe_error_message(exc)}")
             return
         self._set_recipe_cache(context, group.id, recipes)
         await self._edit_recipe_list(query, 0, context)
@@ -1610,7 +1616,7 @@ class TelegramRecipeBot:
                 results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
         except Exception as exc:  # noqa: BLE001
             logger.exception("sync failed")
-            await query.edit_message_text(f"Ошибка синхронизации: {exc}")
+            await query.edit_message_text(f"Ошибка синхронизации: {user_safe_error_message(exc)}")
             return
         lines = [
             f"{account_labels.get(result.account_key, result.account_key)}: {'OK' if result.ok else 'ERROR'}"
@@ -1660,7 +1666,7 @@ class TelegramRecipeBot:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("delete failed")
-            await query.edit_message_text(f"Ошибка удаления: {exc}")
+            await query.edit_message_text(f"Ошибка удаления: {user_safe_error_message(exc)}")
             return
         if results and all(result.ok for result in results):
             self._remove_cached_recipe(context, recipe.group_id, recipe_id)
@@ -1750,7 +1756,7 @@ class TelegramRecipeBot:
                 results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
         except Exception as exc:  # noqa: BLE001
             logger.exception("sync failed")
-            await status.edit_text(f"Ошибка синхронизации: {exc}")
+            await status.edit_text(f"Ошибка синхронизации: {user_safe_error_message(exc)}")
             return
         lines = [
             f"{account_labels.get(result.account_key, result.account_key)}: {'OK' if result.ok else 'ERROR'}"
@@ -1954,7 +1960,7 @@ class TelegramRecipeBot:
             results_by_recipe = await self.sync_engine.delete_live_recipes_everywhere(selected_recipes)
         except Exception as exc:  # noqa: BLE001
             logger.exception("batch delete failed")
-            await query.edit_message_text(f"Ошибка batch удаления: {exc}")
+            await query.edit_message_text(f"Ошибка batch удаления: {user_safe_error_message(exc)}")
             return
         account_labels = {account.key: account.label for account in self.storage.list_fatsecret_accounts(group_id)}
         ok_count = 0
@@ -2223,7 +2229,7 @@ class TelegramRecipeBot:
         except Exception as exc:  # noqa: BLE001
             logger.exception("FatSecret account validation failed")
             context.user_data.clear()
-            await status.edit_text(f"FatSecret не принял логин/пароль: {exc}")
+            await status.edit_text(f"FatSecret не принял логин/пароль: {user_safe_error_message(exc)}")
             return
 
         context.user_data.clear()
@@ -2281,7 +2287,7 @@ class TelegramRecipeBot:
         except Exception as exc:  # noqa: BLE001
             logger.exception("FatSecret cookbook import failed after account connect")
             await status.edit_text(
-                f"Аккаунт подключен, но рецепты не загрузились: {exc}",
+                f"Аккаунт подключен, но рецепты не загрузились: {user_safe_error_message(exc)}",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
             )
             return
@@ -2470,7 +2476,7 @@ class TelegramRecipeBot:
             draft = await self.sync_engine.resolve_recipe_list_items(str(group_id), items)
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list resolve failed")
-            await status.edit_text(f"Не удалось подобрать ингредиенты: {exc}")
+            await status.edit_text(f"Не удалось подобрать ингредиенты: {user_safe_error_message(exc)}")
             return
         context.user_data["recipe_list_draft"] = draft.items
         context.user_data["recipe_list_unresolved"] = draft.unresolved
@@ -2755,7 +2761,10 @@ class TelegramRecipeBot:
             await self._ensure_recipe_list_candidate_cache(context, str(group_id), search_query, grams, end + 1)
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list replacement search failed")
-            await self._edit_flow_message(message, f"Не удалось найти замену: {exc}")
+            await self._edit_flow_message(
+                message,
+                f"Не удалось найти замену: {user_safe_error_message(exc)}",
+            )
             return
 
         cache = context.user_data.get("recipe_list_candidates_cache")
@@ -2907,7 +2916,7 @@ class TelegramRecipeBot:
             except Exception as exc:  # noqa: BLE001 - creation must not rely on stale duplicate data.
                 logger.exception("live recipe duplicate check failed")
                 await query.edit_message_text(
-                    f"Не удалось проверить актуальные названия рецептов: {exc}",
+                    f"Не удалось проверить актуальные названия рецептов: {user_safe_error_message(exc)}",
                     reply_markup=InlineKeyboardMarkup(
                         [
                             [InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")],
@@ -2936,7 +2945,7 @@ class TelegramRecipeBot:
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list create failed")
             await query.edit_message_text(
-                f"Ошибка создания рецепта: {exc}",
+                f"Ошибка создания рецепта: {user_safe_error_message(exc)}",
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [

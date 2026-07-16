@@ -217,7 +217,12 @@ class FakeFailingCookbookClient(FakeCookbookClient):
 
 
 class FakeFoodUsageClient:
-    def __init__(self, recipes: list[Recipe], account_key: str) -> None:
+    def __init__(
+        self,
+        recipes: list[Recipe],
+        account_key: str,
+        details: dict[str, FoodSearchResult] | None = None,
+    ) -> None:
         self.account = FatSecretAccountConfig(
             key=account_key,
             label=account_key,
@@ -227,6 +232,8 @@ class FakeFoodUsageClient:
             language="ru",
         )
         self.recipes = {recipe.id: recipe for recipe in recipes}
+        self.details = details or {}
+        self.detail_calls: list[str] = []
         self.closed = False
 
     async def cookbook(self) -> list[RecipeSummary]:
@@ -234,6 +241,13 @@ class FakeFoodUsageClient:
 
     async def get_recipe(self, remote_id: str) -> Recipe:
         return self.recipes[remote_id]
+
+    async def ensure_logged_in(self) -> None:
+        return None
+
+    async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
+        self.detail_calls.append(result.food_id)
+        return self.details.get(result.food_id, result)
 
     async def close(self) -> None:
         self.closed = True
@@ -883,6 +897,52 @@ def test_refresh_food_usage_cache_for_all_groups_refreshes_groups_with_accounts(
         assert [item.title for item in storage.list_food_usage_cache(group.id)] == ["Свино-Куриный Фарш"]
         assert storage.list_food_usage_cache(empty_group.id) == []
         assert client.closed is True
+    finally:
+        storage.close()
+
+
+def test_food_usage_refresh_resolves_repeated_food_once_per_account(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        storage.upsert_fatsecret_account(11, "One", "one@example.com", "secret", "BY", "ru")
+        recipes = []
+        for index in range(2):
+            recipe = Recipe(id=f"remote-{index}", title=f"Рецепт {index}")
+            recipe.ingredients = [
+                Ingredient(
+                    id=f"i-{index}",
+                    recipe_id=recipe.id,
+                    food_id="food-yogurt",
+                    title="Йогурт",
+                    portion_id="serving",
+                    amount=Decimal("1"),
+                    portion_description="serving",
+                )
+            ]
+            recipes.append(recipe)
+        client = FakeFoodUsageClient(
+            recipes,
+            "tg11",
+            details={
+                "food-yogurt": FoodSearchResult(
+                    food_id="food-yogurt",
+                    title="Йогурт",
+                    default_portion_id="gram-yogurt",
+                    default_portion_description="100г",
+                    grams_per_portion=Decimal("100"),
+                )
+            },
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+
+        refreshed = asyncio.run(engine.refresh_food_usage_cache(group.id))
+
+        assert refreshed == 1
+        assert client.detail_calls == ["food-yogurt"]
+        assert storage.list_food_usage_cache(group.id)[0].use_count == 2
     finally:
         storage.close()
 

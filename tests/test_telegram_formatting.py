@@ -11,6 +11,25 @@ from fatsecret_bot.sync import RecipeCreateResult
 from fatsecret_bot.telegram_bot import TelegramRecipeBot, _format_recipe, _recipe_actions_keyboard
 
 
+def test_authorization_requires_allowlist_or_existing_registration(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "Existing")
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.allowed_user_ids = {22}
+
+        assert bot._is_authorized(11) is True
+        assert bot._is_authorized(22) is True
+        assert bot._is_authorized(33) is False
+
+        bot.allowed_user_ids = set()
+        assert bot._is_authorized(11) is True
+        assert bot._is_authorized(22) is False
+    finally:
+        storage.close()
+
+
 def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     recipe = Recipe(
         id="local",

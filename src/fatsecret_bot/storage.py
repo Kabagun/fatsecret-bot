@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import re
+import os
 import secrets
 import sqlite3
 import string
@@ -21,10 +21,12 @@ from .models import (
     RecipeGroupMember,
     RecipeSummary,
 )
+from .portions import grams_from_portion, is_bare_weight_portion
 
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
-PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
+STORAGE_SCHEMA_VERSION = 1
+DIARY_COPY_STALE_AFTER = dt.timedelta(minutes=30)
 
 
 def normalize_title(title: str) -> str:
@@ -32,7 +34,14 @@ def normalize_title(title: str) -> str:
 
 
 def _now() -> str:
-    return dt.datetime.now(dt.UTC).isoformat()
+    return _timestamp()
+
+
+def _timestamp(value: dt.datetime | None = None) -> str:
+    current = value or dt.datetime.now(dt.UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.UTC)
+    return current.astimezone(dt.UTC).isoformat()
 
 
 def _steps_to_json(steps: list[str] | None) -> str:
@@ -56,30 +65,6 @@ def _decimal_to_text(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
 
-def _bare_weight_portion_description(description: str) -> bool:
-    normalized = description.strip().casefold()
-    return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""}
-
-
-def _portion_unit_size(description: str) -> Decimal | None:
-    match = PORTION_UNIT_RE.search(description.replace("\xa0", " "))
-    if match is None:
-        return None
-    try:
-        return Decimal(match.group(1).replace(",", "."))
-    except InvalidOperation:
-        return None
-
-
-def _ingredient_grams(amount: Decimal, portion_description: str) -> Decimal | None:
-    unit_size = _portion_unit_size(portion_description)
-    if unit_size is not None and unit_size > 0:
-        return amount * unit_size
-    if _bare_weight_portion_description(portion_description):
-        return amount
-    return None
-
-
 def _decimal_or_none(value: str | None) -> Decimal | None:
     if value is None or value == "":
         return None
@@ -97,8 +82,15 @@ class Storage:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path)
+        self.path.touch(mode=0o600, exist_ok=True)
+        if os.name != "nt":
+            self.path.chmod(0o600)
+        # Storage is intentionally used synchronously from PTB's single event-loop
+        # thread. Every public mutation commits before returning and must never
+        # retain a transaction across an await boundary.
+        self._conn = sqlite3.connect(self.path, timeout=5)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self.migrate()
 
     def close(self) -> None:
@@ -255,8 +247,11 @@ class Storage:
             "ON diary_copy_runs(group_id, created_at DESC)"
         )
         self._backfill_default_group()
-        self._normalize_zero_portion_gram_ingredients()
-        self._backfill_ingredient_grams()
+        current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if current_version < 1:
+            self._normalize_zero_portion_gram_ingredients()
+            self._backfill_ingredient_grams()
+            self._conn.execute(f"PRAGMA user_version = {STORAGE_SCHEMA_VERSION}")
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -332,7 +327,7 @@ class Storage:
             """
         ).fetchall()
         for row in rows:
-            if not _bare_weight_portion_description(row["portion_description"]):
+            if not is_bare_weight_portion(row["portion_description"]):
                 continue
             try:
                 amount = Decimal(row["amount"])
@@ -359,7 +354,7 @@ class Storage:
             amount = _decimal_or_none(row["amount"])
             if amount is None:
                 continue
-            grams = _ingredient_grams(amount, row["portion_description"])
+            grams = grams_from_portion(amount, row["portion_description"])
             if grams is None:
                 continue
             self._conn.execute(
@@ -1228,15 +1223,20 @@ class Storage:
         portion_description: str = "",
         grams: Decimal | None = None,
     ) -> str:
+        normalized_portion_id = portion_id or "0"
+        resolved_grams = grams if grams is not None else grams_from_portion(amount, portion_description)
+        if normalized_portion_id == "0" and is_bare_weight_portion(portion_description):
+            amount = (resolved_grams if resolved_grams is not None else amount) / Decimal("100")
+            portion_description = "100г"
         ingredient = Ingredient(
             id=str(uuid.uuid4()),
             recipe_id=recipe_id,
             food_id=food_id,
             title=title,
-            portion_id=portion_id or "0",
+            portion_id=normalized_portion_id,
             amount=amount,
             portion_description=portion_description,
-            grams=grams if grams is not None else _ingredient_grams(amount, portion_description),
+            grams=resolved_grams,
         )
         position_row = self._conn.execute(
             "SELECT COALESCE(MAX(position), -1) + 1 AS next_position FROM ingredients WHERE recipe_id = ?",
@@ -1495,13 +1495,45 @@ class Storage:
             "request": json.loads(row["request_json"]),
             "status": str(row["status"]),
             "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
         }
 
-    def claim_diary_copy_run(self, run_id: str) -> bool:
-        """Atomically move a pending diary copy run to running for callback idempotency."""
+    def claim_diary_copy_run(
+        self,
+        run_id: str,
+        *,
+        stale_after: dt.timedelta = DIARY_COPY_STALE_AFTER,
+        now: dt.datetime | None = None,
+    ) -> bool:
+        """Claim a pending run or atomically reclaim a stale running operation."""
+        if stale_after <= dt.timedelta(0):
+            raise ValueError("stale_after must be positive")
+        current = now or dt.datetime.now(dt.UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=dt.UTC)
+        current = current.astimezone(dt.UTC)
+        stale_before = current - stale_after
         cursor = self._conn.execute(
-            "UPDATE diary_copy_runs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'pending'",
-            (_now(), run_id),
+            """
+            UPDATE diary_copy_runs
+            SET status = 'running', updated_at = ?
+            WHERE id = ?
+                AND (
+                    status = 'pending'
+                    OR (status = 'running' AND updated_at <= ?)
+                )
+            """,
+            (_timestamp(current), run_id, _timestamp(stale_before)),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def touch_diary_copy_run(self, run_id: str, *, now: dt.datetime | None = None) -> bool:
+        """Refresh the heartbeat of a currently running diary copy operation."""
+        cursor = self._conn.execute(
+            "UPDATE diary_copy_runs SET updated_at = ? WHERE id = ? AND status = 'running'",
+            (_timestamp(now), run_id),
         )
         self._conn.commit()
         return cursor.rowcount == 1
