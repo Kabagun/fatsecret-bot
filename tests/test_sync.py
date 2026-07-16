@@ -571,6 +571,7 @@ def test_sync_ingredients_keeps_public_facebook_food_id_and_portion(tmp_path) ->
                 portion_id="0",
                 amount=Decimal("0.75"),
                 portion_description="100г",
+                remote_ingredient_id="source-iid",
                 grams=Decimal("75"),
             )
         ],
@@ -597,6 +598,7 @@ def test_sync_ingredients_keeps_public_facebook_food_id_and_portion(tmp_path) ->
         assert [(item.food_id, item.portion_id, item.amount) for item in target.saved_ingredients] == [
             (food_id, "0", Decimal("0.75")),
         ]
+        assert target.saved_ingredients[0].remote_ingredient_id is None
         assert target.addable_queries == []
         assert storage.custom_food_mapping("tg-source", food_id, "tg-target") is None
     finally:

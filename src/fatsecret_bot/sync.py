@@ -680,6 +680,20 @@ def _ingredient_with_food_id(ingredient: Ingredient, food_id: str) -> Ingredient
     )
 
 
+def _ingredient_for_target_create(ingredient: Ingredient) -> Ingredient:
+    return Ingredient(
+        id=ingredient.id,
+        recipe_id=ingredient.recipe_id,
+        food_id=ingredient.food_id,
+        title=ingredient.title,
+        portion_id=ingredient.portion_id,
+        amount=ingredient.amount,
+        portion_description=ingredient.portion_description,
+        remote_ingredient_id=None,
+        grams=ingredient.grams,
+    )
+
+
 def _custom_food_content_hash(definition: CustomFoodDefinition) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -2532,11 +2546,12 @@ class RecipeSyncEngine:
                     remote_id,
                     ingredient.food_id,
                 )
+                target_ingredient = _ingredient_for_target_create(ingredient)
                 accepted_ingredient = await self._add_synced_ingredient(
                     client,
                     remote_id,
                     source_ingredient,
-                    ingredient,
+                    target_ingredient,
                     source_client=source_client,
                     source_account_key=source_account_key,
                     target_account_key=target_account_key,
