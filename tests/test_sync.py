@@ -605,6 +605,54 @@ def test_sync_ingredients_keeps_public_facebook_food_id_and_portion(tmp_path) ->
         storage.close()
 
 
+def test_sync_ingredients_never_substitutes_another_public_food_on_rejection(tmp_path) -> None:
+    food_id = "46136861"
+    source_recipe = Recipe(
+        id="source-recipe",
+        title="Котлеты обычные",
+        ingredients=[
+            Ingredient(
+                id="source-iid",
+                recipe_id="source-recipe",
+                food_id=food_id,
+                title="Сухари Панировочные",
+                portion_id="-1",
+                amount=Decimal("75"),
+                portion_description="г",
+                remote_ingredient_id="source-iid",
+                grams=Decimal("75"),
+            )
+        ],
+    )
+    source = FakeFatSecretClient(source_recipe, account_key="tg-source")
+    target_recipe = Recipe(id="target-recipe", title="Котлеты обычные")
+    target = FakeFacebookFoodTargetClient(target_recipe, food_id, account_key="tg-target")
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+
+        try:
+            asyncio.run(
+                engine._sync_ingredients(
+                    target,
+                    source_recipe,
+                    target_recipe.id,
+                    source_client=source,
+                    source_account_key="tg-source",
+                    target_account_key="tg-target",
+                )
+            )
+        except FatSecretActionError as exc:
+            assert exc.action == "ingredientsave"
+        else:
+            raise AssertionError("expected FatSecretActionError")
+
+        assert target.addable_queries == []
+        assert [item.food_id for item in target.saved_ingredients] == [food_id]
+    finally:
+        storage.close()
+
+
 def test_sync_ingredients_fails_when_extra_cannot_be_deleted(tmp_path) -> None:
     source = Recipe(id="local", title="Завтрак")
     target = Recipe(id="remote-target", title="Завтрак")
@@ -637,7 +685,7 @@ def test_sync_ingredients_fails_when_extra_cannot_be_deleted(tmp_path) -> None:
         storage.close()
 
 
-def test_sync_recipe_normalizes_portion_ingredients_to_grams(tmp_path) -> None:
+def test_sync_recipe_stores_normalized_grams_but_copies_raw_portion_fields(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         recipe_id = storage.create_recipe("Соус", "", Decimal("1"), 0, 0, updated_by=11, group_id="group")
@@ -678,11 +726,12 @@ def test_sync_recipe_normalizes_portion_ingredients_to_grams(tmp_path) -> None:
         synced_recipe = storage.get_recipe(recipe_id)
 
         assert all(result.ok for result in results)
-        assert target.saved_ingredients[0].portion_id == "gram-portion"
+        assert target.saved_ingredients[0].portion_id == "serving-portion"
         assert target.saved_ingredients[0].amount == Decimal("1.5")
-        assert target.saved_ingredients[0].portion_description == "100г"
-        assert target.saved_ingredients[0].grams == Decimal("150.0")
+        assert target.saved_ingredients[0].portion_description == "порции"
+        assert target.saved_ingredients[0].remote_ingredient_id is None
         assert synced_recipe is not None
+        assert synced_recipe.ingredients[0].portion_id == "gram-portion"
         assert synced_recipe.ingredients[0].grams == Decimal("150.0")
     finally:
         storage.close()
@@ -2153,6 +2202,66 @@ def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path
         assert second.deleted_ingredient_ids == ["iid-extra"]
         assert results[1].message == "добавлено ингредиентов: 1; удалено лишних ингредиентов: 1"
         assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+def test_sync_live_recipe_copies_raw_yogurt_payload_and_returns_normalized_display(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(
+            id="95538732",
+            title="Блины",
+            group_id="group",
+            ingredients=[
+                Ingredient(
+                    id="source-yogurt-iid",
+                    recipe_id="95538732",
+                    food_id="93062070",
+                    title="Йогурт Черника",
+                    portion_id="0",
+                    amount=Decimal("1.080"),
+                    portion_description="serving",
+                    remote_ingredient_id="source-yogurt-iid",
+                )
+            ],
+        )
+        target_recipe = Recipe(id="132400676", title="Блины", group_id="group")
+        recipe_ref = Recipe(
+            id="live-pancakes",
+            title="Блины",
+            group_id="group",
+            remote_ids={"tg11": "95538732", "tg22": "132400676"},
+            remote_ids_by_account={"tg11": ["95538732"], "tg22": ["132400676"]},
+        )
+        yogurt_detail = FoodSearchResult(
+            food_id="93062070",
+            title="Йогурт Черника",
+            default_portion_id="0",
+            default_portion_description="100g",
+            raw={
+                "_gram_portion_id": "74562979",
+                "_gram_portion_description": "100g",
+            },
+        )
+        source = FakeFatSecretClient(source_recipe, account_key="tg11", details={"93062070": yogurt_detail})
+        target = FakeFatSecretClient(target_recipe, account_key="tg22")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": source, "tg22": target}  # type: ignore[method-assign]
+
+        synced, results = asyncio.run(engine.sync_live_recipe_from_source(recipe_ref, "tg11"))
+
+        assert all(result.ok for result in results)
+        assert len(target.saved_ingredients) == 1
+        copied = target.saved_ingredients[0]
+        assert copied.food_id == "93062070"
+        assert copied.portion_id == "0"
+        assert copied.amount == Decimal("1.080")
+        assert copied.portion_description == "serving"
+        assert copied.remote_ingredient_id is None
+        assert synced.ingredients[0].portion_id == "74562979"
+        assert synced.ingredients[0].amount == Decimal("1.080")
+        assert synced.ingredients[0].grams == Decimal("108.000")
     finally:
         storage.close()
 

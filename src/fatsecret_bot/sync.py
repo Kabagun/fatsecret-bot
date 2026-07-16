@@ -70,6 +70,12 @@ class IngredientSyncStats:
 
 
 @dataclass(frozen=True)
+class _RecipeSourceSnapshot:
+    transport: Recipe
+    display: Recipe
+
+
+@dataclass(frozen=True)
 class RecipeListItem:
     query: str
     grams: Decimal
@@ -743,6 +749,19 @@ class RecipeSyncEngine:
         for client in clients.values():
             await client.close()
 
+    async def _load_recipe_source_snapshot(
+        self,
+        client: FatSecretClient,
+        remote_id: str,
+        local_id: str,
+    ) -> _RecipeSourceSnapshot:
+        remote = await client.get_recipe(remote_id)
+        transport = _copy_recipe_from_remote(local_id, remote)
+        normalized_ingredients = await self._normalize_recipe_ingredients(client, remote.ingredients)
+        display = _copy_recipe_from_remote(local_id, remote)
+        display.ingredients = _copy_remote_ingredients(local_id, normalized_ingredients)
+        return _RecipeSourceSnapshot(transport=transport, display=display)
+
     async def validate_account(self, account: FatSecretAccountConfig) -> None:
         """Verify FatSecret credentials by performing a real mobile API login."""
         client = self._build_client(account)
@@ -957,7 +976,6 @@ class RecipeSyncEngine:
         target_recipe_id = recipe.remote_ids.get(target_account_key)
         if target_recipe_id is None:
             source_recipe = await source_client.get_recipe(entry.recipe_id)
-            source_recipe.ingredients = await self._normalize_recipe_ingredients(source_client, source_recipe.ingredients)
             source_recipe.id = recipe.id
             source_recipe.group_id = recipe.group_id
             target_recipe_id = await target_client.create_recipe(source_recipe)
@@ -1576,6 +1594,7 @@ class RecipeSyncEngine:
         requested_query: str | None = None,
         action_error_fallback: Callable[[], Awaitable[Ingredient | None]] | None = None,
         prefer_original: bool = False,
+        allow_legacy_fallback: bool = True,
     ) -> Ingredient | None:
         logger.info(
             "Ingredient fallback flow started account=%s remote_recipe_id=%s food_id=%s iid=%s title=%r "
@@ -1684,6 +1703,16 @@ class RecipeSyncEngine:
                     remote_id,
                     ingredient.food_id,
                 )
+        if not allow_legacy_fallback:
+            logger.error(
+                "Exact ingredient copy rejected without substitution account=%s remote_recipe_id=%s food_id=%s",
+                client.account.label,
+                remote_id,
+                ingredient.food_id,
+            )
+            if action_error is not None:
+                raise action_error
+            return None
         fallback = None if prepared is not None else await self._legacy_addable_ingredient(client, ingredient, requested_query)
         if fallback is None:
             logger.error(
@@ -2079,38 +2108,37 @@ class RecipeSyncEngine:
             if source_client is None:
                 raise FatSecretError("Аккаунт-источник больше не подключен.")
 
-            source_remote = await source_client.get_recipe(source_remote_id)
-            source_remote.ingredients = await self._normalize_recipe_ingredients(source_client, source_remote.ingredients)
+            source_snapshot = await self._load_recipe_source_snapshot(source_client, source_remote_id, recipe.id)
+            source_recipe = source_snapshot.transport
+            display_recipe = source_snapshot.display
             logger.info(
                 "Recipe sync source loaded run=%s local_recipe_id=%s source_account=%s source_remote_id=%s "
-                "title=%r ingredients=%d",
+                "title=%r raw_ingredients=%d display_ingredients=%d",
                 sync_run,
                 recipe_id,
                 source_client.account.label,
                 source_remote_id,
-                source_remote.title,
-                len(source_remote.ingredients),
+                source_recipe.title,
+                len(source_recipe.ingredients),
+                len(display_recipe.ingredients),
             )
-            source_recipe = _copy_recipe_from_remote(recipe.id, source_remote)
             source_recipe.title = source_recipe.title or recipe.title
             source_recipe.description = _sync_description(timezone=self.timezone)
-            source_recipe.remote_ids = dict(recipe.remote_ids)
-            source_recipe.remote_ids_by_account = {
-                account_key: list(remote_ids)
-                for account_key, remote_ids in recipe.remote_ids_by_account.items()
-            }
+            display_recipe.title = source_recipe.title
+            display_recipe.description = source_recipe.description
             self.storage.update_recipe_from_remote(
                 recipe_id=recipe.id,
-                title=source_recipe.title,
-                description=source_recipe.description,
-                portions=source_recipe.portions,
-                prep_time=source_recipe.prep_time,
-                cook_time=source_recipe.cook_time,
-                steps=source_recipe.steps,
+                title=display_recipe.title,
+                description=display_recipe.description,
+                portions=display_recipe.portions,
+                prep_time=display_recipe.prep_time,
+                cook_time=display_recipe.cook_time,
+                steps=display_recipe.steps,
             )
-            self.storage.replace_ingredients(recipe.id, source_recipe.ingredients)
-            recipe = self.storage.get_recipe(recipe.id) or source_recipe
+            self.storage.replace_ingredients(recipe.id, display_recipe.ingredients)
+            recipe = self.storage.get_recipe(recipe.id) or display_recipe
             recipe.steps = list(source_recipe.steps)
+            recipe.ingredients = source_recipe.ingredients
 
             for account_key, client in clients.items():
                 remote_id = recipe.remote_ids.get(account_key)
@@ -2223,27 +2251,35 @@ class RecipeSyncEngine:
             if source_client is None:
                 raise FatSecretError("Аккаунт-источник больше не подключен.")
 
-            source_remote = await source_client.get_recipe(source_remote_id)
-            source_remote.ingredients = await self._normalize_recipe_ingredients(source_client, source_remote.ingredients)
+            source_snapshot = await self._load_recipe_source_snapshot(source_client, source_remote_id, recipe_ref.id)
+            transport_recipe = source_snapshot.transport
+            recipe = source_snapshot.display
             logger.info(
                 "Recipe sync source loaded run=%s local_recipe_id=%s source_account=%s source_remote_id=%s "
-                "title=%r ingredients=%d",
+                "title=%r raw_ingredients=%d display_ingredients=%d",
                 sync_run,
                 recipe_ref.id,
                 source_client.account.label,
                 source_remote_id,
-                source_remote.title,
-                len(source_remote.ingredients),
+                transport_recipe.title,
+                len(transport_recipe.ingredients),
+                len(recipe.ingredients),
             )
-            recipe = _copy_recipe_from_remote(recipe_ref.id, source_remote)
             recipe.title = recipe.title or recipe_ref.title
             recipe.description = _sync_description(timezone=self.timezone)
             recipe.group_id = recipe_ref.group_id
-            recipe.remote_ids = dict(recipe_ref.remote_ids)
-            recipe.remote_ids_by_account = {
+            remote_ids = dict(recipe_ref.remote_ids)
+            remote_ids_by_account = {
                 account_key: list(remote_ids)
                 for account_key, remote_ids in recipe_ref.remote_ids_by_account.items()
             }
+            recipe.remote_ids = remote_ids
+            recipe.remote_ids_by_account = remote_ids_by_account
+            transport_recipe.title = recipe.title
+            transport_recipe.description = recipe.description
+            transport_recipe.group_id = recipe.group_id
+            transport_recipe.remote_ids = remote_ids
+            transport_recipe.remote_ids_by_account = remote_ids_by_account
 
             for account_key, client in clients.items():
                 remote_id = recipe.remote_ids.get(account_key)
@@ -2260,7 +2296,7 @@ class RecipeSyncEngine:
                         account_key == source_account_key,
                     )
                     if account_key == source_account_key:
-                        ok = await client.save_recipe_meta(recipe, source_remote_id)
+                        ok = await client.save_recipe_meta(transport_recipe, source_remote_id)
                         if not ok:
                             raise FatSecretError(f"{client.account.label}: source recipe metadata save returned false")
                         results.append(AccountSyncResult(account_key, source_remote_id, True, "источник; дата обновлена"))
@@ -2272,17 +2308,17 @@ class RecipeSyncEngine:
                         )
                         continue
                     created_target = remote_id is None
-                    remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
-                    _remember_remote_recipe_id(recipe, account_key, remote_id)
+                    remote_id = await self._ensure_remote_recipe(client, transport_recipe, remote_id)
+                    _remember_remote_recipe_id(transport_recipe, account_key, remote_id)
                     stats = await self._sync_ingredients(
                         client,
-                        recipe,
+                        transport_recipe,
                         remote_id,
                         source_client=source_client,
                         source_account_key=source_account_key,
                         target_account_key=account_key,
                     )
-                    ok = await client.save_recipe_meta(recipe, remote_id)
+                    ok = await client.save_recipe_meta(transport_recipe, remote_id)
                     if not ok:
                         raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
                     results.append(AccountSyncResult(account_key, remote_id, True, stats.message()))
@@ -2315,7 +2351,7 @@ class RecipeSyncEngine:
                         if rollback_message:
                             message = f"{message} {rollback_message}"
                         if rolled_back:
-                            _forget_remote_recipe_id(recipe, account_key, remote_id)
+                            _forget_remote_recipe_id(transport_recipe, account_key, remote_id)
                     results.append(AccountSyncResult(account_key, remote_id, False, message))
         finally:
             await self._close_clients(clients)
@@ -2488,6 +2524,7 @@ class RecipeSyncEngine:
             source_ingredient.title,
             action_error_fallback=action_error_fallback,
             prefer_original=True,
+            allow_legacy_fallback=False,
         )
 
     async def _sync_ingredients(
