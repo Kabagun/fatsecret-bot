@@ -1,21 +1,15 @@
 from __future__ import annotations
 
-import logging
-
 from .config import load_config
+from .logging_config import configure_logging
 from .storage import Storage
 from .sync import RecipeSyncEngine
 from .telegram_bot import TelegramRecipeBot
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
     config = load_config()
+    configure_logging(config.log_path, config.log_retention_days)
     storage = Storage(config.db_path)
     sync_engine = RecipeSyncEngine(storage, config.device, timezone=config.timezone)
     bot = TelegramRecipeBot(

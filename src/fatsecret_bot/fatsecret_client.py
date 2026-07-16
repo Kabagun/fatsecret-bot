@@ -64,7 +64,23 @@ FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
 DIARY_BULK_UPDATE_URL = "https://app.ftscrt.com/api/user-data/v1/update-journal-entries"
 FOOD_SEARCH_PAGE_SIZE = 10
 AUTH_RETRY_STATUS_CODES = {401, 403, 500}
+SAFE_ANDROID_CONTEXT_FIELDS = ("action", "prid", "rid", "iid", "entryname", "portionid", "portionamount")
 PORTION_UNIT_RE = re.compile(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:г|гр|g|gram|грам|мл|ml)\b", re.IGNORECASE)
+
+
+def _safe_context_value(value: str, limit: int = 200) -> str:
+    normalized = value.replace("\r", "\\r").replace("\n", "\\n")
+    return normalized if len(normalized) <= limit else f"{normalized[:limit]}…"
+
+
+def _safe_android_context(page: str, fields: dict[str, str]) -> str:
+    context = [f"page={page}"]
+    context.extend(
+        f"{key}={_safe_context_value(fields[key])}"
+        for key in SAFE_ANDROID_CONTEXT_FIELDS
+        if fields.get(key)
+    )
+    return ", ".join(context)
 
 
 def days_since_epoch(today: dt.date | None = None) -> str:
@@ -391,6 +407,11 @@ class FatSecretClient:
             return await self._login_unlocked()
 
     async def _login_unlocked(self) -> FatSecretSession:
+        logger.info(
+            "FatSecret login started account=%s previous_generation=%d",
+            self.account.label,
+            self._session_generation,
+        )
         query = self._build_query(include_auth=False, include_build=True)
         url = f"https://app.ftscrt.com/api/authenticate/v1/fatsecret?{urlencode(query)}"
         device_key = _stable_device_key(self.device.device_identifier, self.account.key)
@@ -402,6 +423,7 @@ class FatSecretClient:
         }
         response = await self._http.post(url, headers=headers, json=payload)
         if response.status_code != 200:
+            logger.error("FatSecret login failed account=%s status=%d", self.account.label, response.status_code)
             raise FatSecretError(f"{self.account.label}: login failed with HTTP {response.status_code}")
         data = response.json()
         try:
@@ -416,10 +438,20 @@ class FatSecretClient:
                 self._session_saver(session)
         except KeyError as exc:
             raise FatSecretError(f"{self.account.label}: login response has no {exc.args[0]}") from exc
+        logger.info(
+            "FatSecret login completed account=%s generation=%d",
+            self.account.label,
+            self._session_generation,
+        )
         return session
 
     async def ensure_logged_in(self) -> FatSecretSession:
         if self._session is not None:
+            logger.debug(
+                "Using cached FatSecret session account=%s generation=%d",
+                self.account.label,
+                self._session_generation,
+            )
             return self._session
         async with self._auth_lock:
             if self._session is None:
@@ -433,9 +465,25 @@ class FatSecretClient:
     ) -> FatSecretSession:
         async with self._auth_lock:
             if self._session is request_session and self._session_generation == request_generation:
+                logger.warning(
+                    "Refreshing FatSecret session for replay account=%s request_generation=%d",
+                    self.account.label,
+                    request_generation,
+                )
                 return await self._login_unlocked()
             if self._session is None:
+                logger.warning(
+                    "FatSecret replay found no session account=%s request_generation=%d",
+                    self.account.label,
+                    request_generation,
+                )
                 return await self._login_unlocked()
+            logger.info(
+                "FatSecret replay reuses concurrent fresh session account=%s request_generation=%d current_generation=%d",
+                self.account.label,
+                request_generation,
+                self._session_generation,
+            )
             return self._session
 
     async def cookbook(self) -> list[RecipeSummary]:
@@ -481,12 +529,25 @@ class FatSecretClient:
             ],
             "deletes": [],
         }
+        logger.info(
+            "Diary bulk update started account=%s date=%s entries=%d",
+            self.account.label,
+            date.isoformat(),
+            len(entries),
+        )
         response = await self._post_app_json(DIARY_BULK_UPDATE_URL, payload, "diary bulk update")
         try:
             data = response.json()
         except ValueError as exc:
             raise FatSecretError(f"{self.account.label}: invalid diary bulk update JSON") from exc
-        return self._parse_food_diary_bulk_result(data)
+        result = self._parse_food_diary_bulk_result(data)
+        logger.info(
+            "Diary bulk update completed account=%s date=%s entries=%d",
+            self.account.label,
+            date.isoformat(),
+            len(entries),
+        )
+        return result
 
     async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
         """Read a user-created food as a portable per-100g definition."""
@@ -498,6 +559,13 @@ class FatSecretClient:
 
     async def create_custom_food(self, definition: CustomFoodDefinition) -> str:
         """Create a user-owned food and return its new FatSecret recipe id."""
+        logger.info(
+            "Custom food create started account=%s source_food_id=%s title=%r manufacturer=%r",
+            self.account.label,
+            definition.source_recipe_id,
+            definition.title,
+            definition.manufacturer_name,
+        )
         form = {
             "action": "saveregional",
             "manufacturerType": "0",
@@ -511,7 +579,14 @@ class FatSecretClient:
             **{name: _form_decimal(value) for name, value in definition.nutrients.items()},
         }
         response = await self._post_android("RecipeCustomEntryActionAndroidPage.aspx", form)
-        return _parse_custom_food_save_response(response.text)
+        remote_id = _parse_custom_food_save_response(response.text)
+        logger.info(
+            "Custom food create completed account=%s source_food_id=%s target_food_id=%s",
+            self.account.label,
+            definition.source_recipe_id,
+            remote_id,
+        )
+        return remote_id
 
     async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
         try:
@@ -579,13 +654,23 @@ class FatSecretClient:
         return self._parse_autocomplete(data)
 
     async def get_recipe(self, remote_id: str) -> Recipe:
+        logger.debug("Recipe load started account=%s remote_recipe_id=%s", self.account.label, remote_id)
         response = await self._post_android(
             "RecipeAndroidPage.aspx",
             {"rid": remote_id, "images": "true", "fl": "7"},
         )
-        return self._parse_recipe(response.text)
+        recipe = self._parse_recipe(response.text)
+        logger.debug(
+            "Recipe load completed account=%s remote_recipe_id=%s title=%r ingredients=%d",
+            self.account.label,
+            remote_id,
+            recipe.title,
+            len(recipe.ingredients),
+        )
+        return recipe
 
     async def create_recipe(self, recipe: Recipe) -> str:
+        logger.info("Recipe create started account=%s title=%r", self.account.label, recipe.title)
         form = {
             "action": "recipeinitialsave",
             "prid": "0",
@@ -597,9 +682,22 @@ class FatSecretClient:
             "fl": "7",
         }
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
-        return parse_recipe_initial_save_response(response.text)
+        remote_id = parse_recipe_initial_save_response(response.text)
+        logger.info(
+            "Recipe create completed account=%s remote_recipe_id=%s title=%r",
+            self.account.label,
+            remote_id,
+            recipe.title,
+        )
+        return remote_id
 
     async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
+        logger.info(
+            "Recipe metadata save started account=%s remote_recipe_id=%s title=%r",
+            self.account.label,
+            remote_id,
+            recipe.title,
+        )
         form = {
             "action": "recipesave",
             "prid": remote_id,
@@ -616,7 +714,14 @@ class FatSecretClient:
                 break
             form[f"step{index}"] = step
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
-        return _looks_like_true(response.text)
+        accepted = _looks_like_true(response.text)
+        logger.info(
+            "Recipe metadata save completed account=%s remote_recipe_id=%s accepted=%s",
+            self.account.label,
+            remote_id,
+            accepted,
+        )
+        return accepted
 
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         form = {
@@ -629,8 +734,30 @@ class FatSecretClient:
             "portionid": ingredient.portion_id or "0",
             "portionamount": _form_decimal(_ingredient_portion_amount(ingredient)),
         }
+        logger.info(
+            "Ingredient save started account=%s remote_recipe_id=%s food_id=%s iid=%s title=%r "
+            "portion_id=%s portion_amount=%s portion=%r grams=%s",
+            self.account.label,
+            remote_recipe_id,
+            ingredient.food_id,
+            ingredient.remote_ingredient_id or "0",
+            ingredient.title,
+            ingredient.portion_id or "0",
+            form["portionamount"],
+            ingredient.portion_description,
+            ingredient.grams,
+        )
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
-        return _looks_like_true(response.text)
+        accepted = _looks_like_true(response.text)
+        logger.info(
+            "Ingredient save completed account=%s remote_recipe_id=%s food_id=%s iid=%s accepted=%s",
+            self.account.label,
+            remote_recipe_id,
+            ingredient.food_id,
+            ingredient.remote_ingredient_id or "0",
+            accepted,
+        )
+        return accepted
 
     async def delete_ingredient(self, remote_recipe_id: str, remote_ingredient_id: str) -> bool:
         """Delete one ingredient from a recipe in the current FatSecret account."""
@@ -640,8 +767,22 @@ class FatSecretClient:
             "prid": remote_recipe_id,
             "iid": remote_ingredient_id,
         }
+        logger.info(
+            "Ingredient delete started account=%s remote_recipe_id=%s iid=%s",
+            self.account.label,
+            remote_recipe_id,
+            remote_ingredient_id,
+        )
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
-        return _looks_like_true(response.text)
+        accepted = _looks_like_true(response.text)
+        logger.info(
+            "Ingredient delete completed account=%s remote_recipe_id=%s iid=%s accepted=%s",
+            self.account.label,
+            remote_recipe_id,
+            remote_ingredient_id,
+            accepted,
+        )
+        return accepted
 
     async def delete_recipe(self, remote_recipe_id: str) -> bool:
         """Delete a recipe from the current account's FatSecret cookbook."""
@@ -650,8 +791,16 @@ class FatSecretClient:
             "fl": "5",
             "rid": remote_recipe_id,
         }
+        logger.info("Recipe delete started account=%s remote_recipe_id=%s", self.account.label, remote_recipe_id)
         response = await self._post_android("RecipeActionAndroidPage.aspx", form)
-        return _looks_like_true(response.text)
+        accepted = _looks_like_true(response.text)
+        logger.info(
+            "Recipe delete completed account=%s remote_recipe_id=%s accepted=%s",
+            self.account.label,
+            remote_recipe_id,
+            accepted,
+        )
+        return accepted
 
     async def _post_android(self, page: str, fields: dict[str, str]) -> httpx.Response:
         session = await self.ensure_logged_in()
@@ -659,14 +808,37 @@ class FatSecretClient:
         common = self._common_form(session)
         common.update(fields)
         url = f"https://android.fatsecret.com/android/{page}"
+        safe_context = _safe_android_context(page, fields)
+        request_log_level = logging.INFO if fields.get("action") else logging.DEBUG
+        logger.log(
+            request_log_level,
+            "Android request account=%s attempt=1 %s",
+            self.account.label,
+            safe_context,
+        )
         response = await self._http.post(
             url,
             data=common,
             headers=self._headers("application/x-www-form-urlencoded", device_key=session.device_key),
             follow_redirects=False,
         )
+        logger.log(
+            request_log_level if response.status_code == 200 else logging.WARNING,
+            "Android response account=%s attempt=1 status=%d Location=%s %s",
+            self.account.label,
+            response.status_code,
+            _safe_redirect_location(response) or "-",
+            safe_context,
+        )
         replayed = False
         if _should_retry_with_fresh_login(response):
+            logger.warning(
+                "Android request will replay after fresh login account=%s initial_status=%d Location=%s %s",
+                self.account.label,
+                response.status_code,
+                _safe_redirect_location(response) or "-",
+                safe_context,
+            )
             session = await self._session_for_replay(session, session_generation)
             common = self._common_form(session)
             common.update(fields)
@@ -677,19 +849,27 @@ class FatSecretClient:
                 follow_redirects=False,
             )
             replayed = True
+            logger.log(
+                request_log_level if response.status_code == 200 else logging.WARNING,
+                "Android response account=%s attempt=2 status=%d Location=%s %s",
+                self.account.label,
+                response.status_code,
+                _safe_redirect_location(response) or "-",
+                safe_context,
+            )
         if response.status_code != 200:
-            context = [f"page={page}"]
-            context.extend(f"{key}={fields[key]}" for key in ("action", "prid", "rid") if fields.get(key))
             location = _safe_redirect_location(response)
-            context.extend(
-                (
-                    f"Location={location}",
-                    f"replayed={'yes' if replayed else 'no'}",
-                )
+            logger.error(
+                "Android request failed account=%s final_status=%d Location=%s replayed=%s %s",
+                self.account.label,
+                response.status_code,
+                location or "-",
+                replayed,
+                safe_context,
             )
             raise FatSecretActionError(
                 f"{self.account.label}: {page} failed with HTTP {response.status_code} "
-                f"({', '.join(context)})",
+                f"({safe_context}, Location={location}, replayed={'yes' if replayed else 'no'})",
                 status_code=response.status_code,
                 page=page,
                 action=fields.get("action", ""),
@@ -703,13 +883,28 @@ class FatSecretClient:
         session_generation = self._session_generation
         query = self._build_app_query()
         full_url = f"{url}?{urlencode(query)}"
+        logger.debug("App JSON request account=%s label=%s attempt=1", self.account.label, label)
         response = await self._http.post(
             full_url,
             json=payload,
             headers=self._app_headers("application/json", session=session),
             follow_redirects=False,
         )
+        logger.log(
+            logging.DEBUG if response.status_code == 200 else logging.WARNING,
+            "App JSON response account=%s label=%s attempt=1 status=%d Location=%s",
+            self.account.label,
+            label,
+            response.status_code,
+            _safe_redirect_location(response) or "-",
+        )
         if _should_retry_with_fresh_login(response):
+            logger.warning(
+                "App JSON request will replay after fresh login account=%s label=%s status=%d",
+                self.account.label,
+                label,
+                response.status_code,
+            )
             session = await self._session_for_replay(session, session_generation)
             query = self._build_app_query()
             full_url = f"{url}?{urlencode(query)}"
@@ -719,7 +914,21 @@ class FatSecretClient:
                 headers=self._app_headers("application/json", session=session),
                 follow_redirects=False,
             )
+            logger.log(
+                logging.DEBUG if response.status_code == 200 else logging.WARNING,
+                "App JSON response account=%s label=%s attempt=2 status=%d Location=%s",
+                self.account.label,
+                label,
+                response.status_code,
+                _safe_redirect_location(response) or "-",
+            )
         if response.status_code != 200:
+            logger.error(
+                "App JSON request failed account=%s label=%s final_status=%d",
+                self.account.label,
+                label,
+                response.status_code,
+            )
             raise FatSecretError(f"{self.account.label}: {label} failed with HTTP {response.status_code}")
         return response
 

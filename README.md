@@ -68,6 +68,8 @@ Copy-Item .env.example .env
 
 FatSecret логины/пароли вводятся в боте через `Аккаунты` и сохраняются в runtime SQLite. `.env` и runtime SQLite лежат вне git.
 
+Подробная безопасная трассировка запросов и синхронизации пишется в `FATSECRET_BOT_LOG_PATH` (по умолчанию рядом с SQLite в `fatsecret_bot.log`). Файл ротируется ежедневно, а архивы старше `FATSECRET_BOT_LOG_RETENTION_DAYS` удаляются; значение по умолчанию — 10 дней. Лог содержит аккаунт, action, recipe/food/ingredient/portion ids, выбранные fallback-кандидаты, HTTP status/Location и rollback, но не содержит пароли, auth headers или session keys.
+
 ## Запуск
 
 ```powershell

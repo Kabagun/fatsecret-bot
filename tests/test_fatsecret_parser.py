@@ -663,6 +663,10 @@ def test_repeated_redirect_reports_safe_action_context_without_following_redirec
     assert "action=ingredientsave" in message
     assert "prid=recipe-123" in message
     assert "rid=food-456" in message
+    assert "iid=0" in message
+    assert "entryname=Ingredient" in message
+    assert "portionid=0" in message
+    assert "portionamount=0.01" in message
     assert "Location=/Default.aspx" in message
     assert "replayed=yes" in message
     assert "c_s" not in message
