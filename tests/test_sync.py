@@ -679,8 +679,8 @@ def test_sync_recipe_normalizes_portion_ingredients_to_grams(tmp_path) -> None:
 
         assert all(result.ok for result in results)
         assert target.saved_ingredients[0].portion_id == "gram-portion"
-        assert target.saved_ingredients[0].amount == Decimal("150.0")
-        assert target.saved_ingredients[0].portion_description == "г"
+        assert target.saved_ingredients[0].amount == Decimal("1.5")
+        assert target.saved_ingredients[0].portion_description == "100г"
         assert target.saved_ingredients[0].grams == Decimal("150.0")
         assert synced_recipe is not None
         assert synced_recipe.ingredients[0].grams == Decimal("150.0")
@@ -724,8 +724,8 @@ def test_normalize_recipe_ingredients_resolves_details_in_parallel(tmp_path) -> 
         assert client.max_active_detail_calls > 1
         assert client.max_active_detail_calls <= INGREDIENT_NORMALIZE_CONCURRENCY
         assert [item.id for item in normalized] == [f"i-{index}" for index in range(ingredient_count)]
-        assert [item.amount for item in normalized] == [Decimal("100")] * ingredient_count
-        assert [item.portion_description for item in normalized] == ["г"] * ingredient_count
+        assert [item.amount for item in normalized] == [Decimal("1")] * ingredient_count
+        assert [item.portion_description for item in normalized] == ["100г"] * ingredient_count
         assert [item.grams for item in normalized] == [Decimal("100")] * ingredient_count
     finally:
         storage.close()
@@ -753,6 +753,48 @@ def test_normalize_recipe_ingredients_skips_detail_lookup_for_known_gram_amounts
 
         assert client.max_active_detail_calls == 0
         assert [item.grams for item in normalized] == [Decimal("100")] * 3
+    finally:
+        storage.close()
+
+
+def test_normalize_recipe_ingredient_keeps_100g_portion_amount_in_servings(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        ingredient = Ingredient(
+            id="yogurt-iid",
+            recipe_id="pancakes",
+            food_id="93062070",
+            title="Йогурт Черника",
+            portion_id="0",
+            amount=Decimal("1.080"),
+            portion_description="serving",
+            remote_ingredient_id="source-yogurt-iid",
+        )
+        client = FakeFatSecretClient(
+            Recipe(id="pancakes", title="Блины"),
+            details={
+                "93062070": FoodSearchResult(
+                    food_id="93062070",
+                    title="Йогурт Черника",
+                    default_portion_id="0",
+                    default_portion_description="100g",
+                    raw={
+                        "_gram_portion_id": "74562979",
+                        "_gram_portion_description": "100g",
+                        "_gram_portion_gram_weight": "100.000",
+                        "_gram_portion_default_amount": "1.000",
+                    },
+                )
+            },
+        )
+
+        normalized = asyncio.run(engine._normalize_recipe_ingredient(client, ingredient))
+
+        assert normalized.portion_id == "74562979"
+        assert normalized.amount == Decimal("1.080")
+        assert normalized.portion_description == "100g"
+        assert normalized.grams == Decimal("108.000")
     finally:
         storage.close()
 
@@ -1440,8 +1482,8 @@ def test_recipe_list_candidates_uses_remote_gram_portion_id(tmp_path) -> None:
 
         assert candidates[0].ingredient.food_id == "33908"
         assert candidates[0].ingredient.portion_id == "29654"
-        assert candidates[0].ingredient.amount == Decimal("9")
-        assert candidates[0].ingredient.portion_description == "г"
+        assert candidates[0].ingredient.amount == Decimal("0.09")
+        assert candidates[0].ingredient.portion_description == "100г"
     finally:
         storage.close()
 
@@ -1475,8 +1517,8 @@ def test_recipe_list_candidates_uses_cached_food_gram_portion_id_from_metadata(t
         assert candidates[0].source == "часто использовался"
         assert candidates[0].ingredient.food_id == "33908"
         assert candidates[0].ingredient.portion_id == "29654"
-        assert candidates[0].ingredient.amount == Decimal("9")
-        assert candidates[0].ingredient.portion_description == "г"
+        assert candidates[0].ingredient.amount == Decimal("0.09")
+        assert candidates[0].ingredient.portion_description == "100г"
     finally:
         storage.close()
 
@@ -1910,8 +1952,8 @@ def test_create_recipe_from_list_retries_ingredient_with_legacy_addable_id(tmp_p
 
         assert [item.food_id for item in client.saved_ingredients] == ["legacy-onion"]
         assert client.saved_ingredients[0].portion_id == "59173"
-        assert client.saved_ingredients[0].amount == Decimal("119")
-        assert client.saved_ingredients[0].portion_description == "г"
+        assert client.saved_ingredients[0].amount == Decimal("1.19")
+        assert client.saved_ingredients[0].portion_description == "100г"
         assert client.deleted_recipe_ids == []
         assert recipe is not None
         assert recipe.ingredients[0].food_id == "legacy-onion"

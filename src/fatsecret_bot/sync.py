@@ -534,8 +534,12 @@ def _ingredient_current_portion_sends_grams(ingredient: Ingredient, grams: Decim
     portion_id = ingredient.portion_id or "0"
     if portion_id == "0":
         return False
-    normalized = ingredient.portion_description.strip().casefold()
-    return normalized in {"г", "гр", "g", "gram", "grams", "грам", ""} and _same_decimal(ingredient.amount, grams)
+    if not _is_explicit_weight_portion(ingredient.portion_description):
+        return False
+    return _same_decimal(
+        ingredient.amount,
+        _amount_for_grams(grams, ingredient.portion_description),
+    )
 
 
 def _food_result_has_usable_gram_portion(result: FoodSearchResult) -> bool:
@@ -558,14 +562,15 @@ def _ingredient_from_food_result(
 ) -> Ingredient:
     gram_portion_id = str(result.raw.get("_gram_portion_id") or "").strip()
     if gram_portion_id:
+        gram_portion_description = str(result.raw.get("_gram_portion_description") or "г").strip()
         return Ingredient(
             id=id or str(uuid.uuid4()),
             recipe_id=recipe_id,
             food_id=food_id or result.food_id,
             title=title or result.title,
             portion_id=gram_portion_id,
-            amount=grams,
-            portion_description="г",
+            amount=_amount_for_grams(grams, gram_portion_description),
+            portion_description=gram_portion_description,
             remote_ingredient_id=remote_ingredient_id,
             grams=grams,
         )
@@ -578,8 +583,8 @@ def _ingredient_from_food_result(
             food_id=food_id or result.food_id,
             title=title or result.title,
             portion_id=portion_id,
-            amount=grams,
-            portion_description="г",
+            amount=_amount_for_grams(grams, portion_description),
+            portion_description=portion_description,
             remote_ingredient_id=remote_ingredient_id,
             grams=grams,
         )
