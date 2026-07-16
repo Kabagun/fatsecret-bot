@@ -232,6 +232,9 @@ def _recipe_portions(root: ET.Element) -> list[dict[str, str]]:
 def _gram_recipe_portion(portions: list[dict[str, str]]) -> dict[str, str] | None:
     explicit_weight: dict[str, str] | None = None
     for portion in portions:
+        portion_id = portion.get("id", "").strip()
+        if not portion_id.isdecimal() or int(portion_id) <= 0:
+            continue
         description = portion.get("description", "")
         if _bare_weight_portion_description(description):
             return portion
@@ -917,7 +920,7 @@ class FatSecretClient:
             root = ET.fromstring(xml_text)
         except ET.ParseError as exc:
             raise FatSecretError(f"{self.account.label}: invalid custom food XML") from exc
-        if not _bool_value(_text(root, "isOwn")) and _text(root, "source").casefold() != "facebook":
+        if not _bool_value(_text(root, "isOwn")):
             raise FatSecretNotCustomFoodError(
                 f"{self.account.label}: food {remote_id} is not a user-created product"
             )

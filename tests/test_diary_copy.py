@@ -8,7 +8,12 @@ from urllib.parse import parse_qs
 
 import httpx
 
-from fatsecret_bot.fatsecret_client import DIARY_BULK_UPDATE_URL, FatSecretClient, FatSecretError
+from fatsecret_bot.fatsecret_client import (
+    DIARY_BULK_UPDATE_URL,
+    FatSecretClient,
+    FatSecretError,
+    FatSecretNotCustomFoodError,
+)
 from fatsecret_bot.models import (
     CustomFoodDefinition,
     FatSecretAccountConfig,
@@ -351,6 +356,21 @@ def test_client_parses_diary_and_custom_food_and_sends_bulk_payload() -> None:
     assert payload["recordedDate"] == 20649
     assert payload["recipes"][0]["recipeportionid"] == 10270
     assert payload["deletes"] == []
+
+
+def test_facebook_source_is_not_custom_when_is_own_is_false() -> None:
+    client = FatSecretClient(_account("tg11"), _device())
+    public_xml = """
+    <recipe><id>7954761</id><title>Молоко 1,5%</title><source>Facebook</source><isOwn>False</isOwn>
+    <gramsPerPortion>100</gramsPerPortion><energyPerPortion>44</energyPerPortion></recipe>
+    """
+
+    try:
+        client._parse_custom_food_definition(public_xml, "7954761")
+    except FatSecretNotCustomFoodError:
+        pass
+    else:
+        raise AssertionError("expected public Facebook food to stay non-custom")
 
 
 def test_create_custom_food_uses_apk_saveregional_contract() -> None:

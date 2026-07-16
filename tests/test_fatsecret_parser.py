@@ -116,6 +116,30 @@ def test_parse_food_detail_extracts_real_gram_portion_from_recipe_page() -> None
     assert detail.default_portion_description == "средний"
 
 
+def test_parse_food_detail_ignores_synthetic_negative_gram_portion() -> None:
+    xml = """
+    <recipe>
+      <id>46136861</id>
+      <title>Сухари Панировочные</title>
+      <defaultPortionID>0</defaultPortionID>
+      <defaultPortionDescription>100г</defaultPortionDescription>
+      <recipeportion>
+        <id>-1</id>
+        <description>г</description>
+        <gramWeight>1</gramWeight>
+      </recipeportion>
+    </recipe>
+    """
+    detail = _client()._parse_food_detail(
+        xml,
+        FoodSearchResult(food_id="46136861", title="Сухари Панировочные"),
+    )
+
+    assert detail.default_portion_id == "0"
+    assert detail.default_portion_description == "100г"
+    assert "_gram_portion_id" not in detail.raw
+
+
 def test_parse_recipe_ingredients() -> None:
     xml = """
     <recipe>

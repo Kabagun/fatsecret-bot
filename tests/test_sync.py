@@ -160,6 +160,38 @@ class FakeCustomFoodTargetClient(FakeFatSecretClient):
         return self.cloned_food_id
 
 
+class FakeFacebookFoodTargetClient(FakeFatSecretClient):
+    def __init__(self, target: Recipe, food_id: str, account_key: str = "target") -> None:
+        super().__init__(target, account_key=account_key)
+        self.food_id = food_id
+        self.addable_queries: list[str] = []
+
+    async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
+        assert remote_recipe_id == self.target.id
+        self.saved_ingredients.append(ingredient)
+        if ingredient.portion_id == "-1":
+            raise FatSecretActionError(
+                "target: RecipeActionAndroidPage.aspx failed with HTTP 302",
+                status_code=302,
+                page="RecipeActionAndroidPage.aspx",
+                action="ingredientsave",
+                location="/ErrorLogUserFeedback.ashx",
+                replayed=True,
+            )
+        return ingredient.food_id == self.food_id and ingredient.portion_id == "0"
+
+    async def search_addable_foods(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        self.addable_queries.append(query)
+        return [
+            FoodSearchResult(
+                food_id=self.food_id,
+                title="Сухари Панировочные",
+                default_portion_id="0",
+                default_portion_description="100г",
+            )
+        ]
+
+
 class FakeCookbookClient:
     def __init__(self, summaries: list[RecipeSummary], account_key: str) -> None:
         self.account = FatSecretAccountConfig(
@@ -427,7 +459,7 @@ def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> No
 
 
 def test_sync_ingredients_clones_custom_food_before_cross_account_add_and_reuses_mapping(tmp_path) -> None:
-    source_food_id = "46136861"
+    source_food_id = "132165426"
     cloned_food_id = "target-custom-1"
     source_recipe = Recipe(
         id="source-recipe",
@@ -437,18 +469,18 @@ def test_sync_ingredients_clones_custom_food_before_cross_account_add_and_reuses
                 id="source-iid",
                 recipe_id="source-recipe",
                 food_id=source_food_id,
-                title="Сухари Панировочные",
-                portion_id="-1",
-                amount=Decimal("75"),
-                portion_description="г",
+                title="Сухая Смесь для Приготовления Мороженного",
+                portion_id="0",
+                amount=Decimal("0.75"),
+                portion_description="100г",
                 grams=Decimal("75"),
             )
         ],
     )
     definition = CustomFoodDefinition(
         source_recipe_id=source_food_id,
-        title="Сухари Панировочные",
-        manufacturer_name="Минскхлебпром",
+        title="Сухая Смесь для Приготовления Мороженного",
+        manufacturer_name="Nina Farina",
         serving_type="Per100g",
         serving_size="100",
         metric_serving_size="100g",
@@ -484,8 +516,8 @@ def test_sync_ingredients_clones_custom_food_before_cross_account_add_and_reuses
 
         assert stats.added == 1
         assert [item.food_id for item in target.saved_ingredients] == [cloned_food_id]
-        assert target.saved_ingredients[0].amount == Decimal("75")
-        assert target.saved_ingredients[0].portion_id == "-1"
+        assert target.saved_ingredients[0].amount == Decimal("0.75")
+        assert target.saved_ingredients[0].portion_id == "0"
         assert target.created_custom_foods == [definition]
         assert source.custom_food_requests == [source_food_id]
         assert storage.custom_food_mapping("tg-source", source_food_id, "tg-target") == cloned_food_id
@@ -496,10 +528,10 @@ def test_sync_ingredients_clones_custom_food_before_cross_account_add_and_reuses
                 id="target-iid",
                 recipe_id=target_recipe.id,
                 food_id=cloned_food_id,
-                title="Сухари Панировочные",
-                portion_id="-1",
-                amount=Decimal("75"),
-                portion_description="г",
+                title="Сухая Смесь для Приготовления Мороженного",
+                portion_id="0",
+                amount=Decimal("0.75"),
+                portion_description="100г",
                 remote_ingredient_id="target-iid",
                 grams=Decimal("75"),
             )
@@ -521,6 +553,52 @@ def test_sync_ingredients_clones_custom_food_before_cross_account_add_and_reuses
         assert target.saved_ingredients == []
         assert target.created_custom_foods == [definition]
         assert source.custom_food_requests == [source_food_id]
+    finally:
+        storage.close()
+
+
+def test_sync_ingredients_keeps_public_facebook_food_id_and_portion(tmp_path) -> None:
+    food_id = "46136861"
+    source_recipe = Recipe(
+        id="source-recipe",
+        title="Котлеты обычные",
+        ingredients=[
+            Ingredient(
+                id="source-iid",
+                recipe_id="source-recipe",
+                food_id=food_id,
+                title="Сухари Панировочные",
+                portion_id="0",
+                amount=Decimal("0.75"),
+                portion_description="100г",
+                grams=Decimal("75"),
+            )
+        ],
+    )
+    source = FakeFatSecretClient(source_recipe, account_key="tg-source")
+    target_recipe = Recipe(id="target-recipe", title="Котлеты обычные")
+    target = FakeFacebookFoodTargetClient(target_recipe, food_id, account_key="tg-target")
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+
+        stats = asyncio.run(
+            engine._sync_ingredients(
+                target,
+                source_recipe,
+                target_recipe.id,
+                source_client=source,
+                source_account_key="tg-source",
+                target_account_key="tg-target",
+            )
+        )
+
+        assert stats.added == 1
+        assert [(item.food_id, item.portion_id, item.amount) for item in target.saved_ingredients] == [
+            (food_id, "0", Decimal("0.75")),
+        ]
+        assert target.addable_queries == []
+        assert storage.custom_food_mapping("tg-source", food_id, "tg-target") is None
     finally:
         storage.close()
 

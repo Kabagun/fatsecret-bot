@@ -1502,10 +1502,11 @@ class RecipeSyncEngine:
         ingredient: Ingredient,
         requested_query: str | None = None,
         action_error_fallback: Callable[[], Awaitable[Ingredient | None]] | None = None,
+        prefer_original: bool = False,
     ) -> Ingredient | None:
         grams = _ingredient_grams_or_none(ingredient)
         prepared: Ingredient | None = None
-        if not _ingredient_current_portion_sends_grams(ingredient, grams):
+        if not prefer_original and not _ingredient_current_portion_sends_grams(ingredient, grams):
             prepared = await self._legacy_addable_ingredient(client, ingredient, requested_query)
         first_try = prepared or ingredient
         action_error: FatSecretActionError | None = None
@@ -2143,6 +2144,7 @@ class RecipeSyncEngine:
             target_ingredient,
             source_ingredient.title,
             action_error_fallback=action_error_fallback,
+            prefer_original=True,
         )
 
     async def _sync_ingredients(
