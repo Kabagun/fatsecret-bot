@@ -1671,7 +1671,7 @@ def test_storage_next_available_recipe_title_skips_existing_titles(tmp_path) -> 
         storage.close()
 
 
-def test_sync_recipe_updates_source_description_with_last_sync(tmp_path) -> None:
+def test_sync_recipe_preserves_source_description_without_writing_source(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         recipe_id = storage.create_recipe("Омлет", "старое описание", Decimal("1"), 0, 0, updated_by=11, group_id="group")
@@ -1686,9 +1686,9 @@ def test_sync_recipe_updates_source_description_with_last_sync(tmp_path) -> None
         results = asyncio.run(engine.sync_recipe_from_source(recipe_id, "tg11"))
 
         assert results[0].ok is True
-        assert results[0].message == "источник; дата обновлена"
-        assert source.saved_meta[0].description.startswith("Последняя синхронизация: ")
-        assert storage.get_recipe(recipe_id).description.startswith("Последняя синхронизация: ")
+        assert results[0].message == "источник"
+        assert source.saved_meta == []
+        assert storage.get_recipe(recipe_id).description == "старое описание"
     finally:
         storage.close()
 
@@ -2197,7 +2197,7 @@ def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path
         assert synced.id == "local-live"
         assert synced.remote_ids == {"tg11": "111", "tg22": "222"}
         assert [result.ok for result in results] == [True, True]
-        assert first.saved_meta
+        assert first.saved_meta == []
         assert second.saved_ingredients[0].title == "Яйцо"
         assert second.deleted_ingredient_ids == ["iid-extra"]
         assert results[1].message == "добавлено ингредиентов: 1; удалено лишних ингредиентов: 1"
@@ -2212,6 +2212,10 @@ def test_sync_live_recipe_copies_raw_yogurt_payload_and_returns_normalized_displ
         source_recipe = Recipe(
             id="95538732",
             title="Блины",
+            description="1",
+            portions=Decimal("10"),
+            prep_time=1,
+            cook_time=1,
             group_id="group",
             ingredients=[
                 Ingredient(
@@ -2259,6 +2263,11 @@ def test_sync_live_recipe_copies_raw_yogurt_payload_and_returns_normalized_displ
         assert copied.amount == Decimal("1.080")
         assert copied.portion_description == "serving"
         assert copied.remote_ingredient_id is None
+        assert source.saved_meta == []
+        assert target.saved_meta[0].description == "1"
+        assert target.saved_meta[0].portions == Decimal("10")
+        assert target.saved_meta[0].prep_time == 1
+        assert target.saved_meta[0].cook_time == 1
         assert synced.ingredients[0].portion_id == "74562979"
         assert synced.ingredients[0].amount == Decimal("1.080")
         assert synced.ingredients[0].grams == Decimal("108.000")

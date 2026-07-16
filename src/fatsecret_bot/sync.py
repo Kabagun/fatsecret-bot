@@ -2123,9 +2123,7 @@ class RecipeSyncEngine:
                 len(display_recipe.ingredients),
             )
             source_recipe.title = source_recipe.title or recipe.title
-            source_recipe.description = _sync_description(timezone=self.timezone)
             display_recipe.title = source_recipe.title
-            display_recipe.description = source_recipe.description
             self.storage.update_recipe_from_remote(
                 recipe_id=recipe.id,
                 title=display_recipe.title,
@@ -2155,11 +2153,8 @@ class RecipeSyncEngine:
                         account_key == source_account_key,
                     )
                     if account_key == source_account_key:
-                        ok = await client.save_recipe_meta(recipe, source_remote_id)
-                        if not ok:
-                            raise FatSecretError(f"{client.account.label}: source recipe metadata save returned false")
                         self.storage.mark_synced(recipe.id, account_key, source_remote_id, recipe.version)
-                        results.append(AccountSyncResult(account_key, source_remote_id, True, "источник; дата обновлена"))
+                        results.append(AccountSyncResult(account_key, source_remote_id, True, "источник"))
                         logger.info(
                             "Recipe sync account completed run=%s account=%s remote_recipe_id=%s result=source_updated",
                             sync_run,
@@ -2266,7 +2261,6 @@ class RecipeSyncEngine:
                 len(recipe.ingredients),
             )
             recipe.title = recipe.title or recipe_ref.title
-            recipe.description = _sync_description(timezone=self.timezone)
             recipe.group_id = recipe_ref.group_id
             remote_ids = dict(recipe_ref.remote_ids)
             remote_ids_by_account = {
@@ -2296,10 +2290,7 @@ class RecipeSyncEngine:
                         account_key == source_account_key,
                     )
                     if account_key == source_account_key:
-                        ok = await client.save_recipe_meta(transport_recipe, source_remote_id)
-                        if not ok:
-                            raise FatSecretError(f"{client.account.label}: source recipe metadata save returned false")
-                        results.append(AccountSyncResult(account_key, source_remote_id, True, "источник; дата обновлена"))
+                        results.append(AccountSyncResult(account_key, source_remote_id, True, "источник"))
                         logger.info(
                             "Recipe sync account completed run=%s account=%s remote_recipe_id=%s result=source_updated",
                             sync_run,
