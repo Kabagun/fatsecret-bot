@@ -4,7 +4,16 @@ import asyncio
 import datetime as dt
 from decimal import Decimal
 
-from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FoodSearchResult, Ingredient, Recipe, RecipeSummary
+from fatsecret_bot.fatsecret_client import FatSecretActionError, FatSecretNotCustomFoodError
+from fatsecret_bot.models import (
+    CustomFoodDefinition,
+    FatSecretAccountConfig,
+    FatSecretDeviceConfig,
+    FoodSearchResult,
+    Ingredient,
+    Recipe,
+    RecipeSummary,
+)
 from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import (
     INGREDIENT_NORMALIZE_CONCURRENCY,
@@ -69,6 +78,9 @@ class FakeFatSecretClient:
     async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
         return self.details.get(result.food_id, result)
 
+    async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
+        raise FatSecretNotCustomFoodError(f"{self.account.label}: food {remote_id} is not a user-created product")
+
     async def close(self) -> None:
         return None
 
@@ -102,6 +114,50 @@ class FakeSlowDetailClient(FakeFatSecretClient):
             return self.details.get(result.food_id, result)
         finally:
             self.active_detail_calls -= 1
+
+
+class FakeCustomFoodSourceClient(FakeFatSecretClient):
+    def __init__(self, target: Recipe, definition: CustomFoodDefinition, account_key: str = "source") -> None:
+        super().__init__(target, account_key=account_key)
+        self.definition = definition
+        self.custom_food_requests: list[str] = []
+
+    async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
+        self.custom_food_requests.append(remote_id)
+        assert remote_id == self.definition.source_recipe_id
+        return self.definition
+
+
+class FakeCustomFoodTargetClient(FakeFatSecretClient):
+    def __init__(
+        self,
+        target: Recipe,
+        source_food_id: str,
+        cloned_food_id: str,
+        account_key: str = "target",
+    ) -> None:
+        super().__init__(target, account_key=account_key)
+        self.source_food_id = source_food_id
+        self.cloned_food_id = cloned_food_id
+        self.created_custom_foods: list[CustomFoodDefinition] = []
+
+    async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
+        assert remote_recipe_id == self.target.id
+        self.saved_ingredients.append(ingredient)
+        if ingredient.food_id == self.source_food_id:
+            raise FatSecretActionError(
+                "target: RecipeActionAndroidPage.aspx failed with HTTP 302",
+                status_code=302,
+                page="RecipeActionAndroidPage.aspx",
+                action="ingredientsave",
+                location="/ErrorLogUserFeedback.ashx",
+                replayed=True,
+            )
+        return ingredient.food_id == self.cloned_food_id
+
+    async def create_custom_food(self, definition: CustomFoodDefinition) -> str:
+        self.created_custom_foods.append(definition)
+        return self.cloned_food_id
 
 
 class FakeCookbookClient:
@@ -366,6 +422,105 @@ def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> No
         assert client.saved_ingredients[0].amount == Decimal("125")
         assert client.saved_ingredients[1].remote_ingredient_id is None
         assert client.deleted_ingredient_ids == ["iid-extra"]
+    finally:
+        storage.close()
+
+
+def test_sync_ingredients_clones_custom_food_before_cross_account_add_and_reuses_mapping(tmp_path) -> None:
+    source_food_id = "46136861"
+    cloned_food_id = "target-custom-1"
+    source_recipe = Recipe(
+        id="source-recipe",
+        title="Котлеты обычные",
+        ingredients=[
+            Ingredient(
+                id="source-iid",
+                recipe_id="source-recipe",
+                food_id=source_food_id,
+                title="Сухари Панировочные",
+                portion_id="-1",
+                amount=Decimal("75"),
+                portion_description="г",
+                grams=Decimal("75"),
+            )
+        ],
+    )
+    definition = CustomFoodDefinition(
+        source_recipe_id=source_food_id,
+        title="Сухари Панировочные",
+        manufacturer_name="Минскхлебпром",
+        serving_type="Per100g",
+        serving_size="100",
+        metric_serving_size="100g",
+        nutrients={
+            "calories": Decimal("395"),
+            "protein": Decimal("13"),
+            "totalFat": Decimal("5"),
+            "carbohydrate": Decimal("67"),
+        },
+    )
+    source = FakeCustomFoodSourceClient(source_recipe, definition, account_key="tg-source")
+    target_recipe = Recipe(id="target-recipe", title="Котлеты обычные")
+    target = FakeCustomFoodTargetClient(
+        target_recipe,
+        source_food_id,
+        cloned_food_id,
+        account_key="tg-target",
+    )
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+
+        stats = asyncio.run(
+            engine._sync_ingredients(
+                target,
+                source_recipe,
+                target_recipe.id,
+                source_client=source,
+                source_account_key="tg-source",
+                target_account_key="tg-target",
+            )
+        )
+
+        assert stats.added == 1
+        assert [item.food_id for item in target.saved_ingredients] == [cloned_food_id]
+        assert target.saved_ingredients[0].amount == Decimal("75")
+        assert target.saved_ingredients[0].portion_id == "-1"
+        assert target.created_custom_foods == [definition]
+        assert source.custom_food_requests == [source_food_id]
+        assert storage.custom_food_mapping("tg-source", source_food_id, "tg-target") == cloned_food_id
+        assert storage.custom_food_mapping("tg-target", cloned_food_id, "tg-source") == source_food_id
+
+        target.target.ingredients = [
+            Ingredient(
+                id="target-iid",
+                recipe_id=target_recipe.id,
+                food_id=cloned_food_id,
+                title="Сухари Панировочные",
+                portion_id="-1",
+                amount=Decimal("75"),
+                portion_description="г",
+                remote_ingredient_id="target-iid",
+                grams=Decimal("75"),
+            )
+        ]
+        target.saved_ingredients.clear()
+
+        repeat_stats = asyncio.run(
+            engine._sync_ingredients(
+                target,
+                source_recipe,
+                target_recipe.id,
+                source_client=source,
+                source_account_key="tg-source",
+                target_account_key="tg-target",
+            )
+        )
+
+        assert repeat_stats.unchanged == 1
+        assert target.saved_ingredients == []
+        assert target.created_custom_foods == [definition]
+        assert source.custom_food_requests == [source_food_id]
     finally:
         storage.close()
 

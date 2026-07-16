@@ -1385,7 +1385,7 @@ class Storage:
         source_food_id: str,
         target_account_key: str,
     ) -> str | None:
-        """Return a previously cloned personal-food id for a target account."""
+        """Return a personal-food counterpart in either mapping direction."""
         row = self._conn.execute(
             """
             SELECT target_food_id
@@ -1394,7 +1394,18 @@ class Storage:
             """,
             (source_account_key, source_food_id, target_account_key),
         ).fetchone()
-        return str(row["target_food_id"]) if row is not None else None
+        if row is not None:
+            return str(row["target_food_id"])
+        reverse = self._conn.execute(
+            """
+            SELECT source_food_id
+            FROM custom_food_mappings
+            WHERE source_account_key = ? AND target_account_key = ? AND target_food_id = ?
+            LIMIT 1
+            """,
+            (target_account_key, source_account_key, source_food_id),
+        ).fetchone()
+        return str(reverse["source_food_id"]) if reverse is not None else None
 
     def set_custom_food_mapping(
         self,

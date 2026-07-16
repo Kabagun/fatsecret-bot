@@ -34,6 +34,31 @@ class FatSecretError(RuntimeError):
     pass
 
 
+class FatSecretActionError(FatSecretError):
+    """Android action failure with safe structured response context."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        page: str,
+        action: str,
+        location: str,
+        replayed: bool,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.page = page
+        self.action = action
+        self.location = location
+        self.replayed = replayed
+
+
+class FatSecretNotCustomFoodError(FatSecretError):
+    """Requested FatSecret food is not owned by the current account."""
+
+
 logger = logging.getLogger(__name__)
 FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
 DIARY_BULK_UPDATE_URL = "https://app.ftscrt.com/api/user-data/v1/update-journal-entries"
@@ -652,15 +677,21 @@ class FatSecretClient:
         if response.status_code != 200:
             context = [f"page={page}"]
             context.extend(f"{key}={fields[key]}" for key in ("action", "prid", "rid") if fields.get(key))
+            location = _safe_redirect_location(response)
             context.extend(
                 (
-                    f"Location={_safe_redirect_location(response)}",
+                    f"Location={location}",
                     f"replayed={'yes' if replayed else 'no'}",
                 )
             )
-            raise FatSecretError(
+            raise FatSecretActionError(
                 f"{self.account.label}: {page} failed with HTTP {response.status_code} "
-                f"({', '.join(context)})"
+                f"({', '.join(context)})",
+                status_code=response.status_code,
+                page=page,
+                action=fields.get("action", ""),
+                location=location,
+                replayed=replayed,
             )
         return response
 
@@ -887,7 +918,9 @@ class FatSecretClient:
         except ET.ParseError as exc:
             raise FatSecretError(f"{self.account.label}: invalid custom food XML") from exc
         if not _bool_value(_text(root, "isOwn")) and _text(root, "source").casefold() != "facebook":
-            raise FatSecretError(f"{self.account.label}: food {remote_id} is not a user-created product")
+            raise FatSecretNotCustomFoodError(
+                f"{self.account.label}: food {remote_id} is not a user-created product"
+            )
         grams = _decimal(_text(root, "gramsPerPortion"), Decimal("100")) or Decimal("100")
         scale = Decimal("100") / grams if grams > 0 else Decimal("1")
         source_tags = {

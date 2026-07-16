@@ -9,10 +9,17 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .fatsecret_client import FatSecretClient, FatSecretError
+from .fatsecret_client import (
+    FatSecretActionError,
+    FatSecretClient,
+    FatSecretError,
+    FatSecretNotCustomFoodError,
+)
 from .models import (
+    CustomFoodDefinition,
     DiaryCopyDateResult,
     DiaryCopyPreview,
     DiaryCopyResult,
@@ -659,6 +666,34 @@ def _ingredient_with_search_result(ingredient: Ingredient, result: FoodSearchRes
     )
 
 
+def _ingredient_with_food_id(ingredient: Ingredient, food_id: str) -> Ingredient:
+    return Ingredient(
+        id=ingredient.id,
+        recipe_id=ingredient.recipe_id,
+        food_id=food_id,
+        title=ingredient.title,
+        portion_id=ingredient.portion_id,
+        amount=ingredient.amount,
+        portion_description=ingredient.portion_description,
+        remote_ingredient_id=ingredient.remote_ingredient_id,
+        grams=ingredient.grams,
+    )
+
+
+def _custom_food_content_hash(definition: CustomFoodDefinition) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "title": definition.title,
+                "manufacturer": definition.manufacturer_name,
+                "nutrients": {key: str(value) for key, value in sorted(definition.nutrients.items())},
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 class RecipeSyncEngine:
     def __init__(self, storage: Storage, device: FatSecretDeviceConfig, timezone: str = "Europe/Minsk") -> None:
         self.storage = storage
@@ -881,23 +916,12 @@ class RecipeSyncEngine:
             if target_food_id is None:
                 definition = await source_client.get_custom_food_definition(entry.recipe_id)
                 target_food_id = await target_client.create_custom_food(definition)
-                content_hash = hashlib.sha256(
-                    json.dumps(
-                        {
-                            "title": definition.title,
-                            "manufacturer": definition.manufacturer_name,
-                            "nutrients": {key: str(value) for key, value in sorted(definition.nutrients.items())},
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ).encode("utf-8")
-                ).hexdigest()
                 self.storage.set_custom_food_mapping(
                     source_account_key,
                     entry.recipe_id,
                     target_account_key,
                     target_food_id,
-                    content_hash,
+                    _custom_food_content_hash(definition),
                 )
             mapped = (target_food_id, "-1")
             cache[cache_key] = mapped
@@ -919,7 +943,14 @@ class RecipeSyncEngine:
             source_recipe.group_id = recipe.group_id
             target_recipe_id = await target_client.create_recipe(source_recipe)
             try:
-                await self._sync_ingredients(target_client, source_recipe, target_recipe_id)
+                await self._sync_ingredients(
+                    target_client,
+                    source_recipe,
+                    target_recipe_id,
+                    source_client=source_client,
+                    source_account_key=source_account_key,
+                    target_account_key=target_account_key,
+                )
                 if not await target_client.save_recipe_meta(source_recipe, target_recipe_id):
                     raise FatSecretError(f"{target_client.account.label}: recipe metadata save returned false")
             except Exception:
@@ -1470,20 +1501,107 @@ class RecipeSyncEngine:
         remote_id: str,
         ingredient: Ingredient,
         requested_query: str | None = None,
+        action_error_fallback: Callable[[], Awaitable[Ingredient | None]] | None = None,
     ) -> Ingredient | None:
         grams = _ingredient_grams_or_none(ingredient)
         prepared: Ingredient | None = None
         if not _ingredient_current_portion_sends_grams(ingredient, grams):
             prepared = await self._legacy_addable_ingredient(client, ingredient, requested_query)
         first_try = prepared or ingredient
-        if await client.add_ingredient(remote_id, first_try):
-            return first_try
+        action_error: FatSecretActionError | None = None
+        try:
+            if await client.add_ingredient(remote_id, first_try):
+                return first_try
+        except FatSecretActionError as exc:
+            is_backend_rejection = (
+                exc.status_code == 302
+                and exc.action == "ingredientsave"
+                and exc.location.casefold().startswith("/errorloguserfeedback.ashx")
+            )
+            if not is_backend_rejection:
+                raise
+            action_error = exc
+            if action_error_fallback is not None:
+                exact_fallback = await action_error_fallback()
+                if exact_fallback is not None:
+                    if await client.add_ingredient(remote_id, exact_fallback):
+                        return exact_fallback
+                    return None
         fallback = None if prepared is not None else await self._legacy_addable_ingredient(client, ingredient, requested_query)
         if fallback is None:
+            if action_error is not None:
+                raise action_error
             return None
         if await client.add_ingredient(remote_id, fallback):
             return fallback
+        if action_error is not None:
+            raise action_error
         return None
+
+    def _mapped_custom_food_ingredient(
+        self,
+        source_account_key: str | None,
+        target_account_key: str | None,
+        ingredient: Ingredient,
+    ) -> Ingredient:
+        if not source_account_key or not target_account_key:
+            return ingredient
+        mapped_food_id = self.storage.custom_food_mapping(
+            source_account_key,
+            ingredient.food_id,
+            target_account_key,
+        )
+        return _ingredient_with_food_id(ingredient, mapped_food_id) if mapped_food_id else ingredient
+
+    async def _ensure_custom_food_ingredient(
+        self,
+        source_client: FatSecretClient | None,
+        target_client: FatSecretClient,
+        source_account_key: str | None,
+        target_account_key: str | None,
+        ingredient: Ingredient,
+    ) -> Ingredient:
+        mapped = self._mapped_custom_food_ingredient(source_account_key, target_account_key, ingredient)
+        if mapped.food_id != ingredient.food_id:
+            return mapped
+        if source_client is None or source_account_key is None or target_account_key is None:
+            return ingredient
+        try:
+            definition = await source_client.get_custom_food_definition(ingredient.food_id)
+        except FatSecretNotCustomFoodError:
+            return ingredient
+        target_food_id = await target_client.create_custom_food(definition)
+        self.storage.set_custom_food_mapping(
+            source_account_key,
+            ingredient.food_id,
+            target_account_key,
+            target_food_id,
+            _custom_food_content_hash(definition),
+        )
+        return _ingredient_with_food_id(ingredient, target_food_id)
+
+    async def _clone_custom_food_ingredient(
+        self,
+        source_client: FatSecretClient,
+        target_client: FatSecretClient,
+        source_account_key: str,
+        target_account_key: str,
+        source_ingredient: Ingredient,
+        target_ingredient: Ingredient,
+    ) -> Ingredient | None:
+        try:
+            definition = await source_client.get_custom_food_definition(source_ingredient.food_id)
+        except FatSecretNotCustomFoodError:
+            return None
+        target_food_id = await target_client.create_custom_food(definition)
+        self.storage.set_custom_food_mapping(
+            source_account_key,
+            source_ingredient.food_id,
+            target_account_key,
+            target_food_id,
+            _custom_food_content_hash(definition),
+        )
+        return _ingredient_with_food_id(target_ingredient, target_food_id)
 
     async def create_recipe_from_list(
         self,
@@ -1782,7 +1900,14 @@ class RecipeSyncEngine:
                     created_target = remote_id is None
                     remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
                     _remember_remote_recipe_id(recipe, account_key, remote_id)
-                    stats = await self._sync_ingredients(client, recipe, remote_id)
+                    stats = await self._sync_ingredients(
+                        client,
+                        recipe,
+                        remote_id,
+                        source_client=source_client,
+                        source_account_key=source_account_key,
+                        target_account_key=account_key,
+                    )
                     ok = await client.save_recipe_meta(recipe, remote_id)
                     if not ok:
                         raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
@@ -1846,7 +1971,14 @@ class RecipeSyncEngine:
                     created_target = remote_id is None
                     remote_id = await self._ensure_remote_recipe(client, recipe, remote_id)
                     _remember_remote_recipe_id(recipe, account_key, remote_id)
-                    stats = await self._sync_ingredients(client, recipe, remote_id)
+                    stats = await self._sync_ingredients(
+                        client,
+                        recipe,
+                        remote_id,
+                        source_client=source_client,
+                        source_account_key=source_account_key,
+                        target_account_key=account_key,
+                    )
                     ok = await client.save_recipe_meta(recipe, remote_id)
                     if not ok:
                         raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
@@ -1980,17 +2112,74 @@ class RecipeSyncEngine:
 
         return await client.create_recipe(recipe)
 
-    async def _sync_ingredients(self, client: FatSecretClient, recipe: Recipe, remote_id: str) -> IngredientSyncStats:
+    async def _add_synced_ingredient(
+        self,
+        client: FatSecretClient,
+        remote_id: str,
+        source_ingredient: Ingredient,
+        target_ingredient: Ingredient,
+        *,
+        source_client: FatSecretClient | None,
+        source_account_key: str | None,
+        target_account_key: str | None,
+    ) -> Ingredient | None:
+        action_error_fallback: Callable[[], Awaitable[Ingredient | None]] | None = None
+        if source_client is not None and source_account_key is not None and target_account_key is not None:
+
+            async def clone_custom_food() -> Ingredient | None:
+                return await self._clone_custom_food_ingredient(
+                    source_client,
+                    client,
+                    source_account_key,
+                    target_account_key,
+                    source_ingredient,
+                    target_ingredient,
+                )
+
+            action_error_fallback = clone_custom_food
+        return await self._add_ingredient_with_fallback(
+            client,
+            remote_id,
+            target_ingredient,
+            source_ingredient.title,
+            action_error_fallback=action_error_fallback,
+        )
+
+    async def _sync_ingredients(
+        self,
+        client: FatSecretClient,
+        recipe: Recipe,
+        remote_id: str,
+        *,
+        source_client: FatSecretClient | None = None,
+        source_account_key: str | None = None,
+        target_account_key: str | None = None,
+    ) -> IngredientSyncStats:
         remote = await client.get_recipe(remote_id)
         used_target_ids: set[str] = set()
         added = 0
         updated = 0
         unchanged = 0
         deleted = 0
-        for ingredient in recipe.ingredients:
+        for source_ingredient in recipe.ingredients:
+            ingredient = await self._ensure_custom_food_ingredient(
+                source_client,
+                client,
+                source_account_key,
+                target_account_key,
+                source_ingredient,
+            )
             target = _find_matching_ingredient(remote.ingredients, ingredient, used_target_ids)
             if target is None:
-                accepted_ingredient = await self._add_ingredient_with_fallback(client, remote_id, ingredient, ingredient.title)
+                accepted_ingredient = await self._add_synced_ingredient(
+                    client,
+                    remote_id,
+                    source_ingredient,
+                    ingredient,
+                    source_client=source_client,
+                    source_account_key=source_account_key,
+                    target_account_key=target_account_key,
+                )
                 ok = accepted_ingredient is not None
                 added += 1
             elif not _ingredient_needs_update(target, ingredient):
@@ -1999,29 +2188,30 @@ class RecipeSyncEngine:
                 continue
             else:
                 used_target_ids.add(_ingredient_identity(target))
-                accepted_ingredient = await self._add_ingredient_with_fallback(
+                target_ingredient = Ingredient(
+                    id=target.id,
+                    recipe_id=remote_id,
+                    food_id=ingredient.food_id,
+                    title=ingredient.title,
+                    portion_id=ingredient.portion_id,
+                    amount=ingredient.amount,
+                    portion_description=ingredient.portion_description,
+                    remote_ingredient_id=_ingredient_identity(target),
+                    grams=ingredient.grams,
+                )
+                accepted_ingredient = await self._add_synced_ingredient(
                     client,
                     remote_id,
-                    Ingredient(
-                        id=target.id,
-                        recipe_id=remote_id,
-                        food_id=ingredient.food_id,
-                        title=ingredient.title,
-                        portion_id=ingredient.portion_id,
-                        amount=ingredient.amount,
-                        portion_description=ingredient.portion_description,
-                        remote_ingredient_id=_ingredient_identity(target),
-                        grams=ingredient.grams,
-                    ),
-                    ingredient.title,
+                    source_ingredient,
+                    target_ingredient,
+                    source_client=source_client,
+                    source_account_key=source_account_key,
+                    target_account_key=target_account_key,
                 )
                 ok = accepted_ingredient is not None
                 updated += 1
             if not ok:
-                raise FatSecretError(
-                    f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}». "
-                    "Если это свой продукт, нужен capture API создания собственного продукта."
-                )
+                raise FatSecretError(f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}».")
         extras = [target for target in remote.ingredients if _ingredient_identity(target) not in used_target_ids]
         for target in extras:
             remote_ingredient_id = target.remote_ingredient_id

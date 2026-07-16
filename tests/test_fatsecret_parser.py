@@ -6,7 +6,12 @@ from urllib.parse import parse_qs
 
 import httpx
 
-from fatsecret_bot.fatsecret_client import FatSecretClient, FatSecretError, parse_recipe_initial_save_response
+from fatsecret_bot.fatsecret_client import (
+    FatSecretActionError,
+    FatSecretClient,
+    FatSecretError,
+    parse_recipe_initial_save_response,
+)
 from fatsecret_bot.models import FatSecretAccountConfig, FatSecretDeviceConfig, FatSecretSession, FoodSearchResult, Ingredient, Recipe
 
 
@@ -622,6 +627,7 @@ def test_repeated_redirect_reports_safe_action_context_without_following_redirec
                 )
             )
         except FatSecretError as exc:
+            error = exc
             message = str(exc)
         else:
             raise AssertionError("expected FatSecretError")
@@ -641,6 +647,11 @@ def test_repeated_redirect_reports_safe_action_context_without_following_redirec
     assert "private-password" not in message
     assert "old-secret-private" not in message
     assert "redirect-secret" not in message
+    assert isinstance(error, FatSecretActionError)
+    assert error.status_code == 302
+    assert error.action == "ingredientsave"
+    assert error.location == "/Default.aspx"
+    assert error.replayed is True
     assert [request.url.path for request in requests].count("/api/authenticate/v1/fatsecret") == 1
     assert [request.url.path for request in requests].count("/android/RecipeActionAndroidPage.aspx") == 2
     assert all(request.url.path != "/Default.aspx" for request in requests)
