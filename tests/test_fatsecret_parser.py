@@ -201,6 +201,24 @@ def test_parse_recipe_ingredients() -> None:
     assert recipe.ingredients[0].grams == Decimal("100.0")
 
 
+def test_parse_recipe_supports_production_nested_steps_without_legacy_duplicates() -> None:
+    nested = "".join(
+        f"<recipestep><number>{index}</number><description>Шаг {index}</description></recipestep>"
+        for index in range(105, 0, -1)
+    )
+    xml = (
+        "<recipe><id>999</id><title>Омлет</title>"
+        "<step1>Старый дубликат</step1>"
+        f"{nested}"
+        "<recipestep><number>2</number><description>Шаг 2</description></recipestep>"
+        "</recipe>"
+    )
+
+    recipe = _client()._parse_recipe(xml)
+
+    assert recipe.steps == [f"Шаг {index}" for index in range(1, 101)]
+
+
 def test_parse_recipe_ingredient_normalizes_serving_with_grams_per_portion() -> None:
     xml = """
     <recipe>
@@ -414,6 +432,106 @@ def test_delete_recipe_posts_recipedelete_form() -> None:
     assert form["action"] == ["recipedelete"]
     assert form["rid"] == ["123456"]
     assert form["fl"] == ["5"]
+
+
+def test_safe_cookbook_read_retries_transient_statuses_three_times() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, text="busy")
+        if attempts == 2:
+            return httpx.Response(429, headers={"Retry-After": "0.25"}, text="slow")
+        return httpx.Response(200, text="<recipes><recipe><id>1</id><title>Омлет</title></recipe></recipes>")
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        _client().device,
+        http=http,
+        session=FatSecretSession(server_id="server", device_key="device", secret_key="secret"),
+        sleep=fake_sleep,
+    )
+    try:
+        recipes = asyncio.run(client.cookbook())
+    finally:
+        asyncio.run(http.aclose())
+
+    assert [(item.remote_id, item.title) for item in recipes] == [("1", "Омлет")]
+    assert attempts == 3
+    assert delays == [0.5, 0.25]
+
+
+def test_safe_read_retries_transport_error_from_auth_replay() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(302, headers={"Location": "/login"})
+        if attempts == 2:
+            raise httpx.ConnectError("replay connection lost", request=request)
+        return httpx.Response(200, text="<recipes />")
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def fake_replay(session: FatSecretSession, generation: int) -> FatSecretSession:
+        return session
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        _client().device,
+        http=http,
+        session=FatSecretSession(server_id="server", device_key="device", secret_key="secret"),
+        sleep=fake_sleep,
+    )
+    client._session_for_replay = fake_replay  # type: ignore[method-assign]
+    try:
+        recipes = asyncio.run(client.cookbook())
+    finally:
+        asyncio.run(http.aclose())
+
+    assert recipes == []
+    assert attempts == 3
+    assert delays == [0.5]
+
+
+def test_recipe_mutation_does_not_transport_retry_503() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, text="busy")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        _client().device,
+        http=http,
+        session=FatSecretSession(server_id="server", device_key="device", secret_key="secret"),
+    )
+    try:
+        try:
+            asyncio.run(client.delete_recipe("123"))
+        except FatSecretActionError as exc:
+            assert exc.status_code == 503
+        else:
+            raise AssertionError("expected FatSecretActionError")
+    finally:
+        asyncio.run(http.aclose())
+
+    assert attempts == 1
 
 
 def test_cached_session_skips_login() -> None:

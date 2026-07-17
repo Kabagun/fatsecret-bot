@@ -7,6 +7,7 @@ import logging
 import re
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Awaitable
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 from urllib.parse import urlencode
@@ -305,15 +306,39 @@ def _xml_local_name(tag: str) -> str:
 
 
 def _recipe_steps_from_xml(root: ET.Element) -> list[str]:
-    numbered_steps: list[tuple[int, str]] = []
+    """Parse both legacy ``stepN`` and current nested FatSecret recipe steps."""
+    nested_steps: list[tuple[int, str]] = []
+    legacy_steps: list[tuple[int, str]] = []
     for node in root.iter():
         match = _STEP_TAG_RE.fullmatch(_xml_local_name(node.tag))
-        if match is None:
+        if match is not None:
+            step = (node.text or "").strip()
+            if step:
+                legacy_steps.append((int(match.group(1)), step))
             continue
-        step = (node.text or "").strip()
-        if step:
-            numbered_steps.append((int(match.group(1)), step))
-    return [step for _, step in sorted(numbered_steps)[:MAX_RECIPE_STEPS]]
+        if _xml_local_name(node.tag).casefold() != "recipestep":
+            continue
+        number_text = _text(node, "number")
+        description = _text(node, "description").strip()
+        if not description:
+            continue
+        try:
+            number = int(number_text)
+        except (TypeError, ValueError):
+            number = len(nested_steps) + 1
+        nested_steps.append((number, description))
+    selected = nested_steps or legacy_steps
+    steps: list[str] = []
+    seen: set[str] = set()
+    for _, step in sorted(selected, key=lambda item: item[0]):
+        normalized = " ".join(step.split()).casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        steps.append(step)
+        if len(steps) >= MAX_RECIPE_STEPS:
+            break
+    return steps
 
 
 def _looks_like_true(text: str) -> bool:
@@ -373,6 +398,7 @@ class FatSecretClient:
         session: FatSecretSession | None = None,
         session_saver: Callable[[FatSecretSession], None] | None = None,
         today_provider: Callable[[], dt.date] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self.account = account
         self.device = device
@@ -382,6 +408,7 @@ class FatSecretClient:
         self._session_generation = 0
         self._session_saver = session_saver
         self._today_provider = today_provider or dt.date.today
+        self._sleep = sleep or asyncio.sleep
         self._auth_lock = asyncio.Lock()
 
     async def close(self) -> None:
@@ -473,7 +500,7 @@ class FatSecretClient:
             return self._session
 
     async def cookbook(self) -> list[RecipeSummary]:
-        response = await self._post_android("CookBookAndroidPage.aspx", {"fl": "4"})
+        response = await self._post_android("CookBookAndroidPage.aspx", {"fl": "4"}, read_only=True)
         return self._parse_recipe_list(response.text)
 
     async def get_food_diary_day(self, date: dt.date) -> FoodDiaryDay:
@@ -535,11 +562,27 @@ class FatSecretClient:
         )
         return result
 
+    async def delete_food_diary_entries(self, date: dt.date, entry_ids: list[str]) -> None:
+        """Delete selected journal rows using the official bulk-update delete-id contract."""
+        if not entry_ids:
+            return
+        try:
+            deletes = [int(entry_id) for entry_id in entry_ids]
+        except ValueError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid diary entry id") from exc
+        payload = {
+            "recordedDate": int(days_since_epoch(date)),
+            "recipes": [],
+            "deletes": deletes,
+        }
+        await self._post_app_json(DIARY_BULK_UPDATE_URL, payload, "diary bulk delete")
+
     async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
         """Read a user-created food as a portable per-100g definition."""
         response = await self._post_android(
             "RecipeAndroidPage.aspx",
             {"rid": remote_id, "images": "true", "fl": "7"},
+            read_only=True,
         )
         return self._parse_custom_food_definition(response.text, remote_id)
 
@@ -644,6 +687,7 @@ class FatSecretClient:
         response = await self._post_android(
             "RecipeAndroidPage.aspx",
             {"rid": remote_id, "images": "true", "fl": "7"},
+            read_only=True,
         )
         recipe = self._parse_recipe(response.text)
         logger.debug(
@@ -788,62 +832,138 @@ class FatSecretClient:
         )
         return accepted
 
-    async def _post_android(self, page: str, fields: dict[str, str]) -> httpx.Response:
-        session = await self.ensure_logged_in()
-        session_generation = self._session_generation
-        common = self._common_form(session)
-        common.update(fields)
-        url = f"https://android.fatsecret.com/android/{page}"
+    async def _post_android(
+        self,
+        page: str,
+        fields: dict[str, str],
+        *,
+        read_only: bool = False,
+    ) -> httpx.Response:
+        """POST one Android endpoint, retrying only explicitly safe read operations."""
+        max_read_attempts = 3 if read_only else 1
         safe_context = _safe_android_context(page, fields)
         request_log_level = logging.INFO if fields.get("action") else logging.DEBUG
-        logger.log(
-            request_log_level,
-            "Android request account=%s attempt=1 %s",
-            self.account.label,
-            safe_context,
-        )
-        response = await self._http.post(
-            url,
-            data=common,
-            headers=self._headers("application/x-www-form-urlencoded", device_key=session.device_key),
-            follow_redirects=False,
-        )
-        logger.log(
-            request_log_level if response.status_code == 200 else logging.WARNING,
-            "Android response account=%s attempt=1 status=%d Location=%s %s",
-            self.account.label,
-            response.status_code,
-            _safe_redirect_location(response) or "-",
-            safe_context,
-        )
-        replayed = False
-        if _should_retry_with_fresh_login(response):
-            logger.warning(
-                "Android request will replay after fresh login account=%s initial_status=%d Location=%s %s",
-                self.account.label,
-                response.status_code,
-                _safe_redirect_location(response) or "-",
-                safe_context,
-            )
-            session = await self._session_for_replay(session, session_generation)
+        url = f"https://android.fatsecret.com/android/{page}"
+        last_transport_error: httpx.TransportError | None = None
+
+        for read_attempt in range(1, max_read_attempts + 1):
+            session = await self.ensure_logged_in()
+            session_generation = self._session_generation
             common = self._common_form(session)
             common.update(fields)
-            response = await self._http.post(
-                url,
-                data=common,
-                headers=self._headers("application/x-www-form-urlencoded", device_key=session.device_key),
-                follow_redirects=False,
+            logger.log(
+                request_log_level,
+                "Android request account=%s read_attempt=%d auth_attempt=1 %s",
+                self.account.label,
+                read_attempt,
+                safe_context,
             )
-            replayed = True
+            try:
+                response = await self._http.post(
+                    url,
+                    data=common,
+                    headers=self._headers("application/x-www-form-urlencoded", device_key=session.device_key),
+                    follow_redirects=False,
+                )
+            except httpx.TransportError as exc:
+                last_transport_error = exc
+                if not read_only or read_attempt >= max_read_attempts:
+                    logger.exception(
+                        "Android transport failed account=%s read_attempt=%d final=true %s",
+                        self.account.label,
+                        read_attempt,
+                        safe_context,
+                    )
+                    raise
+                delay = 0.5 if read_attempt == 1 else 1.5
+                logger.warning(
+                    "Android safe read will retry after transport error account=%s read_attempt=%d delay=%.1f %s",
+                    self.account.label,
+                    read_attempt,
+                    delay,
+                    safe_context,
+                )
+                await self._sleep(delay)
+                continue
             logger.log(
                 request_log_level if response.status_code == 200 else logging.WARNING,
-                "Android response account=%s attempt=2 status=%d Location=%s %s",
+                "Android response account=%s read_attempt=%d auth_attempt=1 status=%d Location=%s %s",
                 self.account.label,
+                read_attempt,
                 response.status_code,
                 _safe_redirect_location(response) or "-",
                 safe_context,
             )
-        if response.status_code != 200:
+            replayed = False
+            if _should_retry_with_fresh_login(response):
+                logger.warning(
+                    "Android request will replay after fresh login account=%s initial_status=%d Location=%s %s",
+                    self.account.label,
+                    response.status_code,
+                    _safe_redirect_location(response) or "-",
+                    safe_context,
+                )
+                session = await self._session_for_replay(session, session_generation)
+                common = self._common_form(session)
+                common.update(fields)
+                try:
+                    response = await self._http.post(
+                        url,
+                        data=common,
+                        headers=self._headers("application/x-www-form-urlencoded", device_key=session.device_key),
+                        follow_redirects=False,
+                    )
+                except httpx.TransportError as exc:
+                    last_transport_error = exc
+                    if not read_only or read_attempt >= max_read_attempts:
+                        logger.exception(
+                            "Android auth replay transport failed account=%s read_attempt=%d final=true %s",
+                            self.account.label,
+                            read_attempt,
+                            safe_context,
+                        )
+                        raise
+                    delay = 0.5 if read_attempt == 1 else 1.5
+                    logger.warning(
+                        "Android safe read will retry after auth replay transport error "
+                        "account=%s read_attempt=%d delay=%.1f %s",
+                        self.account.label,
+                        read_attempt,
+                        delay,
+                        safe_context,
+                    )
+                    await self._sleep(delay)
+                    continue
+                replayed = True
+                logger.log(
+                    request_log_level if response.status_code == 200 else logging.WARNING,
+                    "Android response account=%s read_attempt=%d auth_attempt=2 status=%d Location=%s %s",
+                    self.account.label,
+                    read_attempt,
+                    response.status_code,
+                    _safe_redirect_location(response) or "-",
+                    safe_context,
+                )
+            if response.status_code == 200:
+                return response
+            if read_only and response.status_code in {429, 502, 503, 504} and read_attempt < max_read_attempts:
+                retry_after = response.headers.get("Retry-After", "").strip()
+                try:
+                    delay = min(5.0, max(0.0, float(retry_after))) if retry_after else 0.0
+                except ValueError:
+                    delay = 0.0
+                if delay == 0.0:
+                    delay = 0.5 if read_attempt == 1 else 1.5
+                logger.warning(
+                    "Android safe read will retry account=%s status=%d read_attempt=%d delay=%.1f %s",
+                    self.account.label,
+                    response.status_code,
+                    read_attempt,
+                    delay,
+                    safe_context,
+                )
+                await self._sleep(delay)
+                continue
             location = _safe_redirect_location(response)
             logger.error(
                 "Android request failed account=%s final_status=%d Location=%s replayed=%s %s",
@@ -862,7 +982,8 @@ class FatSecretClient:
                 location=location,
                 replayed=replayed,
             )
-        return response
+        assert last_transport_error is not None
+        raise last_transport_error
 
     async def _post_app_json(self, url: str, payload: dict[str, Any], label: str) -> httpx.Response:
         session = await self.ensure_logged_in()
