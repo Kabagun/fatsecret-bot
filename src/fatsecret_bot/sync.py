@@ -1511,6 +1511,8 @@ class RecipeSyncEngine:
         client: FatSecretClient,
         ingredient: Ingredient,
         requested_query: str | None = None,
+        *,
+        same_food_id_only: bool = False,
     ) -> Ingredient | None:
         search_addable = getattr(client, "search_addable_foods", None)
         if search_addable is None:
@@ -1563,7 +1565,11 @@ class RecipeSyncEngine:
         candidates = [
             item
             for item in _dedupe_food_results(candidates)
-            if item.food_id and _matches_requested_food(match_query, item.title, _food_search_text(item))
+            if (
+                item.food_id
+                and (not same_food_id_only or item.food_id == ingredient.food_id)
+                and _matches_requested_food(match_query, item.title, _food_search_text(item))
+            )
         ]
         candidates.sort(key=lambda item: _food_result_rank(match_query, item))
         logger.debug(
@@ -1634,7 +1640,14 @@ class RecipeSyncEngine:
         grams = _ingredient_grams_or_none(ingredient)
         prepared: Ingredient | None = None
         if not prefer_original and not _ingredient_current_portion_sends_grams(ingredient, grams):
-            prepared = await self._legacy_addable_ingredient(client, ingredient, requested_query)
+            # Portion preparation must not silently replace the food selected by the user.
+            # A different food ID is eligible only after FatSecret rejects the exact selection.
+            prepared = await self._legacy_addable_ingredient(
+                client,
+                ingredient,
+                requested_query,
+                same_food_id_only=True,
+            )
         first_try = prepared or ingredient
         logger.info(
             "Ingredient first attempt selected account=%s remote_recipe_id=%s original_food_id=%s attempt_food_id=%s "
