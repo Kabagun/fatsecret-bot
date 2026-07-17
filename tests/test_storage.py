@@ -7,7 +7,8 @@ from decimal import Decimal
 
 import pytest
 
-from fatsecret_bot.models import FatSecretSession, RecipeSummary
+from fatsecret_bot.models import FatSecretSession, Ingredient, Recipe, RecipeSummary
+from fatsecret_bot.recipe_compare import recipe_fingerprint
 from fatsecret_bot.storage import Storage, normalize_title
 
 
@@ -82,6 +83,10 @@ def test_group_join_switch_and_group_scoped_accounts(tmp_path) -> None:
 
         other_group = storage.create_group(11, "Solo")
         assert storage.set_active_group_for_user(22, other_group.id) is False
+        assert storage.list_fatsecret_accounts(other_group.id) == []
+        assert {account.key for account in storage.list_fatsecret_accounts(group.id)} == {"tg11", "tg22"}
+        assert storage.detach_fatsecret_account_from_group("tg11", group.id, 11) is True
+        assert storage.attach_fatsecret_account_to_group("tg11", other_group.id, 11) is True
         assert {account.key for account in storage.list_fatsecret_accounts(other_group.id)} == {"tg11"}
     finally:
         storage.close()
@@ -262,7 +267,7 @@ def test_migration_normalizes_legacy_zero_portion_gram_ingredients(tmp_path) -> 
         assert recipe.ingredients[0].amount == Decimal("0.05")
         assert recipe.ingredients[0].portion_description == "100г"
         assert recipe.ingredients[0].grams == Decimal("5")
-        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 2
     finally:
         storage.close()
 
@@ -403,9 +408,10 @@ def test_update_fatsecret_account_label(tmp_path) -> None:
             language="ru",
         )
 
-        assert storage.update_fatsecret_account_label(account_key, "  One  ") is True
-        assert storage.update_fatsecret_account_label(account_key, " ") is False
-        assert storage.update_fatsecret_account_label("missing", "Two") is False
+        assert storage.update_fatsecret_account_label(account_key, "  One  ", owner_telegram_id=11) is True
+        assert storage.update_fatsecret_account_label(account_key, " ", owner_telegram_id=11) is False
+        assert storage.update_fatsecret_account_label("missing", "Two", owner_telegram_id=11) is False
+        assert storage.update_fatsecret_account_label(account_key, "Other", owner_telegram_id=22) is False
         account = storage.get_fatsecret_account(account_key)
         assert account is not None
         assert account.label == "One"
@@ -526,5 +532,118 @@ def test_reconcile_group_remote_recipes_prunes_stale_mappings_and_keeps_unrelate
         assert storage.get_recipe(recipe_id) is None
         assert storage.find_recipe_by_title("g1", "Блины тонкие") is None
         assert storage.get_recipe(draft_id) is not None
+    finally:
+        storage.close()
+
+
+def test_one_telegram_user_can_own_multiple_accounts_but_each_account_has_one_group(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        first_group = storage.create_group(11, "Первая")
+        first_key = storage.create_fatsecret_account(
+            11, "Основной", "one@example.com", "secret", "BY", "ru", group_id=first_group.id
+        )
+        second_key = storage.create_fatsecret_account(
+            11, "Тест", "test@example.com", "secret", "BY", "ru", group_id=first_group.id
+        )
+        second_group = storage.create_group(11, "Вторая")
+
+        assert [item.key for item in storage.list_fatsecret_accounts_for_owner(11)] == [first_key, second_key]
+        assert {item.key for item in storage.list_fatsecret_accounts(first_group.id)} == {first_key, second_key}
+        assert storage.attach_fatsecret_account_to_group(first_key, second_group.id, 11) is False
+        assert storage.detach_fatsecret_account_from_group(second_key, first_group.id, 11) is True
+        assert storage.attach_fatsecret_account_to_group(second_key, second_group.id, 11) is True
+        assert storage.fatsecret_account_group_id(second_key) == second_group.id
+        assert storage.set_active_group_for_user(11, first_group.id) is True
+        assert storage.set_active_group_for_user(11, second_group.id) is True
+    finally:
+        storage.close()
+
+
+def test_version_one_account_migration_preserves_credentials_session_and_group(tmp_path) -> None:
+    db_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE telegram_users (
+                telegram_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL,
+                active_group_id TEXT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE recipe_groups (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, invite_code TEXT NOT NULL UNIQUE,
+                created_by INTEGER NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE group_members (
+                group_id TEXT NOT NULL, telegram_id INTEGER NOT NULL, joined_at TEXT NOT NULL,
+                PRIMARY KEY (group_id, telegram_id)
+            );
+            CREATE TABLE fatsecret_accounts (
+                account_key TEXT PRIMARY KEY, telegram_id INTEGER NOT NULL UNIQUE,
+                label TEXT NOT NULL, username TEXT NOT NULL, password TEXT NOT NULL,
+                market TEXT NOT NULL, language TEXT NOT NULL,
+                session_server_id TEXT, session_device_key TEXT, session_secret_key TEXT,
+                session_updated_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            INSERT INTO telegram_users VALUES (11, 'One', 'g1', 'now');
+            INSERT INTO recipe_groups VALUES ('g1', 'QA', 'ABCDEFGH', 11, 'now');
+            INSERT INTO group_members VALUES ('g1', 11, 'now');
+            INSERT INTO fatsecret_accounts VALUES (
+                'tg11', 11, 'Kabaye', 'one@example.com', 'password', 'BY', 'ru',
+                'server', 'device', 'secret', 'now', 'now', 'now'
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+
+    storage = Storage(db_path)
+    try:
+        account = storage.get_fatsecret_account("tg11")
+        assert account is not None
+        assert (account.username, account.password, account.label) == (
+            "one@example.com",
+            "password",
+            "Kabaye",
+        )
+        assert storage.fatsecret_account_owner("tg11") == 11
+        assert storage.fatsecret_account_group_id("tg11") == "g1"
+        assert storage.get_fatsecret_session("tg11") == FatSecretSession("server", "device", "secret")
+        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    finally:
+        storage.close()
+
+
+def test_remote_recipe_snapshots_round_trip_and_reconcile_by_account(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe = Recipe(
+            id="local",
+            title="Омлет",
+            portions=Decimal("2"),
+            steps=["Смешать", "Запечь"],
+            ingredients=[
+                Ingredient(
+                    id="i1",
+                    recipe_id="local",
+                    food_id="food-1",
+                    title="Яйцо",
+                    portion_id="p1",
+                    amount=Decimal("2"),
+                    grams=Decimal("100"),
+                )
+            ],
+        )
+        fingerprint = recipe_fingerprint(recipe)
+        storage.upsert_remote_recipe_snapshot("a1", "111", recipe, fingerprint)
+        storage.upsert_remote_recipe_summary("a1", "112", "Старый")
+
+        stored = storage.remote_recipe_snapshot("a1", "111")
+        assert stored is not None
+        restored, digest = stored
+        assert digest == fingerprint.digest
+        assert recipe_fingerprint(restored).digest == fingerprint.digest
+        assert storage.reconcile_remote_recipe_snapshots("a1", {"111"}) == 1
+        assert storage.remote_recipe_snapshot("a1", "111") is not None
+        assert storage.remote_recipe_snapshots_by_title("Омлет", account_keys={"a1"})[0][1] == "111"
     finally:
         storage.close()

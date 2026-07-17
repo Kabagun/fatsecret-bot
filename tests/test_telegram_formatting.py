@@ -8,10 +8,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
-from fatsecret_bot.models import Ingredient, Recipe
+from fatsecret_bot.models import Ingredient, Recipe, RemoteRecipeVariant
+from fatsecret_bot.recipe_compare import recipe_fingerprint
 from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import RecipeCreateResult
-from fatsecret_bot.telegram_bot import TelegramRecipeBot, _format_recipe, _recipe_actions_keyboard
+from fatsecret_bot.telegram_bot import (
+    TelegramRecipeBot,
+    _format_recipe,
+    _format_recipe_conflict,
+    _recipe_actions_keyboard,
+)
 
 
 def test_authorization_requires_allowlist_or_existing_registration(tmp_path) -> None:
@@ -116,6 +122,22 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     assert "- Кетчуп: 300г" in text
     assert "<b>Шаги</b>" in text
     assert "1. Смешать" in text
+
+
+def test_format_recipe_conflict_labels_both_account_versions() -> None:
+    first = Recipe(id="local", title="Омлет", portions=Decimal("2"), steps=["Смешать"])
+    second = Recipe(id="local", title="Омлет", portions=Decimal("4"), steps=["Запечь"])
+    variants = [
+        RemoteRecipeVariant("tg11", "111", first, recipe_fingerprint(first)),
+        RemoteRecipeVariant("tg22", "222", second, recipe_fingerprint(second)),
+    ]
+
+    text = _format_recipe_conflict(variants, {"tg11": "thekabaye", "tg22": "Святичек"})
+
+    assert "Версии рецепта различаются" in text
+    assert "thekabaye" in text and "ID <code>111</code>" in text
+    assert "Святичек" in text and "ID <code>222</code>" in text
+    assert "Порций: 2" in text and "Порций: 4" in text
 
 
 def test_recipe_actions_keyboard_keeps_only_recipe_actions_and_list_return() -> None:
@@ -298,6 +320,21 @@ def test_recipe_list_create_still_prompts_for_current_live_duplicate(tmp_path) -
         storage.close()
 
 
+def test_recipe_cache_is_reloaded_from_authoritative_cookbook_after_sync() -> None:
+    fresh = Recipe(id="fresh", title="Омлет", group_id="group", remote_ids={"tg11": "new-111"})
+    bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = SimpleNamespace(load_remote_recipe_index=AsyncMock(return_value=[fresh]))
+    context = SimpleNamespace(
+        chat_data={"recipe_cache_group_id": "group", "recipe_cache": [Recipe(id="old", title="Старый")]}
+    )
+
+    refreshed = asyncio.run(bot._refresh_recipe_cache_after_sync(context, "group"))
+
+    assert refreshed is True
+    assert bot._recipe_cache(context, "group") == [fresh]
+    bot.sync_engine.load_remote_recipe_index.assert_awaited_once_with("group")
+
+
 def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -316,10 +353,47 @@ def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path)
         _, other_account = TelegramRecipeBot._active_group_account(bot, 22, "tg11")
 
         assert "Поменять ник: Света" in flat_texts
-        assert "Выйти: Света" in flat_texts
+        assert "Отсоединить: Света" in flat_texts
+        assert "Удалить подключение: Света" in flat_texts
         assert "Поменять ник: Каба" not in flat_texts
-        assert "Выйти: Каба" not in flat_texts
+        assert "Удалить подключение: Каба" not in flat_texts
         assert own_account is not None
         assert other_account is None
+    finally:
+        storage.close()
+
+
+def test_accounts_and_groups_keyboards_support_multiple_owned_accounts_and_switching(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        first_group = storage.create_group(11, "QA")
+        first = storage.create_fatsecret_account(
+            11, "Kabaye", "one@example.com", "secret", "BY", "ru", group_id=first_group.id
+        )
+        second = storage.create_fatsecret_account(
+            11, "Test", "test@example.com", "secret", "BY", "ru", group_id=first_group.id
+        )
+        second_group = storage.create_group(11, "Основная")
+        storage.set_active_group_for_user(11, first_group.id)
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+
+        account_keyboard = TelegramRecipeBot._accounts_keyboard(bot, 11, first_group)
+        account_callbacks = [
+            button.callback_data
+            for row in account_keyboard.inline_keyboard
+            for button in row
+        ]
+        group_keyboard = TelegramRecipeBot._groups_keyboard(bot, 11)
+        group_callbacks = [button.callback_data for row in group_keyboard.inline_keyboard for button in row]
+
+        assert f"account_label:{first}" in account_callbacks
+        assert f"account_label:{second}" in account_callbacks
+        assert f"account_detach:{first}" in account_callbacks
+        assert f"account_delete:{second}" in account_callbacks
+        assert f"group_switch:{second_group.id}" in group_callbacks
+        assert "group_create:0" in group_callbacks
+        assert "group_join:0" in group_callbacks
     finally:
         storage.close()

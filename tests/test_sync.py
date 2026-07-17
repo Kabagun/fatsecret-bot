@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
 from decimal import Decimal
+
+import httpx
+import pytest
 
 from fatsecret_bot.fatsecret_client import FatSecretActionError, FatSecretNotCustomFoodError
 from fatsecret_bot.models import (
@@ -42,6 +46,7 @@ class FakeFatSecretClient:
             language="ru",
         )
         self.target = target
+        self.recipes: dict[str, Recipe] = {target.id: target}
         self.delete_ok = delete_ok
         self.ingredient_delete_ok = ingredient_delete_ok
         self.saved_ingredients: list[Ingredient] = []
@@ -51,29 +56,59 @@ class FakeFatSecretClient:
         self.details = details or {}
 
     async def get_recipe(self, remote_id: str) -> Recipe:
-        assert remote_id == self.target.id
-        return self.target
+        return copy.deepcopy(self.recipes[remote_id])
+
+    async def create_recipe(self, recipe: Recipe) -> str:
+        remote_id = f"{self.target.id}-created-{len(self.recipes)}"
+        created = copy.deepcopy(recipe)
+        created.id = remote_id
+        created.ingredients = []
+        self.recipes[remote_id] = created
+        return remote_id
 
     async def ensure_logged_in(self) -> None:
         return None
 
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
-        assert remote_recipe_id == self.target.id
         self.saved_ingredients.append(ingredient)
+        stored = copy.deepcopy(ingredient)
+        stored.recipe_id = remote_recipe_id
+        stored.remote_ingredient_id = stored.remote_ingredient_id or f"iid-{len(self.recipes[remote_recipe_id].ingredients) + 1}"
+        existing = self.recipes[remote_recipe_id].ingredients
+        if ingredient.remote_ingredient_id:
+            existing[:] = [item for item in existing if item.remote_ingredient_id != ingredient.remote_ingredient_id]
+        existing.append(stored)
         return True
 
     async def delete_ingredient(self, remote_recipe_id: str, remote_ingredient_id: str) -> bool:
-        assert remote_recipe_id == self.target.id
         self.deleted_ingredient_ids.append(remote_ingredient_id)
+        if self.ingredient_delete_ok:
+            self.recipes[remote_recipe_id].ingredients = [
+                item
+                for item in self.recipes[remote_recipe_id].ingredients
+                if item.remote_ingredient_id != remote_ingredient_id
+            ]
         return self.ingredient_delete_ok
 
     async def delete_recipe(self, remote_recipe_id: str) -> bool:
         self.deleted_recipe_ids.append(remote_recipe_id)
+        if self.delete_ok:
+            self.recipes.pop(remote_recipe_id, None)
         return self.delete_ok
 
     async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
         self.saved_meta.append(recipe)
+        target = self.recipes[remote_id]
+        target.title = recipe.title
+        target.description = recipe.description
+        target.portions = recipe.portions
+        target.prep_time = recipe.prep_time
+        target.cook_time = recipe.cook_time
+        target.steps = list(recipe.steps)
         return True
+
+    async def cookbook(self) -> list[RecipeSummary]:
+        return [RecipeSummary(remote_id=remote_id, title=recipe.title) for remote_id, recipe in self.recipes.items()]
 
     async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
         return self.details.get(result.food_id, result)
@@ -86,13 +121,25 @@ class FakeFatSecretClient:
 
 
 class FakeCreatedSyncTargetClient(FakeFatSecretClient):
-    def __init__(self, remote_id: str, account_key: str, *, delete_ok: bool = True) -> None:
+    def __init__(
+        self,
+        remote_id: str,
+        account_key: str,
+        *,
+        delete_ok: bool = True,
+        created_remote_id: str | None = None,
+    ) -> None:
         super().__init__(Recipe(id=remote_id, title="Омлет"), account_key=account_key, delete_ok=delete_ok)
         self.created_recipe: Recipe | None = None
+        self.created_remote_id = created_remote_id or remote_id
 
     async def create_recipe(self, recipe: Recipe) -> str:
         self.created_recipe = recipe
-        return self.target.id
+        created = copy.deepcopy(recipe)
+        created.id = self.created_remote_id
+        created.ingredients = []
+        self.recipes[self.created_remote_id] = created
+        return self.created_remote_id
 
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         assert remote_recipe_id == self.target.id
@@ -114,6 +161,60 @@ class FakeSlowDetailClient(FakeFatSecretClient):
             return self.details.get(result.food_id, result)
         finally:
             self.active_detail_calls -= 1
+
+
+class FakeTimeoutAfterIngredientClient(FakeFatSecretClient):
+    def __init__(self, target: Recipe, account_key: str) -> None:
+        super().__init__(target, account_key=account_key)
+        self.timed_out = False
+
+    async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
+        accepted = await super().add_ingredient(remote_recipe_id, ingredient)
+        if not self.timed_out:
+            self.timed_out = True
+            raise httpx.ReadTimeout("ambiguous ingredient save", request=httpx.Request("POST", "https://example.test"))
+        return accepted
+
+
+class FakeStaleDetailClient(FakeFatSecretClient):
+    async def get_recipe(self, remote_id: str) -> Recipe:
+        recipe = await super().get_recipe(remote_id)
+        if remote_id != self.target.id:
+            recipe.ingredients = []
+        return recipe
+
+
+class FakeAmbiguousDeleteClient(FakeFatSecretClient):
+    def __init__(self, target: Recipe, account_key: str, *, disappeared: bool) -> None:
+        super().__init__(target, account_key=account_key)
+        self.disappeared = disappeared
+        self.delete_calls = 0
+
+    async def delete_recipe(self, remote_recipe_id: str) -> bool:
+        self.delete_calls += 1
+        self.deleted_recipe_ids.append(remote_recipe_id)
+        if self.delete_calls == 1:
+            if self.disappeared:
+                self.recipes.pop(remote_recipe_id, None)
+            raise httpx.ReadTimeout("ambiguous delete", request=httpx.Request("POST", "https://example.test"))
+        self.recipes.pop(remote_recipe_id, None)
+        return True
+
+
+class FakeFinalRenameFailureClient(FakeFatSecretClient):
+    def __init__(self, target: Recipe, account_key: str) -> None:
+        super().__init__(target, account_key=account_key)
+        self.failed_final_rename = False
+
+    async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
+        if (
+            recipe.title == "Омлет"
+            and self.target.id not in self.recipes
+            and not self.failed_final_rename
+        ):
+            self.failed_final_rename = True
+            raise FatSecretError("final rename interrupted")
+        return await super().save_recipe_meta(recipe, remote_id)
 
 
 class FakeCustomFoodSourceClient(FakeFatSecretClient):
@@ -140,6 +241,7 @@ class FakeCustomFoodTargetClient(FakeFatSecretClient):
         self.source_food_id = source_food_id
         self.cloned_food_id = cloned_food_id
         self.created_custom_foods: list[CustomFoodDefinition] = []
+        self.visible_definition: CustomFoodDefinition | None = None
 
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         assert remote_recipe_id == self.target.id
@@ -157,7 +259,13 @@ class FakeCustomFoodTargetClient(FakeFatSecretClient):
 
     async def create_custom_food(self, definition: CustomFoodDefinition) -> str:
         self.created_custom_foods.append(definition)
+        self.visible_definition = definition
         return self.cloned_food_id
+
+    async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
+        if remote_id == self.cloned_food_id and self.visible_definition is not None:
+            return self.visible_definition
+        raise FatSecretNotCustomFoodError(f"{self.account.label}: food {remote_id} is not a user-created product")
 
 
 class FakeFacebookFoodTargetClient(FakeFatSecretClient):
@@ -573,6 +681,111 @@ def test_sync_ingredients_clones_custom_food_before_cross_account_add_and_reuses
         assert target.saved_ingredients == []
         assert target.created_custom_foods == [definition]
         assert source.custom_food_requests == [source_food_id]
+    finally:
+        storage.close()
+
+
+def test_prepare_target_recipe_clones_nina_farina_before_any_ingredient_save(tmp_path) -> None:
+    source_food_id = "132165426"
+    cloned_food_id = "target-custom-1"
+    source_recipe = Recipe(
+        id="source-recipe",
+        title="Мороженое",
+        ingredients=[
+            Ingredient(
+                id="source-iid",
+                recipe_id="source-recipe",
+                food_id=source_food_id,
+                title="Сухая Смесь для Приготовления Мороженного Nina Farina",
+                portion_id="0",
+                amount=Decimal("0.75"),
+                portion_description="100г",
+                grams=Decimal("75"),
+            )
+        ],
+    )
+    definition = CustomFoodDefinition(
+        source_recipe_id=source_food_id,
+        title="Сухая Смесь для Приготовления Мороженного Nina Farina",
+        manufacturer_name="Nina Farina",
+        serving_type="Per100g",
+        serving_size="100",
+        metric_serving_size="100g",
+        nutrients={"calories": Decimal("395")},
+    )
+    source = FakeCustomFoodSourceClient(source_recipe, definition, account_key="tg-source")
+    target = FakeCustomFoodTargetClient(
+        Recipe(id="target", title="Мороженое"),
+        source_food_id,
+        cloned_food_id,
+        account_key="tg-target",
+    )
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+
+        prepared = asyncio.run(
+            engine._prepare_target_recipe(
+                source,
+                target,
+                "tg-source",
+                "tg-target",
+                source_recipe,
+                {},
+            )
+        )
+        repeated = asyncio.run(
+            engine._prepare_target_recipe(
+                source,
+                target,
+                "tg-source",
+                "tg-target",
+                source_recipe,
+                {},
+            )
+        )
+
+        assert [item.food_id for item in prepared.ingredients] == [cloned_food_id]
+        assert [item.food_id for item in repeated.ingredients] == [cloned_food_id]
+        assert target.saved_ingredients == []
+        assert target.created_custom_foods == [definition]
+        assert storage.custom_food_mapping("tg-source", source_food_id, "tg-target") == cloned_food_id
+        assert storage.custom_food_mapping("tg-target", cloned_food_id, "tg-source") == source_food_id
+    finally:
+        storage.close()
+
+
+def test_prepare_target_recipe_keeps_public_food_without_mapping(tmp_path) -> None:
+    ingredient = Ingredient(
+        id="milk",
+        recipe_id="source",
+        food_id="46136861",
+        title="Молоко Савушкин 1,5%",
+        portion_id="0",
+        amount=Decimal("1"),
+        portion_description="100г",
+        grams=Decimal("100"),
+    )
+    source_recipe = Recipe(id="source", title="Молоко", ingredients=[ingredient])
+    source = FakeFatSecretClient(source_recipe, account_key="tg-source")
+    target = FakeFatSecretClient(Recipe(id="target", title="Молоко"), account_key="tg-target")
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+
+        prepared = asyncio.run(
+            engine._prepare_target_recipe(
+                source,
+                target,
+                "tg-source",
+                "tg-target",
+                source_recipe,
+                {},
+            )
+        )
+
+        assert prepared.ingredients[0].food_id == ingredient.food_id
+        assert storage.custom_food_mapping("tg-source", ingredient.food_id, "tg-target") is None
     finally:
         storage.close()
 
@@ -2206,6 +2419,53 @@ def test_load_remote_recipe_index_merges_live_cookbooks_by_title(tmp_path) -> No
         storage.close()
 
 
+def test_hydrate_live_recipe_variants_keeps_conflicting_account_versions(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        first_recipe = Recipe(
+            id="111",
+            title="Омлет",
+            portions=Decimal("2"),
+            steps=["Смешать"],
+            ingredients=[
+                Ingredient("a", "111", "egg", "Яйцо", "0", Decimal("1"), "100г", grams=Decimal("100"))
+            ],
+        )
+        second_recipe = Recipe(
+            id="222",
+            title="Омлет",
+            portions=Decimal("4"),
+            steps=["Запечь"],
+            ingredients=[
+                Ingredient("b", "222", "egg", "Яйцо", "0", Decimal("2"), "100г", grams=Decimal("200"))
+            ],
+        )
+        recipe_ref = Recipe(
+            id="live-omlet",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "111", "tg22": "222"},
+            remote_ids_by_account={"tg11": ["111"], "tg22": ["222"]},
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": FakeFatSecretClient(first_recipe, account_key="tg11"),
+            "tg22": FakeFatSecretClient(second_recipe, account_key="tg22"),
+        }
+
+        variants = asyncio.run(engine.hydrate_live_recipe_variants(recipe_ref))
+
+        assert [(item.account_key, item.remote_recipe_id) for item in variants] == [
+            ("tg11", "111"),
+            ("tg22", "222"),
+        ]
+        assert len({item.fingerprint.digest for item in variants}) == 2
+        assert storage.remote_recipe_snapshot("tg11", "111") is not None
+        assert storage.remote_recipe_snapshot("tg22", "222") is not None
+    finally:
+        storage.close()
+
+
 def test_load_remote_recipe_index_reconciles_recipes_deleted_outside_bot(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -2306,12 +2566,13 @@ def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path
         synced, results = asyncio.run(engine.sync_live_recipe_from_source(recipe_ref, "tg11"))
 
         assert synced.id == "local-live"
-        assert synced.remote_ids == {"tg11": "111", "tg22": "222"}
+        assert synced.remote_ids == {"tg11": "111", "tg22": "222-created-1"}
         assert [result.ok for result in results] == [True, True]
         assert first.saved_meta == []
         assert second.saved_ingredients[0].title == "Яйцо"
-        assert second.deleted_ingredient_ids == ["iid-extra"]
-        assert results[1].message == "добавлено ингредиентов: 1; удалено лишних ингредиентов: 1"
+        assert second.deleted_ingredient_ids == []
+        assert second.deleted_recipe_ids == ["222"]
+        assert results[1].message == "добавлено ингредиентов: 1"
         assert storage.list_recipes("group") == []
     finally:
         storage.close()
@@ -2386,7 +2647,7 @@ def test_sync_live_recipe_copies_raw_yogurt_payload_and_returns_normalized_displ
         storage.close()
 
 
-def test_sync_live_recipe_reports_error_when_existing_target_extra_cannot_be_deleted(tmp_path) -> None:
+def test_sync_live_recipe_swap_does_not_depend_on_deleting_old_ingredients(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         source_recipe = Recipe(id="111", title="Омлет", group_id="group")
@@ -2420,11 +2681,10 @@ def test_sync_live_recipe_reports_error_when_existing_target_extra_cannot_be_del
 
         synced, results = asyncio.run(engine.sync_live_recipe_from_source(recipe_ref, "tg11"))
 
-        assert [result.ok for result in results] == [True, False]
-        assert "не удалил лишний ингредиент «Лишнее»" in results[1].message
-        assert target.deleted_ingredient_ids == ["iid-extra"]
-        assert target.deleted_recipe_ids == []
-        assert synced.remote_ids == {"tg11": "111", "tg22": "222"}
+        assert [result.ok for result in results] == [True, True]
+        assert target.deleted_ingredient_ids == []
+        assert target.deleted_recipe_ids == ["222"]
+        assert synced.remote_ids == {"tg11": "111", "tg22": "222-created-1"}
     finally:
         storage.close()
 
@@ -2548,7 +2808,7 @@ def test_sync_live_recipe_keeps_new_target_mapping_when_rollback_fails(tmp_path)
         storage.close()
 
 
-def test_sync_live_recipe_never_rolls_back_preexisting_target(tmp_path) -> None:
+def test_sync_live_recipe_rolls_back_swap_copy_without_deleting_preexisting_target(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         source_recipe = Recipe(
@@ -2574,16 +2834,180 @@ def test_sync_live_recipe_never_rolls_back_preexisting_target(tmp_path) -> None:
             remote_ids_by_account={"tg11": ["111"], "tg22": ["222"]},
         )
         source = FakeFatSecretClient(source_recipe, account_key="tg11")
-        target = FakeCreatedSyncTargetClient("222", "tg22")
+        target = FakeCreatedSyncTargetClient("222", "tg22", created_remote_id="333")
         engine = RecipeSyncEngine(storage, _device())
         engine._build_clients = lambda group_id=None: {"tg11": source, "tg22": target}  # type: ignore[method-assign]
 
         synced, results = asyncio.run(engine.sync_live_recipe_from_source(recipe_ref, "tg11"))
 
         assert [result.ok for result in results] == [True, False]
-        assert target.created_recipe is None
-        assert target.deleted_recipe_ids == []
+        assert target.created_recipe is not None
+        assert target.deleted_recipe_ids == ["333"]
+        assert "222" in target.recipes
         assert synced.remote_ids == {"tg11": "111", "tg22": "222"}
+    finally:
+        storage.close()
+
+
+def test_ambiguous_ingredient_timeout_resumes_from_fresh_target_diff(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        expected = Recipe(
+            id="live",
+            title="Омлет",
+            ingredients=[
+                Ingredient("egg", "live", "food-egg", "Яйцо", "0", Decimal("1"), "100г")
+            ],
+        )
+        client = FakeTimeoutAfterIngredientClient(Recipe(id="base", title="unused"), "tg22")
+        engine = RecipeSyncEngine(storage, _device())
+
+        remote_id, stats, created = asyncio.run(
+            engine._synchronize_target_recipe(
+                client,
+                "tg22",
+                expected,
+                None,
+                persist_mapping=False,
+            )
+        )
+
+        assert created is True
+        assert remote_id == "base-created-1"
+        assert len(client.saved_ingredients) == 1
+        assert stats.unchanged == 1
+        assert len(client.recipes[remote_id].ingredients) == 1
+    finally:
+        storage.close()
+
+
+def test_verified_sync_rejects_stale_detail_and_rolls_back_new_target(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        expected = Recipe(
+            id="live",
+            title="Омлет",
+            ingredients=[
+                Ingredient("egg", "live", "food-egg", "Яйцо", "0", Decimal("1"), "100г")
+            ],
+        )
+        client = FakeStaleDetailClient(Recipe(id="base", title="unused"), account_key="tg22")
+        engine = RecipeSyncEngine(storage, _device())
+
+        with pytest.raises(FatSecretError) as error:
+            asyncio.run(
+                engine._synchronize_target_recipe(
+                    client,
+                    "tg22",
+                    expected,
+                    None,
+                    persist_mapping=False,
+                )
+            )
+
+        assert "несовпадающий рецепт" in str(error.value)
+        assert client.deleted_recipe_ids == ["base-created-1"]
+        assert "base-created-1" not in client.recipes
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("disappeared, expected_calls", [(True, 1), (False, 2)])
+def test_ambiguous_delete_uses_cookbook_readback_before_optional_retry(
+    tmp_path,
+    disappeared: bool,
+    expected_calls: int,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        client = FakeAmbiguousDeleteClient(
+            Recipe(id="222", title="Омлет"),
+            "tg22",
+            disappeared=disappeared,
+        )
+        engine = RecipeSyncEngine(storage, _device())
+
+        deleted = asyncio.run(engine._delete_remote_recipe_confirmed(client, "222"))
+
+        assert deleted is True
+        assert client.delete_calls == expected_calls
+        assert "222" not in client.recipes
+    finally:
+        storage.close()
+
+
+def test_non_transient_delete_error_is_not_replayed_after_readback(tmp_path) -> None:
+    class RedirectDeleteClient(FakeFatSecretClient):
+        def __init__(self) -> None:
+            super().__init__(Recipe(id="222", title="Омлет"), "tg22")
+            self.delete_calls = 0
+
+        async def delete_recipe(self, remote_recipe_id: str) -> bool:
+            self.delete_calls += 1
+            raise FatSecretActionError(
+                "redirect",
+                status_code=302,
+                page="RecipeActionAndroidPage.aspx",
+                action="recipedelete",
+                location="/ErrorLogUserFeedback.ashx",
+                replayed=True,
+            )
+
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        client = RedirectDeleteClient()
+        engine = RecipeSyncEngine(storage, _device())
+
+        with pytest.raises(FatSecretActionError):
+            asyncio.run(engine._delete_remote_recipe_confirmed(client, "222"))
+
+        assert client.delete_calls == 1
+        assert "222" in client.recipes
+    finally:
+        storage.close()
+
+
+def test_recipe_swap_resumes_after_old_target_deleted_and_final_rename_failed(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        expected = Recipe(
+            id="live-omlet",
+            title="Омлет",
+            ingredients=[
+                Ingredient("egg", "live-omlet", "food-egg", "Яйцо", "0", Decimal("1"), "100г")
+            ],
+        )
+        client = FakeFinalRenameFailureClient(Recipe(id="222", title="Старый"), "tg22")
+        engine = RecipeSyncEngine(storage, _device())
+
+        with pytest.raises(FatSecretError, match="final rename interrupted"):
+            asyncio.run(
+                engine._synchronize_target_recipe(
+                    client,
+                    "tg22",
+                    expected,
+                    "222",
+                    persist_mapping=False,
+                )
+            )
+        runs = storage.incomplete_recipe_swap_runs()
+        assert len(runs) == 1
+        assert runs[0]["status"] == "old_deleted"
+
+        remote_id, _, swapped = asyncio.run(
+            engine._synchronize_target_recipe(
+                client,
+                "tg22",
+                expected,
+                "222",
+                persist_mapping=False,
+            )
+        )
+
+        assert swapped is True
+        assert remote_id == "222-created-1"
+        assert storage.incomplete_recipe_swap_runs() == []
+        assert client.recipes[remote_id].title == "Омлет"
     finally:
         storage.close()
 

@@ -12,6 +12,7 @@ from fatsecret_bot.telegram_bot import (
     _parse_recipe_steps,
     _recipe_list_candidate_keyboard,
     _recipe_list_draft_keyboard,
+    _recipe_list_input_error_keyboard,
 )
 
 
@@ -67,6 +68,15 @@ def test_parse_recipe_list_payload_splits_ingredients_and_steps() -> None:
         ("Куркума", Decimal("5")),
     ]
     assert steps == ["Нарезать филе", "Запечь", "Подать", "Лишнее"]
+
+
+def test_list_validation_errors_always_offer_visible_cancel() -> None:
+    keyboard = _recipe_list_input_error_keyboard()
+
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    assert [(button.text, button.callback_data) for button in buttons] == [
+        ("Отмена", "recipe_list_cancel:0")
+    ]
 
 
 def test_parse_recipe_list_payload_requires_portions_separately() -> None:

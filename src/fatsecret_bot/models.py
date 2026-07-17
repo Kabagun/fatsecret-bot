@@ -86,6 +86,32 @@ class Recipe:
 
 
 @dataclass(frozen=True)
+class RecipeFingerprint:
+    """Canonical account-specific recipe content used for verified synchronization."""
+
+    digest: str
+    canonical_json: str
+
+
+@dataclass(frozen=True)
+class RemoteRecipeVariant:
+    """One fully hydrated recipe version owned by one FatSecret account."""
+
+    account_key: str
+    remote_recipe_id: str
+    recipe: Recipe
+    fingerprint: RecipeFingerprint
+
+
+@dataclass(frozen=True)
+class RecipeConflict:
+    """A normalized recipe title whose account-specific contents differ."""
+
+    title: str
+    variants: list[RemoteRecipeVariant]
+
+
+@dataclass(frozen=True)
 class RecipeGroup:
     id: str
     name: str

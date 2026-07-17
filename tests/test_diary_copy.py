@@ -146,6 +146,51 @@ def _source_day(entry: FoodDiaryEntry | None = None) -> FoodDiaryDay:
     )
 
 
+def test_diary_copy_with_three_accounts_uses_only_selected_targets(tmp_path) -> None:
+    storage, group_id = _storage_with_group(tmp_path)
+    try:
+        third_key = storage.create_fatsecret_account(
+            11,
+            "Third",
+            "third@example.com",
+            "secret",
+            "BY",
+            "ru",
+            group_id=group_id,
+        )
+        source = FakeDiaryClient(_account("tg11"), _source_day())
+        selected = FakeDiaryClient(_account("tg22"))
+        unselected = FakeDiaryClient(_account(third_key))
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_client = lambda account: source  # type: ignore[method-assign]
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": source,
+            "tg22": selected,
+            third_key: unselected,
+        }
+
+        preview = asyncio.run(
+            engine.prepare_diary_copy(
+                group_id,
+                11,
+                "tg11",
+                dt.date(2026, 7, 14),
+                dt.date(2026, 7, 15),
+                dt.date(2026, 7, 15),
+                target_account_keys=["tg22"],
+            )
+        )
+        result = asyncio.run(engine.execute_diary_copy(preview.run_id))
+
+        assert result.status == "completed"
+        assert len(selected.bulk_calls) == 1
+        assert source.bulk_calls == []
+        assert unselected.bulk_calls == []
+        assert [item.account_key for item in result.dates] == ["tg22"]
+    finally:
+        storage.close()
+
+
 def test_diary_copy_appends_to_both_accounts_skips_exact_source_and_is_idempotent(tmp_path) -> None:
     storage, group_id = _storage_with_group(tmp_path)
     try:
@@ -394,6 +439,24 @@ def test_client_parses_diary_and_custom_food_and_sends_bulk_payload() -> None:
     assert payload["recordedDate"] == 20649
     assert payload["recipes"][0]["recipeportionid"] == 10270
     assert payload["deletes"] == []
+
+
+def test_client_sends_official_diary_delete_id_payload() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"insertedEntries": {}, "failedEntries": []})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(_account("tg11"), _device(), http=http, session=FatSecretSession("s", "d", "k"))
+    try:
+        asyncio.run(client.delete_food_diary_entries(dt.date(2026, 7, 15), ["55", "56"]))
+    finally:
+        asyncio.run(http.aclose())
+
+    payload = json.loads(requests[0].content)
+    assert payload == {"recordedDate": 20649, "recipes": [], "deletes": [55, 56]}
 
 
 def test_facebook_source_is_not_custom_when_is_own_is_false() -> None:

@@ -9,6 +9,7 @@ import string
 import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 
 from .models import (
     CachedFoodUsage,
@@ -17,6 +18,7 @@ from .models import (
     FatSecretSession,
     Ingredient,
     Recipe,
+    RecipeFingerprint,
     RecipeGroup,
     RecipeGroupMember,
     RecipeSummary,
@@ -25,7 +27,7 @@ from .portions import grams_from_portion, is_bare_weight_portion
 
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
-STORAGE_SCHEMA_VERSION = 1
+STORAGE_SCHEMA_VERSION = 2
 DIARY_COPY_STALE_AFTER = dt.timedelta(minutes=30)
 
 
@@ -74,6 +76,78 @@ def _decimal_or_none(value: str | None) -> Decimal | None:
         return None
 
 
+def _recipe_snapshot_json(recipe: Recipe) -> str:
+    payload: dict[str, Any] = {
+        "title": recipe.title,
+        "description": recipe.description,
+        "portions": str(recipe.portions),
+        "prep_time": recipe.prep_time,
+        "cook_time": recipe.cook_time,
+        "steps": list(recipe.steps),
+        "default_portion_id": recipe.default_portion_id,
+        "default_portion_description": recipe.default_portion_description,
+        "ingredients": [
+            {
+                "id": ingredient.id,
+                "food_id": ingredient.food_id,
+                "title": ingredient.title,
+                "portion_id": ingredient.portion_id,
+                "amount": str(ingredient.amount),
+                "portion_description": ingredient.portion_description,
+                "remote_ingredient_id": ingredient.remote_ingredient_id,
+                "grams": str(ingredient.grams) if ingredient.grams is not None else None,
+            }
+            for ingredient in recipe.ingredients
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _recipe_from_snapshot_json(
+    snapshot_json: str,
+    account_key: str,
+    remote_recipe_id: str,
+) -> Recipe | None:
+    try:
+        payload = json.loads(snapshot_json)
+        if not isinstance(payload, dict):
+            return None
+        recipe = Recipe(
+            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"fatsecret-snapshot:{account_key}:{remote_recipe_id}")),
+            title=str(payload.get("title") or ""),
+            description=str(payload.get("description") or ""),
+            portions=Decimal(str(payload.get("portions") or "1")),
+            prep_time=int(payload.get("prep_time") or 0),
+            cook_time=int(payload.get("cook_time") or 0),
+            steps=[str(step) for step in payload.get("steps") or [] if str(step).strip()],
+            default_portion_id=str(payload.get("default_portion_id") or "0"),
+            default_portion_description=str(payload.get("default_portion_description") or ""),
+            remote_ids={account_key: remote_recipe_id},
+            remote_ids_by_account={account_key: [remote_recipe_id]},
+        )
+        for position, item in enumerate(payload.get("ingredients") or []):
+            if not isinstance(item, dict):
+                continue
+            recipe.ingredients.append(
+                Ingredient(
+                    id=str(item.get("id") or f"snapshot-{position}"),
+                    recipe_id=recipe.id,
+                    food_id=str(item.get("food_id") or ""),
+                    title=str(item.get("title") or ""),
+                    portion_id=str(item.get("portion_id") or "0"),
+                    amount=Decimal(str(item.get("amount") or "0")),
+                    portion_description=str(item.get("portion_description") or ""),
+                    remote_ingredient_id=(
+                        str(item["remote_ingredient_id"])
+                        if item.get("remote_ingredient_id") is not None
+                        else None
+                    ),
+                    grams=(Decimal(str(item["grams"])) if item.get("grams") is not None else None),
+                )
+            )
+        return recipe
+    except (InvalidOperation, TypeError, ValueError, json.JSONDecodeError):
+        return None
 def _new_invite_code() -> str:
     return "".join(secrets.choice(INVITE_ALPHABET) for _ in range(8))
 
@@ -135,6 +209,14 @@ class Storage:
                 session_updated_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS group_accounts (
+                group_id TEXT NOT NULL REFERENCES recipe_groups(id) ON DELETE CASCADE,
+                account_key TEXT NOT NULL UNIQUE,
+                added_by INTEGER NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (group_id, account_key)
             );
 
             CREATE TABLE IF NOT EXISTS recipes (
@@ -210,6 +292,32 @@ class Storage:
                 PRIMARY KEY (source_account_key, source_food_id, target_account_key)
             );
 
+            CREATE TABLE IF NOT EXISTS remote_recipe_snapshots (
+                account_key TEXT NOT NULL,
+                remote_recipe_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                snapshot_json TEXT,
+                fingerprint TEXT,
+                seen_at TEXT NOT NULL,
+                fetched_at TEXT,
+                PRIMARY KEY (account_key, remote_recipe_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS recipe_swap_runs (
+                id TEXT PRIMARY KEY,
+                recipe_id TEXT NOT NULL,
+                account_key TEXT NOT NULL,
+                old_remote_id TEXT NOT NULL,
+                new_remote_id TEXT,
+                temporary_title TEXT NOT NULL,
+                final_title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS diary_copy_runs (
                 id TEXT PRIMARY KEY,
                 group_id TEXT NOT NULL,
@@ -246,13 +354,70 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_diary_copy_runs_group_created "
             "ON diary_copy_runs(group_id, created_at DESC)"
         )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_remote_recipe_snapshots_title "
+            "ON remote_recipe_snapshots(normalized_title, account_key)"
+        )
         self._backfill_default_group()
         current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
         if current_version < 1:
             self._normalize_zero_portion_gram_ingredients()
             self._backfill_ingredient_grams()
-            self._conn.execute(f"PRAGMA user_version = {STORAGE_SCHEMA_VERSION}")
+        if current_version < 2:
+            self._migrate_multi_account_schema()
+        self._conn.execute(f"PRAGMA user_version = {STORAGE_SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _migrate_multi_account_schema(self) -> None:
+        """Replace the one-account-per-user table and attach accounts to their active groups."""
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(fatsecret_accounts)").fetchall()
+        }
+        if "owner_telegram_id" not in columns:
+            self._conn.executescript(
+                """
+                CREATE TABLE fatsecret_accounts_v2 (
+                    account_key TEXT PRIMARY KEY,
+                    owner_telegram_id INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    session_server_id TEXT,
+                    session_device_key TEXT,
+                    session_secret_key TEXT,
+                    session_updated_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO fatsecret_accounts_v2(
+                    account_key, owner_telegram_id, label, username, password, market, language,
+                    session_server_id, session_device_key, session_secret_key, session_updated_at,
+                    created_at, updated_at
+                )
+                SELECT
+                    account_key, telegram_id, label, username, password, market, language,
+                    session_server_id, session_device_key, session_secret_key, session_updated_at,
+                    created_at, updated_at
+                FROM fatsecret_accounts;
+                DROP TABLE fatsecret_accounts;
+                ALTER TABLE fatsecret_accounts_v2 RENAME TO fatsecret_accounts;
+                """
+            )
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO group_accounts(group_id, account_key, added_by, added_at)
+            SELECT u.active_group_id, fa.account_key, fa.owner_telegram_id, ?
+            FROM fatsecret_accounts fa
+            JOIN telegram_users u ON u.telegram_id = fa.owner_telegram_id
+            JOIN group_members gm
+                ON gm.telegram_id = fa.owner_telegram_id AND gm.group_id = u.active_group_id
+            WHERE u.active_group_id IS NOT NULL
+            """,
+            (_now(),),
+        )
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {
@@ -380,9 +545,8 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT COUNT(*) AS c
-                FROM fatsecret_accounts fa
-                JOIN group_members gm ON gm.telegram_id = fa.telegram_id
-                WHERE gm.group_id = ?
+                FROM group_accounts
+                WHERE group_id = ?
                 """,
                 (group_id,),
             ).fetchone()
@@ -403,8 +567,8 @@ class Storage:
                 """
                 SELECT fa.account_key, fa.label, fa.username, fa.password, fa.market, fa.language
                 FROM fatsecret_accounts fa
-                JOIN group_members gm ON gm.telegram_id = fa.telegram_id
-                WHERE gm.group_id = ?
+                JOIN group_accounts ga ON ga.account_key = fa.account_key
+                WHERE ga.group_id = ?
                 ORDER BY fa.label ASC, fa.account_key ASC
                 """,
                 (group_id,),
@@ -422,12 +586,14 @@ class Storage:
         ]
 
     def get_fatsecret_account_by_telegram_id(self, telegram_id: int) -> FatSecretAccountConfig | None:
-        """Return the FatSecret account connected by a Telegram user, if any."""
+        """Return the first FatSecret account owned by a Telegram user, if any."""
         row = self._conn.execute(
             """
             SELECT account_key, label, username, password, market, language
             FROM fatsecret_accounts
-            WHERE telegram_id = ?
+            WHERE owner_telegram_id = ?
+            ORDER BY created_at ASC, account_key ASC
+            LIMIT 1
             """,
             (telegram_id,),
         ).fetchone()
@@ -462,6 +628,45 @@ class Storage:
             market=row["market"],
             language=row["language"],
         )
+
+    def list_fatsecret_accounts_for_owner(self, telegram_id: int) -> list[FatSecretAccountConfig]:
+        """Return every FatSecret account whose credentials are owned by one Telegram user."""
+        rows = self._conn.execute(
+            """
+            SELECT account_key, label, username, password, market, language
+            FROM fatsecret_accounts
+            WHERE owner_telegram_id = ?
+            ORDER BY created_at ASC, account_key ASC
+            """,
+            (telegram_id,),
+        ).fetchall()
+        return [
+            FatSecretAccountConfig(
+                key=row["account_key"],
+                label=row["label"],
+                username=row["username"],
+                password=row["password"],
+                market=row["market"],
+                language=row["language"],
+            )
+            for row in rows
+        ]
+
+    def fatsecret_account_owner(self, account_key: str) -> int | None:
+        """Return the Telegram owner of one FatSecret account."""
+        row = self._conn.execute(
+            "SELECT owner_telegram_id FROM fatsecret_accounts WHERE account_key = ?",
+            (account_key,),
+        ).fetchone()
+        return int(row["owner_telegram_id"]) if row is not None else None
+
+    def fatsecret_account_group_id(self, account_key: str) -> str | None:
+        """Return the single group to which a FatSecret account is attached."""
+        row = self._conn.execute(
+            "SELECT group_id FROM group_accounts WHERE account_key = ?",
+            (account_key,),
+        ).fetchone()
+        return str(row["group_id"]) if row is not None else None
 
     def get_fatsecret_session(self, account_key: str) -> FatSecretSession | None:
         """Return a cached FatSecret mobile session for an account, if one is stored."""
@@ -537,18 +742,21 @@ class Storage:
         return [RecipeGroup(id=row["id"], name=row["name"], invite_code=row["invite_code"]) for row in rows]
 
     def group_members(self, group_id: str) -> list[RecipeGroupMember]:
-        """Return Telegram users joined to a recipe group with their FatSecret account, if connected."""
+        """Return Telegram members with labels of their accounts attached to this group."""
         rows = self._conn.execute(
             """
             SELECT
                 u.telegram_id,
                 u.display_name,
-                fa.label AS fatsecret_label,
-                fa.username AS fatsecret_username
+                GROUP_CONCAT(CASE WHEN ga.account_key IS NOT NULL THEN fa.label END, ', ') AS fatsecret_label,
+                GROUP_CONCAT(CASE WHEN ga.account_key IS NOT NULL THEN fa.username END, ', ') AS fatsecret_username
             FROM group_members gm
             JOIN telegram_users u ON u.telegram_id = gm.telegram_id
-            LEFT JOIN fatsecret_accounts fa ON fa.telegram_id = u.telegram_id
+            LEFT JOIN fatsecret_accounts fa ON fa.owner_telegram_id = u.telegram_id
+            LEFT JOIN group_accounts ga
+                ON ga.account_key = fa.account_key AND ga.group_id = gm.group_id
             WHERE gm.group_id = ?
+            GROUP BY u.telegram_id, u.display_name
             ORDER BY u.display_name ASC, u.telegram_id ASC
             """,
             (group_id,),
@@ -697,39 +905,152 @@ class Storage:
         market: str,
         language: str,
     ) -> str:
-        """Create or replace the FatSecret account owned by a Telegram user."""
+        """Create the first owned account or update that legacy account in place."""
         existing = self._conn.execute(
-            "SELECT account_key FROM fatsecret_accounts WHERE telegram_id = ?",
+            """
+            SELECT account_key FROM fatsecret_accounts
+            WHERE owner_telegram_id = ?
+            ORDER BY created_at ASC, account_key ASC
+            LIMIT 1
+            """,
             (telegram_id,),
         ).fetchone()
-        account_key = existing["account_key"] if existing else f"tg{telegram_id}"
+        if existing is None:
+            return self.create_fatsecret_account(
+                telegram_id,
+                label,
+                username,
+                password,
+                market,
+                language,
+            )
+        account_key = str(existing["account_key"])
         now = _now()
         self._conn.execute(
             """
-            INSERT INTO fatsecret_accounts(
-                account_key, telegram_id, label, username, password, market,
-                language, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_key) DO UPDATE SET
-                label = excluded.label,
-                username = excluded.username,
-                password = excluded.password,
-                market = excluded.market,
-                language = excluded.language,
+            UPDATE fatsecret_accounts
+            SET label = ?, username = ?, password = ?, market = ?, language = ?,
                 session_server_id = NULL,
                 session_device_key = NULL,
                 session_secret_key = NULL,
                 session_updated_at = NULL,
-                updated_at = excluded.updated_at
+                updated_at = ?
+            WHERE account_key = ?
             """,
-            (account_key, telegram_id, label, username, password, market, language, now, now),
+            (label, username, password, market, language, now, account_key),
         )
         self._conn.commit()
         return account_key
 
-    def update_fatsecret_account_label(self, account_key: str, label: str) -> bool:
-        """Update the bot-facing nickname for one connected FatSecret account."""
+    def create_fatsecret_account(
+        self,
+        telegram_id: int,
+        label: str,
+        username: str,
+        password: str,
+        market: str,
+        language: str,
+        *,
+        group_id: str | None = None,
+    ) -> str:
+        """Create another owned FatSecret account and attach it to at most one group."""
+        owned_count = int(
+            self._conn.execute(
+                "SELECT COUNT(*) AS c FROM fatsecret_accounts WHERE owner_telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()["c"]
+        )
+        account_key = f"tg{telegram_id}" if owned_count == 0 else f"tg{telegram_id}-{uuid.uuid4().hex[:8]}"
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO fatsecret_accounts(
+                account_key, owner_telegram_id, label, username, password, market,
+                language, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (account_key, telegram_id, label, username, password, market, language, now, now),
+        )
+        target_group_id = group_id
+        if target_group_id is None:
+            row = self._conn.execute(
+                "SELECT active_group_id FROM telegram_users WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            target_group_id = str(row["active_group_id"]) if row is not None and row["active_group_id"] else None
+        if target_group_id is not None:
+            member = self._conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id = ? AND telegram_id = ?",
+                (target_group_id, telegram_id),
+            ).fetchone()
+            if member is None:
+                self._conn.rollback()
+                raise ValueError("FatSecret account owner is not a member of the target group")
+            self._conn.execute(
+                """
+                INSERT INTO group_accounts(group_id, account_key, added_by, added_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (target_group_id, account_key, telegram_id, now),
+            )
+        self._conn.commit()
+        return account_key
+
+    def attach_fatsecret_account_to_group(
+        self,
+        account_key: str,
+        group_id: str,
+        telegram_id: int,
+    ) -> bool:
+        """Attach an owned account to one joined group; an account cannot belong to two groups."""
+        if self.fatsecret_account_owner(account_key) != telegram_id:
+            return False
+        member = self._conn.execute(
+            "SELECT 1 FROM group_members WHERE group_id = ? AND telegram_id = ?",
+            (group_id, telegram_id),
+        ).fetchone()
+        if member is None or self.fatsecret_account_group_id(account_key) is not None:
+            return False
+        self._conn.execute(
+            """
+            INSERT INTO group_accounts(group_id, account_key, added_by, added_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (group_id, account_key, telegram_id, _now()),
+        )
+        self._conn.commit()
+        return True
+
+    def detach_fatsecret_account_from_group(
+        self,
+        account_key: str,
+        group_id: str,
+        telegram_id: int,
+    ) -> bool:
+        """Detach an account when requested by its owner or the group creator."""
+        owner = self.fatsecret_account_owner(account_key)
+        creator = self._conn.execute(
+            "SELECT created_by FROM recipe_groups WHERE id = ?",
+            (group_id,),
+        ).fetchone()
+        if owner != telegram_id and (creator is None or int(creator["created_by"]) != telegram_id):
+            return False
+        cursor = self._conn.execute(
+            "DELETE FROM group_accounts WHERE group_id = ? AND account_key = ?",
+            (group_id, account_key),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def update_fatsecret_account_label(
+        self,
+        account_key: str,
+        label: str,
+        *,
+        owner_telegram_id: int,
+    ) -> bool:
+        """Update an owned account nickname after enforcing credential ownership."""
         clean_label = label.strip()[:32]
         if not clean_label:
             return False
@@ -737,39 +1058,35 @@ class Storage:
             """
             UPDATE fatsecret_accounts
             SET label = ?, updated_at = ?
-            WHERE account_key = ?
+            WHERE account_key = ? AND owner_telegram_id = ?
             """,
-            (clean_label, _now(), account_key),
+            (clean_label, _now(), account_key, owner_telegram_id),
         )
         self._conn.commit()
         return cursor.rowcount > 0
 
     def delete_fatsecret_account_for_user(self, telegram_id: int) -> bool:
-        """Delete a user's FatSecret account and stale remote recipe mappings."""
-        row = self._conn.execute(
-            "SELECT account_key FROM fatsecret_accounts WHERE telegram_id = ?",
+        """Delete the only account owned by a user; refuse an ambiguous multi-account delete."""
+        rows = self._conn.execute(
+            "SELECT account_key FROM fatsecret_accounts WHERE owner_telegram_id = ?",
             (telegram_id,),
-        ).fetchone()
-        if row is None:
+        ).fetchall()
+        if len(rows) != 1:
             return False
-        self._conn.execute("DELETE FROM account_recipes WHERE account_key = ?", (row["account_key"],))
-        self._conn.execute(
-            "DELETE FROM custom_food_mappings WHERE source_account_key = ? OR target_account_key = ?",
-            (row["account_key"], row["account_key"]),
-        )
-        self._conn.execute("DELETE FROM fatsecret_accounts WHERE telegram_id = ?", (telegram_id,))
-        self._conn.commit()
-        return True
+        return self.delete_fatsecret_account(str(rows[0]["account_key"]), owner_telegram_id=telegram_id)
 
-    def delete_fatsecret_account(self, account_key: str) -> bool:
-        """Delete a selected FatSecret account and stale remote recipe mappings."""
+    def delete_fatsecret_account(self, account_key: str, *, owner_telegram_id: int | None = None) -> bool:
+        """Delete a selected owned account and all bot-side account metadata."""
         row = self._conn.execute(
-            "SELECT 1 FROM fatsecret_accounts WHERE account_key = ?",
+            "SELECT owner_telegram_id FROM fatsecret_accounts WHERE account_key = ?",
             (account_key,),
         ).fetchone()
-        if row is None:
+        if row is None or (owner_telegram_id is not None and int(row["owner_telegram_id"]) != owner_telegram_id):
             return False
+        self._conn.execute("DELETE FROM group_accounts WHERE account_key = ?", (account_key,))
         self._conn.execute("DELETE FROM account_recipes WHERE account_key = ?", (account_key,))
+        self._conn.execute("DELETE FROM remote_recipe_snapshots WHERE account_key = ?", (account_key,))
+        self._conn.execute("DELETE FROM recipe_swap_runs WHERE account_key = ?", (account_key,))
         self._conn.execute(
             "DELETE FROM custom_food_mappings WHERE source_account_key = ? OR target_account_key = ?",
             (account_key, account_key),
@@ -1371,6 +1688,291 @@ class Storage:
         self._conn.commit()
         return len(stale)
 
+    def upsert_remote_recipe_summary(
+        self,
+        account_key: str,
+        remote_recipe_id: str,
+        title: str,
+        *,
+        seen_at: dt.datetime | None = None,
+    ) -> None:
+        """Record that one remote recipe identity appeared in an authoritative cookbook."""
+        self._conn.execute(
+            """
+            INSERT INTO remote_recipe_snapshots(
+                account_key, remote_recipe_id, title, normalized_title,
+                snapshot_json, fingerprint, seen_at, fetched_at
+            )
+            VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)
+            ON CONFLICT(account_key, remote_recipe_id) DO UPDATE SET
+                title = excluded.title,
+                normalized_title = excluded.normalized_title,
+                seen_at = excluded.seen_at
+            """,
+            (
+                account_key,
+                remote_recipe_id,
+                title,
+                normalize_title(title),
+                _timestamp(seen_at),
+            ),
+        )
+        self._conn.commit()
+
+    def upsert_remote_recipe_snapshot(
+        self,
+        account_key: str,
+        remote_recipe_id: str,
+        recipe: Recipe,
+        fingerprint: RecipeFingerprint,
+        *,
+        fetched_at: dt.datetime | None = None,
+    ) -> None:
+        """Persist one fully hydrated account-specific remote recipe version."""
+        timestamp = _timestamp(fetched_at)
+        self._conn.execute(
+            """
+            INSERT INTO remote_recipe_snapshots(
+                account_key, remote_recipe_id, title, normalized_title,
+                snapshot_json, fingerprint, seen_at, fetched_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_key, remote_recipe_id) DO UPDATE SET
+                title = excluded.title,
+                normalized_title = excluded.normalized_title,
+                snapshot_json = excluded.snapshot_json,
+                fingerprint = excluded.fingerprint,
+                seen_at = excluded.seen_at,
+                fetched_at = excluded.fetched_at
+            """,
+            (
+                account_key,
+                remote_recipe_id,
+                recipe.title,
+                normalize_title(recipe.title),
+                _recipe_snapshot_json(recipe),
+                fingerprint.digest,
+                timestamp,
+                timestamp,
+            ),
+        )
+        self._conn.commit()
+
+    def remote_recipe_snapshot(
+        self,
+        account_key: str,
+        remote_recipe_id: str,
+    ) -> tuple[Recipe, str] | None:
+        """Return a hydrated stored snapshot and its fingerprint digest, if available."""
+        row = self._conn.execute(
+            """
+            SELECT snapshot_json, fingerprint
+            FROM remote_recipe_snapshots
+            WHERE account_key = ? AND remote_recipe_id = ?
+            """,
+            (account_key, remote_recipe_id),
+        ).fetchone()
+        if row is None or not row["snapshot_json"] or not row["fingerprint"]:
+            return None
+        recipe = _recipe_from_snapshot_json(
+            str(row["snapshot_json"]),
+            account_key,
+            remote_recipe_id,
+        )
+        if recipe is None:
+            return None
+        return recipe, str(row["fingerprint"])
+
+    def remote_recipe_snapshots_by_title(
+        self,
+        title: str,
+        *,
+        account_keys: set[str] | None = None,
+    ) -> list[tuple[str, str, Recipe, str]]:
+        """Return every hydrated account-specific snapshot for one normalized title."""
+        rows = self._conn.execute(
+            """
+            SELECT account_key, remote_recipe_id, snapshot_json, fingerprint
+            FROM remote_recipe_snapshots
+            WHERE normalized_title = ? AND snapshot_json IS NOT NULL AND fingerprint IS NOT NULL
+            ORDER BY account_key, remote_recipe_id
+            """,
+            (normalize_title(title),),
+        ).fetchall()
+        result: list[tuple[str, str, Recipe, str]] = []
+        for row in rows:
+            account_key = str(row["account_key"])
+            if account_keys is not None and account_key not in account_keys:
+                continue
+            recipe = _recipe_from_snapshot_json(
+                str(row["snapshot_json"]),
+                account_key,
+                str(row["remote_recipe_id"]),
+            )
+            if recipe is not None:
+                result.append(
+                    (
+                        account_key,
+                        str(row["remote_recipe_id"]),
+                        recipe,
+                        str(row["fingerprint"]),
+                    )
+                )
+        return result
+
+    def reconcile_remote_recipe_snapshots(
+        self,
+        account_key: str,
+        live_remote_ids: set[str],
+    ) -> int:
+        """Delete snapshot rows absent from one successfully loaded authoritative cookbook."""
+        rows = self._conn.execute(
+            "SELECT remote_recipe_id FROM remote_recipe_snapshots WHERE account_key = ?",
+            (account_key,),
+        ).fetchall()
+        stale_ids = [
+            str(row["remote_recipe_id"])
+            for row in rows
+            if str(row["remote_recipe_id"]) not in live_remote_ids
+        ]
+        if stale_ids:
+            self._conn.executemany(
+                "DELETE FROM remote_recipe_snapshots WHERE account_key = ? AND remote_recipe_id = ?",
+                [(account_key, remote_id) for remote_id in stale_ids],
+            )
+            self._conn.commit()
+        return len(stale_ids)
+
+    def create_recipe_swap_run(
+        self,
+        recipe_id: str,
+        account_key: str,
+        old_remote_id: str,
+        temporary_title: str,
+        final_title: str,
+    ) -> str:
+        """Persist the start of a durable create-and-swap recipe replacement."""
+        run_id = uuid.uuid4().hex
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO recipe_swap_runs(
+                id, recipe_id, account_key, old_remote_id, new_remote_id,
+                temporary_title, final_title, status, error, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, NULL, ?, ?, 'creating', NULL, ?, ?)
+            """,
+            (
+                run_id,
+                recipe_id,
+                account_key,
+                old_remote_id,
+                temporary_title,
+                final_title,
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return run_id
+
+    def update_recipe_swap_run(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        new_remote_id: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """Update the recoverable progress marker for one recipe swap."""
+        cursor = self._conn.execute(
+            """
+            UPDATE recipe_swap_runs
+            SET status = ?,
+                new_remote_id = COALESCE(?, new_remote_id),
+                error = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (status, new_remote_id, error, _now(), run_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def incomplete_recipe_swap_runs(self) -> list[dict[str, str | None]]:
+        """Return non-terminal recipe swaps that startup recovery must inspect."""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM recipe_swap_runs
+            WHERE status NOT IN ('completed', 'rolled_back', 'failed')
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+        return [{key: (str(row[key]) if row[key] is not None else None) for key in row.keys()} for row in rows]
+
+    def complete_recipe_swap(
+        self,
+        run_id: str,
+        recipe_id: str,
+        account_key: str,
+        remote_recipe_id: str,
+        version: int,
+        recipe: Recipe,
+        fingerprint: RecipeFingerprint,
+    ) -> None:
+        """Atomically replace a mapping, store its verified snapshot, and finish the swap."""
+        now = _now()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.set_remote_recipe_id(recipe_id, account_key, remote_recipe_id, version)
+            self._conn.execute(
+                """
+                INSERT INTO remote_recipe_snapshots(
+                    account_key, remote_recipe_id, title, normalized_title,
+                    snapshot_json, fingerprint, seen_at, fetched_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_key, remote_recipe_id) DO UPDATE SET
+                    title = excluded.title,
+                    normalized_title = excluded.normalized_title,
+                    snapshot_json = excluded.snapshot_json,
+                    fingerprint = excluded.fingerprint,
+                    seen_at = excluded.seen_at,
+                    fetched_at = excluded.fetched_at
+                """,
+                (
+                    account_key,
+                    remote_recipe_id,
+                    recipe.title,
+                    normalize_title(recipe.title),
+                    _recipe_snapshot_json(recipe),
+                    fingerprint.digest,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.execute(
+                """
+                UPDATE recipe_swap_runs
+                SET status = 'completed', new_remote_id = ?, error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (remote_recipe_id, now, run_id),
+            )
+            old_row = self._conn.execute(
+                "SELECT old_remote_id FROM recipe_swap_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if old_row is not None and str(old_row["old_remote_id"]) != remote_recipe_id:
+                self._conn.execute(
+                    "DELETE FROM remote_recipe_snapshots WHERE account_key = ? AND remote_recipe_id = ?",
+                    (account_key, str(old_row["old_remote_id"])),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def local_recipe_id_for_remote(self, account_key: str, remote_recipe_id: str) -> str | None:
         """Return the local recipe id mapped to one account-specific FatSecret id."""
         row = self._conn.execute(
@@ -1440,6 +2042,23 @@ class Storage:
             ),
         )
         self._conn.commit()
+
+    def delete_custom_food_mapping(
+        self,
+        source_account_key: str,
+        source_food_id: str,
+        target_account_key: str,
+    ) -> bool:
+        """Remove one stale personal-food mapping before recreating its target food."""
+        cursor = self._conn.execute(
+            """
+            DELETE FROM custom_food_mappings
+            WHERE source_account_key = ? AND source_food_id = ? AND target_account_key = ?
+            """,
+            (source_account_key, source_food_id, target_account_key),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
 
     def create_diary_copy_run(
         self,
