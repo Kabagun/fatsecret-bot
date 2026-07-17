@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 from fatsecret_bot.models import Ingredient, Recipe
@@ -26,6 +29,38 @@ def test_authorization_requires_allowlist_or_existing_registration(tmp_path) -> 
         bot.allowed_user_ids = set()
         assert bot._is_authorized(11) is True
         assert bot._is_authorized(22) is False
+    finally:
+        storage.close()
+
+
+def test_denied_user_log_contains_identity_but_not_message_text(tmp_path, caplog) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.allowed_user_ids = set()
+        reply_text = AsyncMock()
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=33,
+                username="qa_user",
+                full_name="QA User",
+            ),
+            effective_message=SimpleNamespace(
+                text="private message text",
+                reply_text=reply_text,
+            ),
+        )
+        caplog.set_level(logging.WARNING, logger="fatsecret_bot.telegram_bot")
+
+        authorized = asyncio.run(bot._require_user(update))
+
+        assert authorized is False
+        reply_text.assert_awaited_once_with("Этот бот закрыт для двух заданных пользователей.")
+        assert "telegram_id=33" in caplog.text
+        assert "username='qa_user'" in caplog.text
+        assert "full_name='QA User'" in caplog.text
+        assert "private message text" not in caplog.text
     finally:
         storage.close()
 

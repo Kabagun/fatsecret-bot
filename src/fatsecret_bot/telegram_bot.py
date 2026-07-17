@@ -695,6 +695,12 @@ class TelegramRecipeBot:
         if user is None or message is None:
             return False
         if not self._is_authorized(user.id):
+            logger.warning(
+                "Telegram access denied telegram_id=%s username=%r full_name=%r",
+                user.id,
+                user.username or "",
+                user.full_name or "",
+            )
             await message.reply_text("Этот бот закрыт для двух заданных пользователей.")
             return False
         self.storage.register_user(user.id, user.full_name or str(user.id))
