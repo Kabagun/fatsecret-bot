@@ -89,6 +89,13 @@ def recipe_fingerprint_diff(expected: RecipeFingerprint, actual: RecipeFingerpri
         if expected_data.get(field) == actual_data.get(field):
             continue
         if field in {"steps", "ingredients"}:
+            if field == "ingredients" and len(expected_data.get(field) or []) == len(actual_data.get(field) or []):
+                differences.append(
+                    f"{label}: содержимое отличается; "
+                    f"ожидалось {(expected_data.get(field) or [])[:3]!r}, "
+                    f"получено {(actual_data.get(field) or [])[:3]!r}"
+                )
+                continue
             differences.append(
                 f"{label}: ожидалось {len(expected_data.get(field) or [])}, "
                 f"получено {len(actual_data.get(field) or [])}"

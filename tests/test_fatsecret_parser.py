@@ -120,6 +120,48 @@ def test_parse_food_detail_extracts_real_gram_portion_from_recipe_page() -> None
     assert detail.default_portion_description == "средний"
 
 
+def test_food_search_100g_summary_does_not_reuse_non_gram_default_portion_id() -> None:
+    xml = """
+    <recipe>
+      <id>3092</id><title>Яйцо</title>
+      <energyPerPortion>147</energyPerPortion><gramsPerPortion>100</gramsPerPortion>
+      <defaultPortionID>10270</defaultPortionID>
+      <recipeportion><id>10270</id><description>средний</description><gramWeight>44</gramWeight></recipeportion>
+      <recipeportion><id>51772</id><description>г</description><gramWeight>100</gramWeight></recipeportion>
+    </recipe>
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=xml)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        _client().device,
+        http=http,
+        session=FatSecretSession(server_id="server", device_key="device", secret_key="secret"),
+    )
+    summary = FoodSearchResult(
+        food_id="3092",
+        title="Яйцо",
+        default_portion_id="10270",
+        default_portion_description="100г",
+        energy_per_portion=Decimal("147"),
+        raw={"_source_endpoint": "food_search_data"},
+    )
+    try:
+        detail = asyncio.run(client.resolve_food_detail(summary))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert len(requests) == 1
+    assert detail.default_portion_id == "10270"
+    assert detail.default_portion_description == "средний"
+    assert detail.raw["_gram_portion_id"] == "51772"
+
+
 def test_generic_request_date_uses_injected_timezone_date() -> None:
     current = dt.date(2030, 1, 2)
     client = _client(today_provider=lambda: current)

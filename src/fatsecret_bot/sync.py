@@ -544,6 +544,8 @@ def _ingredient_current_portion_sends_grams(ingredient: Ingredient, grams: Decim
 def _food_result_has_usable_gram_portion(result: FoodSearchResult) -> bool:
     if result.raw.get("_gram_portion_id"):
         return True
+    if result.raw.get("_source_endpoint") == "food_search_data":
+        return False
     return (result.default_portion_id or "0") != "0" and is_explicit_weight_portion(
         result.default_portion_description
     )

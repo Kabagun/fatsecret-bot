@@ -1463,8 +1463,12 @@ class FatSecretClient:
                 result.fat_per_portion,
             )
         )
-        has_gram_portion = bool(result.raw.get("_gram_portion_id")) or is_explicit_weight_portion(
-            result.default_portion_description
+        # The app search JSON can label a per-100g nutrition summary as ``100г``
+        # while its defaultPortionID still points at a unit such as one medium egg.
+        # Only RecipeAndroidPage exposes the authoritative gram portion id.
+        has_gram_portion = bool(result.raw.get("_gram_portion_id")) or (
+            result.raw.get("_source_endpoint") != "food_search_data"
+            and is_explicit_weight_portion(result.default_portion_description)
         )
         if has_macro_detail and has_gram_portion:
             return result
