@@ -162,6 +162,44 @@ def test_food_search_100g_summary_does_not_reuse_non_gram_default_portion_id() -
     assert detail.raw["_gram_portion_id"] == "51772"
 
 
+def test_food_detail_read_retries_transient_503() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(503, text="busy")
+        return httpx.Response(
+            200,
+            text=(
+                "<recipe><id>3092</id><title>Яйцо</title><defaultPortionID>51772</defaultPortionID>"
+                "<recipeportion><id>51772</id><description>г</description></recipeportion></recipe>"
+            ),
+        )
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(
+        FatSecretAccountConfig("a1", "A1", "user", "pass", "BY", "ru"),
+        _client().device,
+        http=http,
+        session=FatSecretSession(server_id="server", device_key="device", secret_key="secret"),
+        sleep=fake_sleep,
+    )
+    try:
+        detail = asyncio.run(client.resolve_food_detail(FoodSearchResult(food_id="3092", title="Яйцо")))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert detail.raw["_gram_portion_id"] == "51772"
+    assert attempts == 3
+    assert delays == [0.5, 1.5]
+
+
 def test_generic_request_date_uses_injected_timezone_date() -> None:
     current = dt.date(2030, 1, 2)
     client = _client(today_provider=lambda: current)

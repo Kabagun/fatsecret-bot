@@ -1475,6 +1475,7 @@ class FatSecretClient:
         response = await self._post_android(
             "RecipeAndroidPage.aspx",
             {"rid": result.food_id, "images": "true", "fl": "7"},
+            read_only=True,
         )
         return self._parse_food_detail(response.text, result)
 
