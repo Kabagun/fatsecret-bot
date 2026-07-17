@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fatsecret-bot"
 version = "0.1.0"
-description = "Telegram bot for syncing FatSecret recipes and food diaries between two accounts."
+description = "Telegram bot for syncing FatSecret recipes and food diaries across account groups."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
