@@ -127,6 +127,101 @@ class RecipeCreateResult:
     rename_results: list[AccountSyncResult] = field(default_factory=list)
 
 
+def _recipe_list_request_fingerprint(
+    title: str,
+    portions: Decimal,
+    steps: list[str],
+    items: list[ResolvedRecipeListItem],
+) -> str:
+    """Return a stable semantic key that excludes generated row IDs and timestamps."""
+    payload = {
+        "title": normalize_title(title),
+        "portions": str(portions.normalize()),
+        "steps": [step.strip() for step in steps if step.strip()],
+        "items": [
+            {
+                "requested_query": normalize_title(item.requested_query),
+                "grams": str(item.grams.normalize()),
+                "food_id": item.ingredient.food_id,
+                "title": normalize_title(item.ingredient.title),
+                "portion_id": item.ingredient.portion_id or "0",
+                "amount": str(item.ingredient.amount.normalize()),
+                "portion_description": item.ingredient.portion_description,
+                "ingredient_grams": (
+                    str(item.ingredient.grams.normalize()) if item.ingredient.grams is not None else None
+                ),
+            }
+            for item in items
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _recipe_list_payload_json(recipe: Recipe, requested_queries: list[str]) -> str:
+    """Serialize the exact candidate used by a recoverable recipe-list operation."""
+    payload = {
+        "recipe": {
+            "id": recipe.id,
+            "title": recipe.title,
+            "description": recipe.description,
+            "portions": str(recipe.portions),
+            "prep_time": recipe.prep_time,
+            "cook_time": recipe.cook_time,
+            "steps": list(recipe.steps),
+            "group_id": recipe.group_id,
+            "ingredients": [
+                {
+                    "id": ingredient.id,
+                    "food_id": ingredient.food_id,
+                    "title": ingredient.title,
+                    "portion_id": ingredient.portion_id,
+                    "amount": str(ingredient.amount),
+                    "portion_description": ingredient.portion_description,
+                    "grams": str(ingredient.grams) if ingredient.grams is not None else None,
+                }
+                for ingredient in recipe.ingredients
+            ],
+        },
+        "requested_queries": list(requested_queries),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _recipe_list_payload(payload_json: str) -> tuple[Recipe, list[str]]:
+    """Restore an exact recipe-list candidate from its durable journal payload."""
+    payload = json.loads(payload_json)
+    recipe_data = payload["recipe"]
+    recipe = Recipe(
+        id=str(recipe_data["id"]),
+        title=str(recipe_data["title"]),
+        description=str(recipe_data.get("description") or ""),
+        portions=Decimal(str(recipe_data.get("portions") or "1")),
+        prep_time=int(recipe_data.get("prep_time") or 0),
+        cook_time=int(recipe_data.get("cook_time") or 0),
+        steps=[str(step) for step in recipe_data.get("steps") or []],
+        group_id=(str(recipe_data["group_id"]) if recipe_data.get("group_id") is not None else None),
+    )
+    for ingredient_data in recipe_data.get("ingredients") or []:
+        recipe.ingredients.append(
+            Ingredient(
+                id=str(ingredient_data["id"]),
+                recipe_id=recipe.id,
+                food_id=str(ingredient_data["food_id"]),
+                title=str(ingredient_data["title"]),
+                portion_id=str(ingredient_data.get("portion_id") or "0"),
+                amount=Decimal(str(ingredient_data.get("amount") or "0")),
+                portion_description=str(ingredient_data.get("portion_description") or ""),
+                grams=(
+                    Decimal(str(ingredient_data["grams"]))
+                    if ingredient_data.get("grams") is not None
+                    else None
+                ),
+            )
+        )
+    return recipe, [str(query) for query in payload.get("requested_queries") or []]
+
+
 def _inclusive_dates(start: dt.date, end: dt.date) -> list[dt.date]:
     return [start + dt.timedelta(days=offset) for offset in range((end - start).days + 1)]
 
@@ -2119,14 +2214,13 @@ class RecipeSyncEngine:
         replace_existing_recipe_id: str | None = None,
         replace_existing_recipe_ref: Recipe | None = None,
     ) -> RecipeCreateResult:
-        """Create a recipe from a validated ingredient list on every FatSecret account in a group."""
+        """Create or replace a recipe through a durable, resumable multi-account journal."""
         final_title = title.strip()
         if not final_title:
             raise FatSecretError("Название рецепта не должно быть пустым.")
         replaced_recipe: Recipe | None = None
         replace_existing_local = False
         create_title = final_title
-        temporary_title: str | None = None
         if replace_existing_recipe_id is not None and replace_existing_recipe_ref is not None:
             raise FatSecretError("Передан конфликтующий контекст замены рецепта.")
         if replace_existing_recipe_id is not None:
@@ -2142,157 +2236,426 @@ class RecipeSyncEngine:
             if not replaced_recipe.remote_ids:
                 raise FatSecretError("У рецепта для замены нет привязок к FatSecret.")
             create_title = self.storage.next_available_recipe_title(group_id, final_title, include_base=False)
-            temporary_title = create_title
-        elif self.storage.find_recipe_by_title(group_id, final_title) is not None:
+        clean_steps = list(steps or [])
+        payload_fingerprint = _recipe_list_request_fingerprint(final_title, portions, clean_steps, items)
+        run = self.storage.matching_recipe_list_run(group_id, final_title, payload_fingerprint)
+        if run is not None and run["status"] == "completed":
+            return self._recipe_list_result_from_run(run)
+        if run is None and replaced_recipe is None and self.storage.find_recipe_by_title(group_id, final_title) is not None:
             raise FatSecretError("Рецепт с таким именем уже есть. Выбери обновление существующего или измени имя.")
 
         clients = self._build_clients(group_id)
-        description = _sync_description(timezone=self.timezone)
-        recipe_id = self.storage.create_recipe(
-            title=create_title,
-            description=description,
-            portions=portions,
-            prep_time=0,
-            cook_time=0,
-            updated_by=updated_by,
-            group_id=group_id,
-            steps=steps or [],
-        )
-        ingredients = [
-            Ingredient(
-                id=item.ingredient.id,
-                recipe_id=recipe_id,
-                food_id=item.ingredient.food_id,
-                title=item.ingredient.title,
-                portion_id=item.ingredient.portion_id or "0",
-                amount=item.ingredient.amount,
-                portion_description=item.ingredient.portion_description or "г",
-                grams=item.ingredient.grams,
-            )
-            for item in items
-        ]
-        self.storage.replace_ingredients(recipe_id, ingredients)
-        recipe = self.storage.get_recipe(recipe_id)
-        if recipe is None:
-            await self._close_clients(clients)
-            raise FatSecretError("Не удалось создать локальный рецепт.")
-        recipe.steps = list(steps or [])
-
-        results: list[AccountSyncResult] = []
-        successful: list[tuple[str, FatSecretClient, str]] = []
-        failed: list[AccountSyncResult] = []
-        replacement_results: list[AccountSyncResult] = []
-        rename_results: list[AccountSyncResult] = []
-        result_title = create_title
         try:
-            for account_key, client in clients.items():
-                remote_id: str | None = None
-                try:
-                    remote_id = await client.create_recipe(recipe)
-                    for index, ingredient in enumerate(list(recipe.ingredients)):
-                        requested_query = items[index].requested_query if index < len(items) else ingredient.title
-                        accepted_ingredient = await self._add_ingredient_with_fallback(
-                            client,
-                            remote_id,
-                            ingredient,
-                            requested_query,
+            if run is None:
+                candidate_recipe_id = str(uuid.uuid4())
+                candidate = Recipe(
+                    id=candidate_recipe_id,
+                    title=create_title,
+                    description=_sync_description(timezone=self.timezone),
+                    portions=portions,
+                    prep_time=0,
+                    cook_time=0,
+                    steps=clean_steps,
+                    group_id=group_id,
+                    ingredients=[
+                        Ingredient(
+                            id=str(uuid.uuid4()),
+                            recipe_id=candidate_recipe_id,
+                            food_id=item.ingredient.food_id,
+                            title=item.ingredient.title,
+                            portion_id=item.ingredient.portion_id or "0",
+                            amount=item.ingredient.amount,
+                            portion_description=item.ingredient.portion_description or "г",
+                            grams=item.ingredient.grams,
                         )
-                        if accepted_ingredient is None:
-                            raise FatSecretError(f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}».")
-                        if _ingredient_needs_update(ingredient, accepted_ingredient):
-                            recipe.ingredients[index] = accepted_ingredient
-                            self.storage.replace_ingredients(recipe.id, recipe.ingredients)
-                    ok = await client.save_recipe_meta(recipe, remote_id)
-                    if not ok:
-                        raise FatSecretError(f"{client.account.label}: recipe metadata save returned false")
-                    successful.append((account_key, client, remote_id))
-                    results.append(AccountSyncResult(account_key, remote_id, True, "создан"))
-                except Exception as exc:  # noqa: BLE001 - keep per-account creation isolated.
-                    rollback_message = await self._rollback_created_recipe(client, remote_id)
-                    message = user_safe_error_message(exc)
-                    if rollback_message:
-                        message = f"{message} {rollback_message}"
-                    failed.append(AccountSyncResult(account_key, None, False, message))
-            if failed:
-                for account_key, client, remote_id in successful:
-                    rollback_message = await self._rollback_created_recipe(client, remote_id)
-                    failed.append(
-                        AccountSyncResult(
-                            account_key,
-                            None,
-                            False,
-                            rollback_message or f"{client.account.label}: создание отменено после ошибки.",
-                        )
-                    )
-                self.storage.delete_recipe(recipe.id)
-                details = "; ".join(result.message for result in failed)
-                raise FatSecretError(
-                    "FatSecret не создал рецепт во всех подключенных аккаунтах. "
-                    f"Локальный черновик удален. {details}"
+                        for item in items
+                    ],
                 )
-            for account_key, _client, remote_id in successful:
-                self.storage.set_remote_recipe_id(recipe.id, account_key, remote_id, last_synced_version=0)
-                recipe.remote_ids[account_key] = remote_id
-                self.storage.mark_synced(recipe.id, account_key, remote_id, recipe.version)
+                canonical_recipe_id = replaced_recipe.id if replace_existing_local and replaced_recipe is not None else None
+                if canonical_recipe_id is None and replaced_recipe is not None:
+                    cached_same_title = self.storage.find_recipe_by_title(group_id, final_title)
+                    canonical_recipe_id = cached_same_title.id if cached_same_title is not None else None
+                old_remote_ids = {
+                    account_key: (
+                        list(replaced_recipe.remote_ids_by_account.get(account_key) or [])
+                        or ([replaced_recipe.remote_ids[account_key]] if account_key in replaced_recipe.remote_ids else [])
+                        if replaced_recipe is not None
+                        else []
+                    )
+                    for account_key in clients
+                }
+                run_id = self.storage.create_recipe_list_run(
+                    group_id=group_id,
+                    initiated_by=updated_by,
+                    requested_title=final_title,
+                    temporary_title=create_title,
+                    canonical_recipe_id=canonical_recipe_id,
+                    replaced_recipe_id=replaced_recipe.id if replaced_recipe is not None else None,
+                    candidate_recipe_id=candidate_recipe_id,
+                    payload_json=_recipe_list_payload_json(
+                        candidate,
+                        [item.requested_query for item in items],
+                    ),
+                    payload_fingerprint=payload_fingerprint,
+                    old_remote_ids=old_remote_ids,
+                )
+                run = self.storage.recipe_list_run(run_id)
+                if run is None:
+                    raise FatSecretError("Не удалось сохранить журнал создания рецепта.")
+            account_rows = {str(account["account_key"]): account for account in run["accounts"]}
+            if set(account_rows) != set(clients):
+                message = "Набор FatSecret аккаунтов изменился; операция сохранена для безопасного продолжения."
+                self.storage.update_recipe_list_run(str(run["id"]), "recovery_pending", error=message)
+                raise FatSecretError(message)
 
-            if replaced_recipe is not None:
-                if replace_existing_local:
-                    replacement_results = await self._delete_recipe_with_clients(replaced_recipe.id, clients)
-                else:
-                    replacement_results = await self._delete_live_recipe_ref_with_clients(replaced_recipe, clients)
-                if all(result.ok for result in replacement_results):
-                    final_recipe = self.storage.get_recipe(recipe.id)
-                    if final_recipe is None:
-                        raise FatSecretError("Новый рецепт создан, но локальный черновик потерян перед переименованием.")
-                    final_recipe.title = final_title
-                    final_recipe.description = description
-                    final_recipe.portions = portions
-                    final_recipe.prep_time = 0
-                    final_recipe.cook_time = 0
-                    final_recipe.steps = list(steps or [])
-                    for account_key, client, remote_id in successful:
-                        try:
-                            ok = await client.save_recipe_meta(final_recipe, remote_id)
-                            if not ok:
-                                raise FatSecretError(f"{client.account.label}: recipe metadata rename returned false")
-                            rename_results.append(AccountSyncResult(account_key, remote_id, True, "переименован"))
-                        except Exception as exc:  # noqa: BLE001 - keep created replacement accessible.
-                            rename_results.append(
-                                AccountSyncResult(account_key, remote_id, False, user_safe_error_message(exc))
-                            )
-                    if all(result.ok for result in rename_results):
-                        self.storage.update_recipe_from_remote(
-                            recipe_id=recipe.id,
-                            title=final_title,
-                            description=description,
-                            portions=portions,
-                            prep_time=0,
-                            cook_time=0,
-                            steps=steps or [],
+            recipe, requested_queries = _recipe_list_payload(str(run["payload_json"]))
+            if run["status"] == "remote_complete":
+                return self._finalize_recipe_list_run(run, recipe)
+
+            phase_one_error: tuple[str, Exception] | None = None
+            for account_key, client in clients.items():
+                account = account_rows[account_key]
+                if str(account["status"]) in {"verified", "old_deleted", "renamed", "completed"}:
+                    continue
+                try:
+                    await self._prepare_recipe_list_account(
+                        str(run["id"]),
+                        account,
+                        account_key,
+                        client,
+                        recipe,
+                        requested_queries,
+                    )
+                except Exception as exc:  # noqa: BLE001 - rollback is coordinated after all journal writes.
+                    phase_one_error = (account_key, exc)
+                    self.storage.update_recipe_list_run_account(
+                        str(run["id"]),
+                        account_key,
+                        str(account["status"]),
+                        new_remote_id=(str(account["new_remote_id"]) if account.get("new_remote_id") else None),
+                        error=user_safe_error_message(exc),
+                    )
+                    break
+            if phase_one_error is not None:
+                await self._rollback_recipe_list_run(run, clients, account_rows, phase_one_error)
+
+            run = self.storage.recipe_list_run(str(run["id"]))
+            if run is None:
+                raise FatSecretError("Журнал создания рецепта потерян перед заменой.")
+            account_rows = {str(account["account_key"]): account for account in run["accounts"]}
+            active_account_key: str | None = None
+            try:
+                for account_key, client in clients.items():
+                    active_account_key = account_key
+                    account = account_rows[account_key]
+                    if str(account["status"]) in {"old_deleted", "renamed", "completed"}:
+                        continue
+                    remote_id = str(account["new_remote_id"])
+                    live_ids = {summary.remote_id for summary in await client.cookbook()}
+                    for old_remote_id in account["old_remote_ids"]:
+                        if old_remote_id == remote_id or old_remote_id not in live_ids:
+                            continue
+                        if not await self._delete_remote_recipe_confirmed(client, old_remote_id):
+                            raise FatSecretError(f"{client.account.label}: не удалось удалить старый рецепт {old_remote_id}")
+                    remaining_ids = {summary.remote_id for summary in await client.cookbook()}
+                    undeleted = [
+                        old_remote_id
+                        for old_remote_id in account["old_remote_ids"]
+                        if old_remote_id != remote_id and old_remote_id in remaining_ids
+                    ]
+                    if undeleted:
+                        raise FatSecretError(
+                            f"{client.account.label}: старые рецепты остались после удаления: {', '.join(undeleted)}"
                         )
-                        renamed_recipe = self.storage.get_recipe(recipe.id)
-                        version = renamed_recipe.version if renamed_recipe is not None else recipe.version
-                        for account_key, _client, remote_id in successful:
-                            self.storage.mark_synced(recipe.id, account_key, remote_id, version)
-                        result_title = final_title
+                    self.storage.update_recipe_list_run_account(
+                        str(run["id"]),
+                        account_key,
+                        "old_deleted",
+                        new_remote_id=remote_id,
+                    )
+                    account["status"] = "old_deleted"
+
+                recipe.title = str(run["requested_title"])
+                self.storage.update_recipe_list_run_payload(str(run["id"]), _recipe_list_payload_json(recipe, requested_queries))
+                for account_key, client in clients.items():
+                    active_account_key = account_key
+                    account = account_rows[account_key]
+                    if str(account["status"]) in {"renamed", "completed"}:
+                        continue
+                    remote_id = str(account["new_remote_id"])
+                    await self._save_recipe_meta_with_readback(client, recipe, remote_id)
+                    await self._verify_remote_recipe(client, account_key, remote_id, recipe)
+                    self.storage.update_recipe_list_run_account(
+                        str(run["id"]),
+                        account_key,
+                        "renamed",
+                        new_remote_id=remote_id,
+                    )
+                    account["status"] = "renamed"
+            except Exception as exc:  # noqa: BLE001 - old recipes may already be gone, so preserve new identities.
+                message = user_safe_error_message(exc)
+                if active_account_key is not None:
+                    active_account = account_rows[active_account_key]
+                    self.storage.update_recipe_list_run_account(
+                        str(run["id"]),
+                        active_account_key,
+                        str(active_account["status"]),
+                        new_remote_id=(
+                            str(active_account["new_remote_id"])
+                            if active_account.get("new_remote_id")
+                            else None
+                        ),
+                        error=message,
+                    )
+                self.storage.update_recipe_list_run(str(run["id"]), "recovery_pending", error=message)
+                raise FatSecretError(
+                    "FatSecret уже сохранил часть замены. Новые remote ID и этап операции сохранены; "
+                    f"повтори создание для безопасного продолжения. {message}"
+                ) from exc
+
+            self.storage.update_recipe_list_run(str(run["id"]), "remote_complete")
+            completed_run = self.storage.recipe_list_run(str(run["id"]))
+            if completed_run is None:
+                raise FatSecretError("Журнал создания рецепта потерян перед локальной фиксацией.")
+            recipe, _ = _recipe_list_payload(str(completed_run["payload_json"]))
+            return self._finalize_recipe_list_run(completed_run, recipe)
         finally:
             await self._close_clients(clients)
-        if not self.storage.remote_ids(recipe.id):
-            self.storage.delete_recipe(recipe.id)
-            details = "; ".join(result.message for result in results) or "FatSecret не вернул remote id"
-            raise FatSecretError(
-                "FatSecret не создал рецепт ни в одном подключенном аккаунте. "
-                f"Локальный черновик удален. {details}"
+
+    def _recipe_list_result_from_run(self, run: dict[str, object]) -> RecipeCreateResult:
+        """Build the stable public result for a completed recipe-list journal entry."""
+        accounts = list(run.get("accounts") or [])
+        results = [
+            AccountSyncResult(
+                str(account["account_key"]),
+                str(account["new_remote_id"]),
+                True,
+                "создан",
             )
+            for account in accounts
+        ]
+        replaced_recipe_id = str(run["replaced_recipe_id"]) if run.get("replaced_recipe_id") else None
+        replacement_results = (
+            [
+                AccountSyncResult(
+                    str(account["account_key"]),
+                    str(account["new_remote_id"]),
+                    True,
+                    "старый рецепт удален",
+                )
+                for account in accounts
+            ]
+            if replaced_recipe_id is not None
+            else []
+        )
+        temporary_title = str(run["temporary_title"])
+        final_title = str(run["requested_title"])
+        rename_results = (
+            [
+                AccountSyncResult(
+                    str(account["account_key"]),
+                    str(account["new_remote_id"]),
+                    True,
+                    "переименован",
+                )
+                for account in accounts
+            ]
+            if temporary_title != final_title
+            else []
+        )
         return RecipeCreateResult(
-            recipe_id=recipe_id,
+            recipe_id=str(run["canonical_recipe_id"] or run["candidate_recipe_id"]),
             results=results,
-            title=result_title,
-            temporary_title=temporary_title,
-            replaced_recipe_id=replaced_recipe.id if replaced_recipe is not None else None,
+            title=final_title,
+            temporary_title=temporary_title if temporary_title != final_title else None,
+            replaced_recipe_id=replaced_recipe_id,
             replacement_results=replacement_results,
             rename_results=rename_results,
         )
+
+    async def _prepare_recipe_list_account(
+        self,
+        run_id: str,
+        account: dict[str, object],
+        account_key: str,
+        client: FatSecretClient,
+        recipe: Recipe,
+        requested_queries: list[str],
+    ) -> None:
+        """Create, fill, and exactly verify one temporary remote candidate."""
+        remote_id = str(account["new_remote_id"]) if account.get("new_remote_id") else ""
+        if not remote_id:
+            title_matches = [
+                summary.remote_id
+                for summary in await client.cookbook()
+                if normalize_title(summary.title) == normalize_title(recipe.title)
+            ]
+            matching_ids: list[str] = []
+            for matching_id in title_matches:
+                existing = await client.get_recipe(matching_id)
+                if (
+                    normalize_title(existing.title) == normalize_title(recipe.title)
+                    and existing.description == recipe.description
+                    and existing.portions == recipe.portions
+                    and existing.prep_time == recipe.prep_time
+                    and existing.cook_time == recipe.cook_time
+                ):
+                    matching_ids.append(matching_id)
+            if len(matching_ids) > 1:
+                raise FatSecretError(
+                    f"{client.account.label}: найдено несколько временных рецептов «{recipe.title}»; "
+                    "операция остановлена без нового создания"
+                )
+            if title_matches and not matching_ids:
+                raise FatSecretError(
+                    f"{client.account.label}: рецепт «{recipe.title}» уже существует, но не принадлежит "
+                    "этой незавершённой операции"
+                )
+            remote_id = matching_ids[0] if matching_ids else await self._create_recipe_with_readback(client, recipe)
+            account["new_remote_id"] = remote_id
+            account["status"] = "created"
+            self.storage.update_recipe_list_run_account(
+                run_id,
+                account_key,
+                "created",
+                new_remote_id=remote_id,
+            )
+
+        current = await client.get_recipe(remote_id)
+        if recipe_fingerprint(current).digest == recipe_fingerprint(recipe).digest:
+            self.storage.upsert_remote_recipe_snapshot(
+                account_key,
+                remote_id,
+                current,
+                recipe_fingerprint(current),
+            )
+            self.storage.update_recipe_list_run_account(
+                run_id,
+                account_key,
+                "verified",
+                new_remote_id=remote_id,
+            )
+            account["status"] = "verified"
+            return
+
+        for ingredient in current.ingredients:
+            if not ingredient.remote_ingredient_id:
+                raise FatSecretError(
+                    f"{client.account.label}: временный рецепт содержит ингредиент без remote ID; "
+                    "безопасный повтор остановлен"
+                )
+            if not await client.delete_ingredient(remote_id, ingredient.remote_ingredient_id):
+                raise FatSecretError(
+                    f"{client.account.label}: не удалось очистить временный ингредиент «{ingredient.title}»"
+                )
+
+        payload_changed = False
+        for index, ingredient in enumerate(list(recipe.ingredients)):
+            requested_query = requested_queries[index] if index < len(requested_queries) else ingredient.title
+            accepted = await self._add_ingredient_with_fallback(
+                client,
+                remote_id,
+                ingredient,
+                requested_query,
+            )
+            if accepted is None:
+                raise FatSecretError(f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}».")
+            if _ingredient_needs_update(ingredient, accepted):
+                recipe.ingredients[index] = Ingredient(
+                    id=ingredient.id,
+                    recipe_id=recipe.id,
+                    food_id=accepted.food_id,
+                    title=accepted.title,
+                    portion_id=accepted.portion_id or "0",
+                    amount=accepted.amount,
+                    portion_description=accepted.portion_description,
+                    grams=accepted.grams,
+                )
+                payload_changed = True
+        if payload_changed:
+            self.storage.update_recipe_list_run_payload(
+                run_id,
+                _recipe_list_payload_json(recipe, requested_queries),
+            )
+        await self._save_recipe_meta_with_readback(client, recipe, remote_id)
+        await self._verify_remote_recipe(client, account_key, remote_id, recipe)
+        self.storage.update_recipe_list_run_account(
+            run_id,
+            account_key,
+            "verified",
+            new_remote_id=remote_id,
+        )
+        account["status"] = "verified"
+
+    async def _rollback_recipe_list_run(
+        self,
+        run: dict[str, object],
+        clients: dict[str, FatSecretClient],
+        account_rows: dict[str, dict[str, object]],
+        phase_error: tuple[str, Exception],
+    ) -> None:
+        """Roll back every new candidate while no old recipe has been deleted."""
+        failed_account_key, failure = phase_error
+        messages = [user_safe_error_message(failure)]
+        cleanup_ok = True
+        for account_key, account in account_rows.items():
+            remote_id = str(account["new_remote_id"]) if account.get("new_remote_id") else ""
+            if not remote_id:
+                self.storage.update_recipe_list_run_account(
+                    str(run["id"]),
+                    account_key,
+                    "failed",
+                    error=(user_safe_error_message(failure) if account_key == failed_account_key else None),
+                )
+                continue
+            deleted, rollback_message = await self._rollback_created_recipe_with_status(
+                clients[account_key],
+                remote_id,
+            )
+            cleanup_ok = cleanup_ok and deleted
+            messages.append(rollback_message)
+            self.storage.update_recipe_list_run_account(
+                str(run["id"]),
+                account_key,
+                "rolled_back" if deleted else "failed",
+                new_remote_id=remote_id,
+                error=None if deleted else rollback_message,
+            )
+        self.storage.update_recipe_list_run(
+            str(run["id"]),
+            "rolled_back" if cleanup_ok else "failed",
+            error=user_safe_error_message(failure),
+        )
+        details = "; ".join(message for message in messages if message)
+        raise FatSecretError(
+            "FatSecret не создал рецепт во всех подключенных аккаунтах. "
+            f"Локальный черновик удален. {details}"
+        ) from failure
+
+    def _finalize_recipe_list_run(
+        self,
+        run: dict[str, object],
+        recipe: Recipe,
+    ) -> RecipeCreateResult:
+        """Finalize verified remote identities locally or leave a retryable recovery marker."""
+        remote_ids = {
+            str(account["account_key"]): str(account["new_remote_id"])
+            for account in list(run.get("accounts") or [])
+            if account.get("new_remote_id")
+        }
+        try:
+            self.storage.finalize_recipe_list_run(str(run["id"]), recipe, remote_ids)
+        except Exception as exc:
+            message = user_safe_error_message(exc)
+            self.storage.update_recipe_list_run(str(run["id"]), "recovery_pending", error=message)
+            raise FatSecretError(
+                "Рецепт уже подтвержден во всех FatSecret аккаунтах, но локальная фиксация не завершилась. "
+                f"Повтори создание: remote ID сохранены и повторно рецепт не создастся. {message}"
+            ) from exc
+        completed = self.storage.recipe_list_run(str(run["id"]))
+        if completed is None:
+            raise FatSecretError("Локальная фиксация завершилась, но журнал операции не найден.")
+        return self._recipe_list_result_from_run(completed)
 
     async def _rollback_created_recipe(self, client: FatSecretClient, remote_id: str | None) -> str:
         _, message = await self._rollback_created_recipe_with_status(client, remote_id)

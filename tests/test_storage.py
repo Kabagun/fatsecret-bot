@@ -322,7 +322,7 @@ def test_migration_normalizes_legacy_zero_portion_gram_ingredients(tmp_path) -> 
         assert recipe.ingredients[0].amount == Decimal("0.05")
         assert recipe.ingredients[0].portion_description == "100г"
         assert recipe.ingredients[0].grams == Decimal("5")
-        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     finally:
         storage.close()
 
@@ -664,7 +664,7 @@ def test_version_one_account_migration_preserves_credentials_session_and_group(t
         assert storage.fatsecret_account_owner("tg11") == 11
         assert storage.fatsecret_account_group_id("tg11") == "g1"
         assert storage.get_fatsecret_session("tg11") == FatSecretSession("server", "device", "secret")
-        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     finally:
         storage.close()
 

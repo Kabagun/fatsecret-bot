@@ -27,7 +27,7 @@ from .portions import grams_from_portion, is_bare_weight_portion
 
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
-STORAGE_SCHEMA_VERSION = 2
+STORAGE_SCHEMA_VERSION = 3
 DIARY_COPY_STALE_AFTER = dt.timedelta(minutes=30)
 
 
@@ -318,6 +318,35 @@ class Storage:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS recipe_list_runs (
+                id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                initiated_by INTEGER NOT NULL,
+                requested_title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                temporary_title TEXT NOT NULL,
+                canonical_recipe_id TEXT,
+                replaced_recipe_id TEXT,
+                candidate_recipe_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS recipe_list_run_accounts (
+                run_id TEXT NOT NULL REFERENCES recipe_list_runs(id) ON DELETE CASCADE,
+                account_key TEXT NOT NULL,
+                old_remote_ids_json TEXT NOT NULL DEFAULT '[]',
+                new_remote_id TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, account_key)
+            );
+
             CREATE TABLE IF NOT EXISTS diary_copy_runs (
                 id TEXT PRIMARY KEY,
                 group_id TEXT NOT NULL,
@@ -342,6 +371,7 @@ class Storage:
         self._ensure_column("recipes", "group_id", "TEXT")
         self._ensure_column("recipes", "steps", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column("ingredients", "grams", "TEXT")
+        self._ensure_column("recipe_list_runs", "replaced_recipe_id", "TEXT")
         self._conn.execute("DROP INDEX IF EXISTS idx_recipes_normalized_title")
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_group_title ON recipes(group_id, normalized_title)"
@@ -357,6 +387,10 @@ class Storage:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_remote_recipe_snapshots_title "
             "ON remote_recipe_snapshots(normalized_title, account_key)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recipe_list_runs_recovery "
+            "ON recipe_list_runs(group_id, normalized_title, payload_fingerprint, created_at)"
         )
         self._backfill_default_group()
         current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -2042,6 +2076,336 @@ class Storage:
             """
         ).fetchall()
         return [{key: (str(row[key]) if row[key] is not None else None) for key in row.keys()} for row in rows]
+
+    def create_recipe_list_run(
+        self,
+        group_id: str,
+        initiated_by: int,
+        requested_title: str,
+        temporary_title: str,
+        canonical_recipe_id: str | None,
+        replaced_recipe_id: str | None,
+        candidate_recipe_id: str,
+        payload_json: str,
+        payload_fingerprint: str,
+        old_remote_ids: dict[str, list[str]],
+    ) -> str:
+        """Persist a recipe-list operation before the first remote mutation."""
+        run_id = uuid.uuid4().hex
+        now = _now()
+        if self._conn.in_transaction:
+            self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO recipe_list_runs(
+                    id, group_id, initiated_by, requested_title, normalized_title,
+                    temporary_title, canonical_recipe_id, candidate_recipe_id,
+                    replaced_recipe_id, payload_json, payload_fingerprint,
+                    status, error, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+                """,
+                (
+                    run_id,
+                    group_id,
+                    initiated_by,
+                    requested_title,
+                    normalize_title(requested_title),
+                    temporary_title,
+                    canonical_recipe_id,
+                    candidate_recipe_id,
+                    replaced_recipe_id,
+                    payload_json,
+                    payload_fingerprint,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.executemany(
+                """
+                INSERT INTO recipe_list_run_accounts(
+                    run_id, account_key, old_remote_ids_json, new_remote_id,
+                    status, error, updated_at
+                )
+                VALUES (?, ?, ?, NULL, 'pending', NULL, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        account_key,
+                        json.dumps(remote_ids, ensure_ascii=False),
+                        now,
+                    )
+                    for account_key, remote_ids in old_remote_ids.items()
+                ],
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return run_id
+
+    def recipe_list_run(self, run_id: str) -> dict[str, Any] | None:
+        """Return one recipe-list journal entry with its per-account stages."""
+        row = self._conn.execute(
+            "SELECT * FROM recipe_list_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result: dict[str, Any] = dict(row)
+        account_rows = self._conn.execute(
+            """
+            SELECT account_key, old_remote_ids_json, new_remote_id, status, error, updated_at
+            FROM recipe_list_run_accounts
+            WHERE run_id = ?
+            ORDER BY account_key
+            """,
+            (run_id,),
+        ).fetchall()
+        accounts: list[dict[str, Any]] = []
+        for account_row in account_rows:
+            account = dict(account_row)
+            try:
+                old_ids = json.loads(str(account["old_remote_ids_json"]))
+            except json.JSONDecodeError:
+                old_ids = []
+            account["old_remote_ids"] = [str(item) for item in old_ids if str(item)] if isinstance(old_ids, list) else []
+            accounts.append(account)
+        result["accounts"] = accounts
+        return result
+
+    def matching_recipe_list_run(
+        self,
+        group_id: str,
+        title: str,
+        payload_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        """Find an active or completed operation that exactly matches a repeated request."""
+        row = self._conn.execute(
+            """
+            SELECT id
+            FROM recipe_list_runs
+            WHERE group_id = ? AND normalized_title = ? AND payload_fingerprint = ?
+              AND status NOT IN ('rolled_back', 'failed')
+            ORDER BY CASE WHEN status = 'completed' THEN 1 ELSE 0 END ASC, created_at DESC
+            LIMIT 1
+            """,
+            (group_id, normalize_title(title), payload_fingerprint),
+        ).fetchone()
+        return self.recipe_list_run(str(row["id"])) if row is not None else None
+
+    def update_recipe_list_run(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        """Update the operation-level recovery stage."""
+        cursor = self._conn.execute(
+            """
+            UPDATE recipe_list_runs
+            SET status = ?, error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, error, _now(), run_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def update_recipe_list_run_payload(self, run_id: str, payload_json: str) -> bool:
+        """Persist an account-accepted ingredient substitution for deterministic recovery."""
+        cursor = self._conn.execute(
+            """
+            UPDATE recipe_list_runs
+            SET payload_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (payload_json, _now(), run_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def update_recipe_list_run_account(
+        self,
+        run_id: str,
+        account_key: str,
+        status: str,
+        *,
+        new_remote_id: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """Persist one account's last safely completed recipe-list stage."""
+        cursor = self._conn.execute(
+            """
+            UPDATE recipe_list_run_accounts
+            SET status = ?, new_remote_id = COALESCE(?, new_remote_id),
+                error = ?, updated_at = ?
+            WHERE run_id = ? AND account_key = ?
+            """,
+            (status, new_remote_id, error, _now(), run_id, account_key),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def finalize_recipe_list_run(
+        self,
+        run_id: str,
+        recipe: Recipe,
+        remote_ids: dict[str, str],
+    ) -> str:
+        """Atomically publish the verified remote result into one canonical local recipe."""
+        run = self.recipe_list_run(run_id)
+        if run is None:
+            raise ValueError(f"recipe-list run {run_id} does not exist")
+        if set(remote_ids) != {str(account["account_key"]) for account in run["accounts"]}:
+            raise ValueError("recipe-list finalization account set does not match the journal")
+        group_exists = self._conn.execute(
+            "SELECT 1 FROM recipe_groups WHERE id = ?",
+            (run["group_id"],),
+        ).fetchone()
+        if group_exists is not None:
+            current_account_keys = {
+                str(row["account_key"])
+                for row in self._conn.execute(
+                    "SELECT account_key FROM group_accounts WHERE group_id = ?",
+                    (run["group_id"],),
+                ).fetchall()
+            }
+            if set(remote_ids) != current_account_keys:
+                raise ValueError("FatSecret account configuration changed before recipe-list finalization")
+
+        canonical_recipe_id = str(run["canonical_recipe_id"] or run["candidate_recipe_id"])
+        candidate_recipe_id = str(run["candidate_recipe_id"])
+        now = _now()
+        if self._conn.in_transaction:
+            self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            canonical_row = self._conn.execute(
+                "SELECT version FROM recipes WHERE id = ?",
+                (canonical_recipe_id,),
+            ).fetchone()
+            conflict_rows = self._conn.execute(
+                """
+                SELECT id FROM recipes
+                WHERE group_id = ? AND normalized_title = ? AND id <> ?
+                """,
+                (run["group_id"], normalize_title(recipe.title), canonical_recipe_id),
+            ).fetchall()
+            for conflict in conflict_rows:
+                self._delete_recipe_rows(str(conflict["id"]))
+            if candidate_recipe_id != canonical_recipe_id:
+                candidate_row = self._conn.execute(
+                    "SELECT 1 FROM recipes WHERE id = ?",
+                    (candidate_recipe_id,),
+                ).fetchone()
+                if candidate_row is not None:
+                    self._delete_recipe_rows(candidate_recipe_id)
+
+            if canonical_row is None:
+                version = 1
+                self._conn.execute(
+                    """
+                    INSERT INTO recipes(
+                        id, title, normalized_title, description, portions, prep_time,
+                        cook_time, version, group_id, updated_by, updated_at, steps
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        canonical_recipe_id,
+                        recipe.title,
+                        normalize_title(recipe.title),
+                        recipe.description,
+                        str(recipe.portions),
+                        recipe.prep_time,
+                        recipe.cook_time,
+                        version,
+                        run["group_id"],
+                        run["initiated_by"],
+                        now,
+                        _steps_to_json(recipe.steps),
+                    ),
+                )
+            else:
+                version = int(canonical_row["version"]) + 1
+                self._conn.execute(
+                    """
+                    UPDATE recipes
+                    SET title = ?, normalized_title = ?, description = ?, portions = ?,
+                        prep_time = ?, cook_time = ?, version = ?, group_id = ?,
+                        updated_by = ?, updated_at = ?, steps = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        recipe.title,
+                        normalize_title(recipe.title),
+                        recipe.description,
+                        str(recipe.portions),
+                        recipe.prep_time,
+                        recipe.cook_time,
+                        version,
+                        run["group_id"],
+                        run["initiated_by"],
+                        now,
+                        _steps_to_json(recipe.steps),
+                        canonical_recipe_id,
+                    ),
+                )
+
+            self._conn.execute("DELETE FROM ingredients WHERE recipe_id = ?", (canonical_recipe_id,))
+            for position, ingredient in enumerate(recipe.ingredients):
+                self._insert_ingredient(canonical_recipe_id, ingredient, position)
+            self._conn.execute("DELETE FROM account_recipes WHERE recipe_id = ?", (canonical_recipe_id,))
+            for account_key, remote_id in remote_ids.items():
+                self._conn.execute(
+                    "DELETE FROM account_recipes WHERE account_key = ? AND remote_recipe_id = ?",
+                    (account_key, remote_id),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO account_recipes(
+                        recipe_id, account_key, remote_recipe_id, last_synced_version, synced_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (canonical_recipe_id, account_key, remote_id, version, now),
+                )
+
+            for account in run["accounts"]:
+                account_key = str(account["account_key"])
+                new_remote_id = remote_ids[account_key]
+                for old_remote_id in account["old_remote_ids"]:
+                    if old_remote_id != new_remote_id:
+                        self._conn.execute(
+                            "DELETE FROM remote_recipe_snapshots WHERE account_key = ? AND remote_recipe_id = ?",
+                            (account_key, old_remote_id),
+                        )
+            self._conn.execute(
+                """
+                UPDATE recipe_list_run_accounts
+                SET status = 'completed', error = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (now, run_id),
+            )
+            self._conn.execute(
+                """
+                UPDATE recipe_list_runs
+                SET canonical_recipe_id = ?, status = 'completed', error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (canonical_recipe_id, now, run_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return canonical_recipe_id
 
     def complete_recipe_swap(
         self,

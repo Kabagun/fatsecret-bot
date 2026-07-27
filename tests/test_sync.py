@@ -409,6 +409,9 @@ class FakeFailingCreateClient:
     async def create_recipe(self, recipe: Recipe) -> str:
         raise RuntimeError("create failed")
 
+    async def cookbook(self) -> list[RecipeSummary]:
+        return []
+
     async def close(self) -> None:
         return None
 
@@ -424,17 +427,32 @@ class FakeCreateClient:
             language="ru",
         )
         self.created_recipe: Recipe | None = None
+        self.create_calls = 0
         self.saved_ingredients: list[Ingredient] = []
         self.deleted_recipe_ids: list[str] = []
         self.saved_meta: list[Recipe] = []
+        self.recipes: dict[str, Recipe] = {}
 
     async def create_recipe(self, recipe: Recipe) -> str:
-        self.created_recipe = recipe
-        return f"remote-{self.account.key}"
+        self.create_calls += 1
+        self.created_recipe = copy.deepcopy(recipe)
+        remote_id = f"remote-{self.account.key}"
+        created = copy.deepcopy(recipe)
+        created.id = remote_id
+        created.ingredients = []
+        self.recipes[remote_id] = created
+        return remote_id
 
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         self.saved_ingredients.append(ingredient)
+        self._store_ingredient(remote_recipe_id, ingredient)
         return True
+
+    def _store_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> None:
+        stored = copy.deepcopy(ingredient)
+        stored.recipe_id = remote_recipe_id
+        stored.remote_ingredient_id = f"iid-{len(self.recipes[remote_recipe_id].ingredients) + 1}"
+        self.recipes[remote_recipe_id].ingredients.append(stored)
 
     async def save_recipe_meta(self, recipe: Recipe, remote_id: str) -> bool:
         self.saved_meta.append(
@@ -449,11 +467,34 @@ class FakeCreateClient:
                 group_id=recipe.group_id,
             )
         )
+        stored = self.recipes[remote_id]
+        stored.title = recipe.title
+        stored.description = recipe.description
+        stored.portions = recipe.portions
+        stored.prep_time = recipe.prep_time
+        stored.cook_time = recipe.cook_time
+        stored.steps = list(recipe.steps)
         return True
 
     async def delete_recipe(self, remote_recipe_id: str) -> bool:
         self.deleted_recipe_ids.append(remote_recipe_id)
+        self.recipes.pop(remote_recipe_id, None)
         return True
+
+    async def delete_ingredient(self, remote_recipe_id: str, remote_ingredient_id: str) -> bool:
+        recipe = self.recipes[remote_recipe_id]
+        recipe.ingredients = [
+            ingredient
+            for ingredient in recipe.ingredients
+            if ingredient.remote_ingredient_id != remote_ingredient_id
+        ]
+        return True
+
+    async def get_recipe(self, remote_recipe_id: str) -> Recipe:
+        return copy.deepcopy(self.recipes[remote_recipe_id])
+
+    async def cookbook(self) -> list[RecipeSummary]:
+        return [RecipeSummary(remote_id=remote_id, title=recipe.title) for remote_id, recipe in self.recipes.items()]
 
     async def close(self) -> None:
         return None
@@ -466,7 +507,10 @@ class FakeRejectIngredientCreateClient(FakeCreateClient):
 
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         self.saved_ingredients.append(ingredient)
-        return ingredient.title != self.rejected_title
+        accepted = ingredient.title != self.rejected_title
+        if accepted:
+            self._store_ingredient(remote_recipe_id, ingredient)
+        return accepted
 
 
 class FakeLegacyAddableCreateClient(FakeCreateClient):
@@ -477,7 +521,10 @@ class FakeLegacyAddableCreateClient(FakeCreateClient):
 
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         self.saved_ingredients.append(ingredient)
-        return ingredient.food_id == self.addable.food_id
+        accepted = ingredient.food_id == self.addable.food_id
+        if accepted:
+            self._store_ingredient(remote_recipe_id, ingredient)
+        return accepted
 
     async def search_addable_foods(self, query: str, page: int = 0) -> list[FoodSearchResult]:
         self.addable_queries.append(query)
@@ -487,6 +534,7 @@ class FakeLegacyAddableCreateClient(FakeCreateClient):
 class FakeAcceptSelectedFoodCreateClient(FakeLegacyAddableCreateClient):
     async def add_ingredient(self, remote_recipe_id: str, ingredient: Ingredient) -> bool:
         self.saved_ingredients.append(ingredient)
+        self._store_ingredient(remote_recipe_id, ingredient)
         return True
 
 
@@ -1914,7 +1962,7 @@ def test_create_recipe_from_list_uses_last_sync_description(tmp_path) -> None:
             )
         ]
 
-        asyncio.run(
+        created = asyncio.run(
             engine.create_recipe_from_list(
                 "group",
                 "Тест",
@@ -1927,6 +1975,63 @@ def test_create_recipe_from_list_uses_last_sync_description(tmp_path) -> None:
         assert client.created_recipe is not None
         assert client.created_recipe.description.startswith("Последняя синхронизация: ")
         assert client.created_recipe.steps == ["Смешать", "Запечь"]
+        stored = storage.get_recipe(created.recipe_id)
+        assert stored is not None
+        assert stored.ingredients[0].id != "ingredient-1"
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_recovers_create_before_remote_id_journal_write(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeCreateClient()
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Филе",
+                grams=Decimal("100"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-1",
+                    title="Куриное Филе",
+                    portion_id="portion-1",
+                    amount=Decimal("100"),
+                    portion_description="г",
+                ),
+                source="FatSecret",
+            )
+        ]
+        original_update = storage.update_recipe_list_run_account
+        crash_injected = False
+
+        class SimulatedProcessCrash(BaseException):
+            pass
+
+        def crash_before_remote_id_commit(run_id, account_key, status, **kwargs):  # noqa: ANN001, ANN003
+            nonlocal crash_injected
+            if status == "created" and not crash_injected:
+                crash_injected = True
+                raise SimulatedProcessCrash
+            return original_update(run_id, account_key, status, **kwargs)
+
+        storage.update_recipe_list_run_account = crash_before_remote_id_commit  # type: ignore[method-assign]
+
+        with pytest.raises(SimulatedProcessCrash):
+            asyncio.run(engine.create_recipe_from_list("group", "Тест", items, updated_by=11))
+
+        assert client.create_calls == 1
+        assert storage._conn.execute(
+            "SELECT new_remote_id FROM recipe_list_run_accounts"
+        ).fetchone()[0] is None
+
+        resumed = asyncio.run(engine.create_recipe_from_list("group", "Тест", items, updated_by=11))
+
+        assert client.create_calls == 1
+        assert storage.remote_ids(resumed.recipe_id) == {"tg11": "remote-tg11"}
+        assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "completed"
     finally:
         storage.close()
 
@@ -2015,6 +2120,8 @@ def test_create_recipe_from_list_replaces_existing_recipe_after_new_create(tmp_p
         storage.set_remote_recipe_id(existing_id, "tg22", "old-22", last_synced_version=1)
         first = FakeCreateClient("tg11")
         second = FakeCreateClient("tg22")
+        first.recipes["old-11"] = Recipe(id="old-11", title="Омлет")
+        second.recipes["old-22"] = Recipe(id="old-22", title="Омлет")
         engine = RecipeSyncEngine(storage, _device())
         engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
         items = [
@@ -2062,7 +2169,8 @@ def test_create_recipe_from_list_replaces_existing_recipe_after_new_create(tmp_p
         assert stored.title == "Омлет"
         assert stored.portions == Decimal("2")
         assert stored.steps == ["Взбить", "Запечь"]
-        assert storage.get_recipe(existing_id) is None
+        assert created.recipe_id == existing_id
+        assert storage.get_recipe(existing_id) is not None
         assert storage.remote_ids(created.recipe_id) == {"tg11": "remote-tg11", "tg22": "remote-tg22"}
         assert [recipe.id for recipe in storage.list_recipes("group")] == [created.recipe_id]
     finally:
@@ -2074,6 +2182,9 @@ def test_create_recipe_from_list_replaces_live_recipe_ref_after_new_create(tmp_p
     try:
         first = FakeCreateClient("tg11")
         second = FakeCreateClient("tg22")
+        first.recipes["old-11"] = Recipe(id="old-11", title="Омлет")
+        first.recipes["old-12"] = Recipe(id="old-12", title="Омлет")
+        second.recipes["old-22"] = Recipe(id="old-22", title="Омлет")
         engine = RecipeSyncEngine(storage, _device())
         engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
         recipe_ref = Recipe(
@@ -2126,6 +2237,81 @@ def test_create_recipe_from_list_replaces_live_recipe_ref_after_new_create(tmp_p
         assert stored.title == "Омлет"
         assert storage.remote_ids(created.recipe_id) == {"tg11": "remote-tg11", "tg22": "remote-tg22"}
         assert [recipe.id for recipe in storage.list_recipes("group")] == [created.recipe_id]
+    finally:
+        storage.close()
+
+
+def test_create_recipe_from_list_resumes_local_finalization_without_remote_recreate(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        existing_id = storage.create_recipe("Омлет", "старый", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+        storage.set_remote_recipe_id(existing_id, "tg11", "old-11", last_synced_version=1)
+        client = FakeCreateClient("tg11")
+        client.recipes["old-11"] = Recipe(id="old-11", title="Омлет", description="старый")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Яйцо",
+                grams=Decimal("50"),
+                ingredient=Ingredient(
+                    id="ingredient-1",
+                    recipe_id="",
+                    food_id="food-egg",
+                    title="Яйцо",
+                    portion_id="51772",
+                    amount=Decimal("50"),
+                    portion_description="г",
+                    grams=Decimal("50"),
+                ),
+                source="FatSecret",
+            )
+        ]
+        original_finalize = storage.finalize_recipe_list_run
+        finalize_calls = 0
+
+        def fail_once(run_id, recipe, remote_ids):  # noqa: ANN001
+            nonlocal finalize_calls
+            finalize_calls += 1
+            if finalize_calls == 1:
+                raise RuntimeError("injected local finalization failure")
+            return original_finalize(run_id, recipe, remote_ids)
+
+        storage.finalize_recipe_list_run = fail_once  # type: ignore[method-assign]
+
+        with pytest.raises(FatSecretError, match="remote ID сохранены"):
+            asyncio.run(
+                engine.create_recipe_from_list(
+                    "group",
+                    "Омлет",
+                    items,
+                    updated_by=11,
+                    portions=Decimal("2"),
+                    replace_existing_recipe_id=existing_id,
+                )
+            )
+
+        assert client.create_calls == 1
+        assert client.deleted_recipe_ids == ["old-11"]
+        assert storage.remote_ids(existing_id) == {"tg11": "old-11"}
+        assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "recovery_pending"
+
+        resumed = asyncio.run(
+            engine.create_recipe_from_list(
+                "group",
+                "Омлет",
+                items,
+                updated_by=11,
+                portions=Decimal("2"),
+                replace_existing_recipe_id=existing_id,
+            )
+        )
+
+        assert resumed.recipe_id == existing_id
+        assert client.create_calls == 1
+        assert client.deleted_recipe_ids == ["old-11"]
+        assert storage.remote_ids(existing_id) == {"tg11": "remote-tg11"}
+        assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "completed"
     finally:
         storage.close()
 
