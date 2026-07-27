@@ -668,6 +668,22 @@ class TelegramRecipeBot:
         self._set_recipe_cache(context, group_id, recipes)
         return True
 
+    async def _refresh_group_after_account_transfer(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        group_id: str | None,
+    ) -> bool:
+        """Refresh the destination cookbook after owned credentials move between groups."""
+        if group_id is None or self.storage.fatsecret_account_count(group_id) == 0:
+            return True
+        try:
+            recipes = await self.sync_engine.load_remote_recipe_index(group_id)
+        except Exception:  # noqa: BLE001 - the account move is already committed and remains valid.
+            logger.exception("Failed to refresh destination group after account transfer group_id=%s", group_id)
+            return False
+        self._set_recipe_cache(context, group_id, recipes)
+        return True
+
     def _cached_recipe(self, context: ContextTypes.DEFAULT_TYPE, group_id: str, recipe_id: str) -> Recipe | None:
         recipes = self._recipe_cache(context, group_id) or []
         return next((recipe for recipe in recipes if recipe.id == recipe_id), None)
@@ -1390,9 +1406,22 @@ class TelegramRecipeBot:
             )
         elif action == "group_switch":
             context.user_data.clear()
+            source_group = self.storage.active_group_for_user(update.effective_user.id)
+            moved = (
+                self.storage.owned_fatsecret_account_count(update.effective_user.id, source_group.id)
+                if source_group is not None and source_group.id != value
+                else 0
+            )
             switched = self.storage.set_active_group_for_user(update.effective_user.id, value)
+            refreshed = await self._refresh_group_after_account_transfer(context, value) if switched else False
+            transfer_note = f"\n\nПеренесено твоих FatSecret аккаунтов: {moved}." if switched and moved else ""
+            refresh_note = "\nНе удалось сразу обновить рецепты; открой список еще раз." if switched and not refreshed else ""
             await query.edit_message_text(
-                self._groups_text(update.effective_user.id) if switched else "Эта группа больше недоступна.",
+                (
+                    f"{self._groups_text(update.effective_user.id)}{transfer_note}{refresh_note}"
+                    if switched
+                    else "Эта группа больше недоступна."
+                ),
                 reply_markup=self._groups_keyboard(update.effective_user.id),
                 parse_mode=ParseMode.HTML,
             )
@@ -1405,9 +1434,29 @@ class TelegramRecipeBot:
             )
         elif action == "group_leave":
             context.user_data.clear()
+            source_group = self.storage.active_group_for_user(update.effective_user.id)
+            moved = (
+                self.storage.owned_fatsecret_account_count(update.effective_user.id, source_group.id)
+                if source_group is not None
+                else 0
+            )
             left = self.storage.leave_active_group(update.effective_user.id)
+            destination = self.storage.active_group_for_user(update.effective_user.id)
+            refreshed = await self._refresh_group_after_account_transfer(
+                context,
+                destination.id if destination is not None else None,
+            ) if left else False
+            if left and moved:
+                account_note = (
+                    f" Твои FatSecret аккаунты ({moved}) перенесены в группу «{html.escape(destination.name)}»."
+                    if destination is not None
+                    else f" Твои FatSecret аккаунты ({moved}) сохранены без группы."
+                )
+            else:
+                account_note = ""
+            refresh_note = " Не удалось сразу обновить рецепты; открой список еще раз." if left and not refreshed else ""
             await query.edit_message_text(
-                "Отключился от группы." if left else "Ты сейчас не в группе.",
+                f"Отключился от группы.{account_note}{refresh_note}" if left else "Ты сейчас не в группе.",
                 reply_markup=self._groups_keyboard(update.effective_user.id),
                 parse_mode=ParseMode.HTML,
             )
@@ -2447,10 +2496,21 @@ class TelegramRecipeBot:
         user = update.effective_user
         if user is None:
             return
+        source_group = self.storage.active_group_for_user(user.id)
+        moved = (
+            self.storage.owned_fatsecret_account_count(user.id, source_group.id)
+            if source_group is not None
+            else 0
+        )
         group = self.storage.create_group(user.id, text)
+        refreshed = await self._refresh_group_after_account_transfer(context, group.id)
         context.user_data.clear()
+        transfer_note = f"\nПеренесено твоих FatSecret аккаунтов: {moved}." if moved else ""
+        refresh_note = "\nНе удалось сразу обновить рецепты; открой список еще раз." if not refreshed else ""
         await update.effective_message.reply_text(
-            f"Группа создана: {html.escape(group.name)}\nКод для второго пользователя: <code>{group.invite_code}</code>",
+            f"Группа создана: {html.escape(group.name)}\n"
+            f"Код для второго пользователя: <code>{group.invite_code}</code>"
+            f"{transfer_note}{refresh_note}",
             reply_markup=MAIN_KEYBOARD,
             parse_mode=ParseMode.HTML,
         )
@@ -2459,13 +2519,22 @@ class TelegramRecipeBot:
         user = update.effective_user
         if user is None:
             return
+        source_group = self.storage.active_group_for_user(user.id)
+        moved = (
+            self.storage.owned_fatsecret_account_count(user.id, source_group.id)
+            if source_group is not None
+            else 0
+        )
         group = self.storage.join_group_by_code(user.id, text)
         if group is None:
             await update.effective_message.reply_text("Не нашел группу с таким кодом. Проверь код и пришли еще раз.")
             return
+        refreshed = await self._refresh_group_after_account_transfer(context, group.id)
         context.user_data.clear()
+        transfer_note = f" Перенесено твоих FatSecret аккаунтов: {moved}." if moved else ""
+        refresh_note = " Не удалось сразу обновить рецепты; открой список еще раз." if not refreshed else ""
         await update.effective_message.reply_text(
-            f"Подключился к группе: {html.escape(group.name)}.",
+            f"Подключился к группе: {html.escape(group.name)}.{transfer_note}{refresh_note}",
             reply_markup=MAIN_KEYBOARD,
             parse_mode=ParseMode.HTML,
         )

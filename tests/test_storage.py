@@ -83,10 +83,14 @@ def test_group_join_switch_and_group_scoped_accounts(tmp_path) -> None:
 
         other_group = storage.create_group(11, "Solo")
         assert storage.set_active_group_for_user(22, other_group.id) is False
+        assert {account.key for account in storage.list_fatsecret_accounts(other_group.id)} == {"tg11"}
+        assert {account.key for account in storage.list_fatsecret_accounts(group.id)} == {"tg22"}
+
+        assert storage.set_active_group_for_user(11, group.id) is True
         assert storage.list_fatsecret_accounts(other_group.id) == []
         assert {account.key for account in storage.list_fatsecret_accounts(group.id)} == {"tg11", "tg22"}
-        assert storage.detach_fatsecret_account_from_group("tg11", group.id, 11) is True
-        assert storage.attach_fatsecret_account_to_group("tg11", other_group.id, 11) is True
+
+        assert storage.set_active_group_for_user(11, other_group.id) is True
         assert {account.key for account in storage.list_fatsecret_accounts(other_group.id)} == {"tg11"}
     finally:
         storage.close()
@@ -122,6 +126,57 @@ def test_group_members_and_leave_active_group(tmp_path) -> None:
         assert storage.leave_active_group(22) == group
         assert storage.active_group_for_user(22) is None
         assert [member.telegram_id for member in storage.group_members(group.id)] == [11]
+    finally:
+        storage.close()
+
+
+def test_group_switch_moves_only_owned_accounts_and_preserves_session(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        storage.register_user(22, "Two")
+        shared = storage.create_group(11, "Общая")
+        storage.join_group_by_code(22, shared.invite_code)
+        first_key = storage.create_fatsecret_account(
+            11, "One FS", "one@example.com", "secret-one", "BY", "ru", group_id=shared.id
+        )
+        second_key = storage.create_fatsecret_account(
+            22, "Two FS", "two@example.com", "secret-two", "BY", "ru", group_id=shared.id
+        )
+        session = FatSecretSession("server", "device", "secret")
+        assert storage.update_fatsecret_session(first_key, session) is True
+        recipe_id = storage.create_recipe("Омлет", "", Decimal("1"), 0, 0, 11, shared.id)
+        storage.set_remote_recipe_id(recipe_id, first_key, "remote-one", last_synced_version=1)
+        storage.mark_synced(recipe_id, first_key, "remote-one", version=1)
+
+        destination = storage.create_group(11, "Личная")
+
+        assert storage.fatsecret_account_group_id(first_key) == destination.id
+        assert storage.fatsecret_account_group_id(second_key) == shared.id
+        assert storage.get_fatsecret_session(first_key) == session
+        assert storage.get_fatsecret_account(first_key).password == "secret-one"
+        assert storage.get_recipe(recipe_id) is None
+    finally:
+        storage.close()
+
+
+def test_leaving_only_group_detaches_owned_accounts_without_deleting_credentials(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Одна")
+        account_key = storage.create_fatsecret_account(
+            11, "One FS", "one@example.com", "secret", "BY", "ru", group_id=group.id
+        )
+        session = FatSecretSession("server", "device", "secret")
+        storage.update_fatsecret_session(account_key, session)
+
+        assert storage.leave_active_group(11) == group
+
+        assert storage.active_group_for_user(11) is None
+        assert storage.fatsecret_account_group_id(account_key) is None
+        assert storage.get_fatsecret_account(account_key) is not None
+        assert storage.get_fatsecret_session(account_key) == session
     finally:
         storage.close()
 
@@ -550,13 +605,14 @@ def test_one_telegram_user_can_own_multiple_accounts_but_each_account_has_one_gr
         second_group = storage.create_group(11, "Вторая")
 
         assert [item.key for item in storage.list_fatsecret_accounts_for_owner(11)] == [first_key, second_key]
-        assert {item.key for item in storage.list_fatsecret_accounts(first_group.id)} == {first_key, second_key}
-        assert storage.attach_fatsecret_account_to_group(first_key, second_group.id, 11) is False
-        assert storage.detach_fatsecret_account_from_group(second_key, first_group.id, 11) is True
-        assert storage.attach_fatsecret_account_to_group(second_key, second_group.id, 11) is True
-        assert storage.fatsecret_account_group_id(second_key) == second_group.id
+        assert storage.list_fatsecret_accounts(first_group.id) == []
+        assert {item.key for item in storage.list_fatsecret_accounts(second_group.id)} == {first_key, second_key}
         assert storage.set_active_group_for_user(11, first_group.id) is True
+        assert {item.key for item in storage.list_fatsecret_accounts(first_group.id)} == {first_key, second_key}
+        assert storage.list_fatsecret_accounts(second_group.id) == []
         assert storage.set_active_group_for_user(11, second_group.id) is True
+        assert storage.list_fatsecret_accounts(first_group.id) == []
+        assert {item.key for item in storage.list_fatsecret_accounts(second_group.id)} == {first_key, second_key}
     finally:
         storage.close()
 

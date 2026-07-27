@@ -772,32 +772,39 @@ class Storage:
         ]
 
     def create_group(self, telegram_id: int, name: str) -> RecipeGroup:
-        """Create a recipe sync group and make it active for the creator."""
+        """Create a recipe sync group, move owned accounts there, and make it active."""
         group = RecipeGroup(id=str(uuid.uuid4()), name=name.strip() or "Группа", invite_code=self._unique_invite_code())
         now = _now()
-        self._conn.execute(
-            """
-            INSERT INTO recipe_groups(id, name, invite_code, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (group.id, group.name, group.invite_code, telegram_id, now),
-        )
-        self._conn.execute(
-            """
-            INSERT OR IGNORE INTO group_members(group_id, telegram_id, joined_at)
-            VALUES (?, ?, ?)
-            """,
-            (group.id, telegram_id, now),
-        )
-        self._conn.execute(
-            "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
-            (group.id, telegram_id),
-        )
-        self._conn.commit()
+        source_group_id = self._active_group_id_for_user(telegram_id)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO recipe_groups(id, name, invite_code, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (group.id, group.name, group.invite_code, telegram_id, now),
+            )
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO group_members(group_id, telegram_id, joined_at)
+                VALUES (?, ?, ?)
+                """,
+                (group.id, telegram_id, now),
+            )
+            self._move_owned_accounts_between_groups(telegram_id, source_group_id, group.id)
+            self._conn.execute(
+                "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
+                (group.id, telegram_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return group
 
     def join_group_by_code(self, telegram_id: int, invite_code: str) -> RecipeGroup | None:
-        """Join a group by invite code and make it active for the user."""
+        """Join a group, move owned accounts there, and make it active for the user."""
         normalized = invite_code.strip().upper().replace(" ", "")
         row = self._conn.execute(
             "SELECT id, name, invite_code FROM recipe_groups WHERE invite_code = ?",
@@ -805,33 +812,47 @@ class Storage:
         ).fetchone()
         if row is None:
             return None
-        self._conn.execute(
-            """
-            INSERT OR IGNORE INTO group_members(group_id, telegram_id, joined_at)
-            VALUES (?, ?, ?)
-            """,
-            (row["id"], telegram_id, _now()),
-        )
-        self._conn.execute(
-            "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
-            (row["id"], telegram_id),
-        )
-        self._conn.commit()
+        source_group_id = self._active_group_id_for_user(telegram_id)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO group_members(group_id, telegram_id, joined_at)
+                VALUES (?, ?, ?)
+                """,
+                (row["id"], telegram_id, _now()),
+            )
+            self._move_owned_accounts_between_groups(telegram_id, source_group_id, str(row["id"]))
+            self._conn.execute(
+                "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
+                (row["id"], telegram_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return RecipeGroup(id=row["id"], name=row["name"], invite_code=row["invite_code"])
 
     def set_active_group_for_user(self, telegram_id: int, group_id: str) -> bool:
-        """Switch the active group if the Telegram user is a group member."""
+        """Switch groups and move the user's owned FatSecret accounts atomically."""
         row = self._conn.execute(
             "SELECT 1 FROM group_members WHERE telegram_id = ? AND group_id = ?",
             (telegram_id, group_id),
         ).fetchone()
         if row is None:
             return False
-        self._conn.execute(
-            "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
-            (group_id, telegram_id),
-        )
-        self._conn.commit()
+        source_group_id = self._active_group_id_for_user(telegram_id)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._move_owned_accounts_between_groups(telegram_id, source_group_id, group_id)
+            self._conn.execute(
+                "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
+                (group_id, telegram_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return True
 
     def active_group_created_by(self, telegram_id: int) -> bool:
@@ -871,30 +892,129 @@ class Storage:
         return RecipeGroup(id=row["id"], name=clean_name, invite_code=row["invite_code"])
 
     def leave_active_group(self, telegram_id: int) -> RecipeGroup | None:
-        """Remove a Telegram user from their active group and switch to another joined group if one exists."""
+        """Leave the active group and move owned accounts to the next group or detach them."""
         group = self.active_group_for_user(telegram_id)
         if group is None:
             return None
-        self._conn.execute(
-            "DELETE FROM group_members WHERE telegram_id = ? AND group_id = ?",
-            (telegram_id, group.id),
-        )
-        next_group = self._conn.execute(
-            """
-            SELECT group_id
-            FROM group_members
-            WHERE telegram_id = ?
-            ORDER BY joined_at ASC
-            LIMIT 1
-            """,
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "DELETE FROM group_members WHERE telegram_id = ? AND group_id = ?",
+                (telegram_id, group.id),
+            )
+            next_group = self._conn.execute(
+                """
+                SELECT group_id
+                FROM group_members
+                WHERE telegram_id = ?
+                ORDER BY joined_at ASC
+                LIMIT 1
+                """,
+                (telegram_id,),
+            ).fetchone()
+            destination_group_id = str(next_group["group_id"]) if next_group else None
+            self._move_owned_accounts_between_groups(telegram_id, group.id, destination_group_id)
+            self._conn.execute(
+                "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
+                (destination_group_id, telegram_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return group
+
+    def _active_group_id_for_user(self, telegram_id: int) -> str | None:
+        row = self._conn.execute(
+            "SELECT active_group_id FROM telegram_users WHERE telegram_id = ?",
             (telegram_id,),
         ).fetchone()
+        return str(row["active_group_id"]) if row is not None and row["active_group_id"] else None
+
+    def _move_owned_accounts_between_groups(
+        self,
+        telegram_id: int,
+        source_group_id: str | None,
+        destination_group_id: str | None,
+    ) -> int:
+        """Move owned attachments and invalidate source-group local state in the current transaction."""
+        if source_group_id is None or source_group_id == destination_group_id:
+            return 0
+        rows = self._conn.execute(
+            """
+            SELECT ga.account_key
+            FROM group_accounts ga
+            JOIN fatsecret_accounts fa ON fa.account_key = ga.account_key
+            WHERE ga.group_id = ? AND fa.owner_telegram_id = ?
+            ORDER BY ga.account_key
+            """,
+            (source_group_id, telegram_id),
+        ).fetchall()
+        account_keys = [str(row["account_key"]) for row in rows]
+        if not account_keys:
+            return 0
+
+        placeholders = ",".join("?" for _ in account_keys)
+        affected_rows = self._conn.execute(
+            f"""
+            SELECT DISTINCT ar.recipe_id
+            FROM account_recipes ar
+            JOIN recipes r ON r.id = ar.recipe_id
+            WHERE r.group_id = ? AND ar.account_key IN ({placeholders})
+            """,
+            (source_group_id, *account_keys),
+        ).fetchall()
+        affected_recipe_ids = {str(row["recipe_id"]) for row in affected_rows}
         self._conn.execute(
-            "UPDATE telegram_users SET active_group_id = ? WHERE telegram_id = ?",
-            (next_group["group_id"] if next_group else None, telegram_id),
+            f"""
+            DELETE FROM account_recipes
+            WHERE account_key IN ({placeholders})
+              AND recipe_id IN (SELECT id FROM recipes WHERE group_id = ?)
+            """,
+            (*account_keys, source_group_id),
         )
-        self._conn.commit()
-        return group
+        for recipe_id in affected_recipe_ids:
+            remaining = self._conn.execute(
+                "SELECT 1 FROM account_recipes WHERE recipe_id = ? LIMIT 1",
+                (recipe_id,),
+            ).fetchone()
+            if remaining is None:
+                self._delete_recipe_rows(recipe_id)
+
+        now = _now()
+        self._conn.execute(
+            f"""
+            UPDATE recipe_swap_runs
+            SET status = 'failed', error = ?, updated_at = ?
+            WHERE account_key IN ({placeholders})
+              AND status NOT IN ('completed', 'rolled_back', 'failed')
+            """,
+            ("FatSecret account moved to another group", now, *account_keys),
+        )
+        self._conn.execute(
+            """
+            UPDATE diary_copy_runs
+            SET status = 'failed', result_json = ?, updated_at = ?
+            WHERE group_id = ? AND status IN ('pending', 'running')
+            """,
+            (json.dumps({"error": "FatSecret account configuration changed"}), now, source_group_id),
+        )
+        self._conn.execute(
+            f"DELETE FROM group_accounts WHERE account_key IN ({placeholders})",
+            account_keys,
+        )
+        if destination_group_id is not None:
+            self._conn.executemany(
+                """
+                INSERT INTO group_accounts(group_id, account_key, added_by, added_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [(destination_group_id, account_key, telegram_id, now) for account_key in account_keys],
+            )
+        for group_id in {source_group_id, destination_group_id} - {None}:
+            self._conn.execute("DELETE FROM food_usage_cache WHERE group_id = ?", (group_id,))
+            self._conn.execute("DELETE FROM food_usage_refreshes WHERE group_id = ?", (group_id,))
+        return len(account_keys)
 
     def upsert_fatsecret_account(
         self,
@@ -1337,6 +1457,19 @@ class Storage:
                 "SELECT COUNT(*) AS c FROM recipes WHERE group_id = ?",
                 (group_id,),
             ).fetchone()
+        return int(row["c"])
+
+    def owned_fatsecret_account_count(self, telegram_id: int, group_id: str) -> int:
+        """Return how many accounts owned by a user are attached to one group."""
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM group_accounts ga
+            JOIN fatsecret_accounts fa ON fa.account_key = ga.account_key
+            WHERE ga.group_id = ? AND fa.owner_telegram_id = ?
+            """,
+            (group_id, telegram_id),
+        ).fetchone()
         return int(row["c"])
 
     def list_recipe_page(self, group_id: str | None, page: int, page_size: int) -> list[Recipe]:
