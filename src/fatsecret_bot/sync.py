@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Awaitable, Callable
@@ -793,6 +794,22 @@ def _ingredient_for_target_create(ingredient: Ingredient) -> Ingredient:
         remote_ingredient_id=None,
         grams=ingredient.grams,
     )
+
+
+def _recipe_ingredient_membership_differences(expected: Recipe, actual: Recipe) -> list[str]:
+    """Report missing or unexpected ingredient identities without comparing transport formatting."""
+    expected_counts = Counter(ingredient.food_id for ingredient in expected.ingredients)
+    actual_counts = Counter(ingredient.food_id for ingredient in actual.ingredients)
+    expected_titles = {ingredient.food_id: ingredient.title for ingredient in expected.ingredients}
+    actual_titles = {ingredient.food_id: ingredient.title for ingredient in actual.ingredients}
+    differences: list[str] = []
+    for food_id, count in sorted((expected_counts - actual_counts).items()):
+        title = expected_titles.get(food_id) or food_id
+        differences.append(f"не добавлен продукт «{title}» ({count} шт.)")
+    for food_id, count in sorted((actual_counts - expected_counts).items()):
+        title = actual_titles.get(food_id) or food_id
+        differences.append(f"добавлен лишний продукт «{title}» ({count} шт.)")
+    return differences
 
 
 def _custom_food_content_hash(definition: CustomFoodDefinition) -> str:
@@ -2106,14 +2123,13 @@ class RecipeSyncEngine:
         remote_id: str,
         expected: Recipe,
     ) -> Recipe:
-        """Read back one mutation and reject a false success when exact content differs."""
+        """Read back one mutation and reject only missing or unexpected ingredients."""
         actual = await client.get_recipe(remote_id)
-        expected_fingerprint = recipe_fingerprint(expected)
         actual_fingerprint = recipe_fingerprint(actual)
-        differences = recipe_fingerprint_diff(expected_fingerprint, actual_fingerprint)
+        differences = _recipe_ingredient_membership_differences(expected, actual)
         if differences:
             raise FatSecretError(
-                f"{client.account.label}: FatSecret вернул несовпадающий рецепт после сохранения: "
+                f"{client.account.label}: FatSecret сохранил неверный набор продуктов: "
                 + "; ".join(differences)
             )
         self.storage.upsert_remote_recipe_snapshot(

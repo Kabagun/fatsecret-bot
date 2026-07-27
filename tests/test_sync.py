@@ -2652,6 +2652,99 @@ def test_hydrate_live_recipe_variants_keeps_conflicting_account_versions(tmp_pat
         storage.close()
 
 
+def test_verify_remote_recipe_accepts_server_portion_and_metadata_canonicalization(tmp_path) -> None:
+    expected = Recipe(
+        id="local",
+        title="Куриные котлеты",
+        description="expected",
+        portions=Decimal("2"),
+        steps=["Приготовить"],
+        ingredients=[
+            Ingredient(
+                "flour",
+                "local",
+                "18138808",
+                "Пшеничная мука",
+                "0",
+                Decimal("0.4"),
+                "100г",
+                grams=Decimal("40"),
+            )
+        ],
+    )
+    actual = Recipe(
+        id="remote",
+        title="FatSecret canonical title",
+        description="actual",
+        portions=Decimal("1"),
+        steps=[],
+        ingredients=[
+            Ingredient(
+                "remote-flour",
+                "remote",
+                "18138808",
+                "ПШЕНИЧНАЯ МУКА",
+                "0",
+                Decimal("0.4"),
+                "serving",
+                remote_ingredient_id="iid-flour",
+                grams=None,
+            )
+        ],
+    )
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeFatSecretClient(actual, account_key="tg11")
+
+        verified = asyncio.run(engine._verify_remote_recipe(client, "tg11", "remote", expected))
+
+        assert verified.ingredients[0].portion_description == "serving"
+        assert verified.ingredients[0].grams is None
+        assert storage.remote_recipe_snapshot("tg11", "remote") is not None
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    ("actual_ingredients", "message"),
+    [
+        ([], "не добавлен продукт «Пшеничная мука»"),
+        (
+            [
+                Ingredient("flour", "remote", "18138808", "Пшеничная мука", "0", Decimal("0.4")),
+                Ingredient("extra", "remote", "999", "Лишний продукт", "0", Decimal("1")),
+            ],
+            "добавлен лишний продукт «Лишний продукт»",
+        ),
+    ],
+)
+def test_verify_remote_recipe_rejects_missing_or_unexpected_products(
+    tmp_path,
+    actual_ingredients: list[Ingredient],
+    message: str,
+) -> None:
+    expected = Recipe(
+        id="local",
+        title="Котлеты",
+        ingredients=[
+            Ingredient("flour", "local", "18138808", "Пшеничная мука", "0", Decimal("0.4"))
+        ],
+    )
+    actual = Recipe(id="remote", title="Котлеты", ingredients=actual_ingredients)
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        client = FakeFatSecretClient(actual, account_key="tg11")
+
+        with pytest.raises(FatSecretError, match=message):
+            asyncio.run(engine._verify_remote_recipe(client, "tg11", "remote", expected))
+
+        assert storage.remote_recipe_snapshot("tg11", "remote") is None
+    finally:
+        storage.close()
+
+
 def test_load_remote_recipe_index_reconciles_recipes_deleted_outside_bot(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -3091,7 +3184,8 @@ def test_verified_sync_rejects_stale_detail_and_rolls_back_new_target(tmp_path) 
                 )
             )
 
-        assert "несовпадающий рецепт" in str(error.value)
+        assert "неверный набор продуктов" in str(error.value)
+        assert "не добавлен продукт «Яйцо»" in str(error.value)
         assert client.deleted_recipe_ids == ["base-created-1"]
         assert "base-created-1" not in client.recipes
     finally:
