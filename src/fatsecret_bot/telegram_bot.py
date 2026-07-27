@@ -7,6 +7,8 @@ import html
 import logging
 import re
 import time
+from collections import Counter
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -48,6 +50,8 @@ RECIPE_CACHE_GROUP_KEY = "recipe_cache_group_id"
 RECIPE_CACHE_LOADED_KEY = "recipe_cache_loaded_at"
 RECIPE_RENDER_KEY = "recipe_render_key"
 RECIPE_SEARCH_IDS_KEY = "recipe_search_ids"
+RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY = "recipe_product_difference_cache"
+RECIPE_PRODUCT_DIFFERENCE_FOOTER = "⚠️ — в рецепте есть различия между аккаунтами."
 MAIN_BUTTONS = {"Поиск рецептов", "Рецепты", "Создать из списка", "Меню / Дневник", "Группы", "Аккаунты"}
 LIST_WIDTH_LINE = "--------------------------------"
 PORTION_DESCRIPTION_RE = re.compile(
@@ -213,6 +217,119 @@ def _format_ingredient_amount(ingredient: Ingredient) -> str:
     return f"{number} {unit}"
 
 
+@dataclass(frozen=True)
+class _RecipeProductComparison:
+    same_products: tuple[Ingredient, ...]
+    different_products: tuple[tuple[RemoteRecipeVariant, tuple[Ingredient, ...]], ...]
+
+    @property
+    def has_differences(self) -> bool:
+        return any(products for _, products in self.different_products)
+
+
+def _visible_ingredient_key(ingredient: Ingredient) -> tuple[str, str]:
+    return normalize_title(ingredient.title), normalize_title(_format_ingredient_amount(ingredient))
+
+
+def _compare_recipe_products(variants: list[RemoteRecipeVariant]) -> _RecipeProductComparison:
+    """Compare visible ingredient names and amounts across account-specific recipe versions."""
+    if not variants:
+        return _RecipeProductComparison((), ())
+    if len({variant.account_key for variant in variants}) < 2:
+        return _RecipeProductComparison(tuple(variants[0].recipe.ingredients), ())
+
+    counters = [Counter(_visible_ingredient_key(item) for item in variant.recipe.ingredients) for variant in variants]
+    same_counts = counters[0].copy()
+    for counter in counters[1:]:
+        same_counts &= counter
+
+    same_remaining = same_counts.copy()
+    same_products: list[Ingredient] = []
+    for ingredient in variants[0].recipe.ingredients:
+        key = _visible_ingredient_key(ingredient)
+        if same_remaining[key] <= 0:
+            continue
+        same_products.append(ingredient)
+        same_remaining[key] -= 1
+
+    different_products: list[tuple[RemoteRecipeVariant, tuple[Ingredient, ...]]] = []
+    for variant in variants:
+        remaining = same_counts.copy()
+        differences: list[Ingredient] = []
+        for ingredient in variant.recipe.ingredients:
+            key = _visible_ingredient_key(ingredient)
+            if remaining[key] > 0:
+                remaining[key] -= 1
+            else:
+                differences.append(ingredient)
+        different_products.append((variant, tuple(differences)))
+    return _RecipeProductComparison(tuple(same_products), tuple(different_products))
+
+
+def _format_product_difference_amount(ingredient: Ingredient) -> str:
+    return re.sub(r"(?<=\d)(г|мл)$", r" \1", _format_ingredient_amount(ingredient))
+
+
+def _format_product_difference_line(index: int, ingredient: Ingredient) -> str:
+    title = ingredient.title.strip() or "Без названия"
+    if len(title) > 240:
+        title = title[:237].rstrip() + "…"
+    return (
+        f"{index}. {html.escape(title)} — "
+        f"{html.escape(_format_product_difference_amount(ingredient))}"
+    )
+
+
+def _truncate_html_lines(lines: list[str], limit: int = 4000) -> str:
+    rendered: list[str] = []
+    current_length = 0
+    for line in lines:
+        added_length = len(line) + (1 if rendered else 0)
+        if current_length + added_length > limit - 2:
+            rendered.append("…")
+            break
+        rendered.append(line)
+        current_length += added_length
+    return "\n".join(rendered)
+
+
+def _format_recipe_product_differences(
+    comparison: _RecipeProductComparison,
+    account_labels: dict[str, str],
+) -> str:
+    """Render visible ingredient differences grouped by FatSecret account."""
+    if not comparison.different_products:
+        return ""
+    variants = [variant for variant, _ in comparison.different_products]
+    title = variants[0].recipe.title.strip() or "Рецепт"
+    account_counts = Counter(variant.account_key for variant in variants)
+    difference_slots = max(len(products) for _, products in comparison.different_products)
+    lines = [f"<b>{html.escape(title)}</b>"]
+    for variant, products in comparison.different_products:
+        label = account_labels.get(variant.account_key, variant.account_key)
+        if account_counts[variant.account_key] > 1:
+            label = f"{label} (ID {variant.remote_recipe_id})"
+        lines.extend(["", f"<b>Продукты отличаются у {html.escape(label)}:</b>", ""])
+        if products:
+            lines.extend(
+                _format_product_difference_line(index, ingredient)
+                for index, ingredient in enumerate(products, start=1)
+            )
+        lines.extend(
+            f"{index}. Отсутствует"
+            for index in range(len(products) + 1, difference_slots + 1)
+        )
+    lines.extend(["", "<b>Совпадающие продукты:</b>", ""])
+    if comparison.same_products:
+        lines.extend(
+            _format_product_difference_line(index, ingredient)
+            for index, ingredient in enumerate(comparison.same_products, start=1)
+        )
+    else:
+        lines.append("Отсутствуют.")
+    return _truncate_html_lines(lines)
+
+
 def _parse_open_recipe_value(value: str) -> tuple[str, int, str]:
     recipe_id, _, rest = value.partition(":")
     raw_page, _, raw_page_action = rest.partition(":")
@@ -250,13 +367,23 @@ def _recipe_owner_text(recipe: Recipe, account_labels: dict[str, str]) -> str:
     return ", ".join(owners)
 
 
-def _recipe_list_button_text(recipe: Recipe, account_labels: dict[str, str], prefix: str = "") -> str:
-    text = f"{prefix}{recipe.title} - {_recipe_owner_text(recipe, account_labels)}"
-    return text[:90]
+def _recipe_list_button_text(
+    recipe: Recipe,
+    account_labels: dict[str, str],
+    prefix: str = "",
+    *,
+    has_product_differences: bool = False,
+) -> str:
+    text = f"{prefix}{recipe.title} · {_recipe_owner_text(recipe, account_labels)}"
+    marker = " ⚠️" if has_product_differences else ""
+    return f"{text[: 90 - len(marker)].rstrip()}{marker}"
 
 
-def _recipe_list_message(title: str) -> str:
-    return f"{title}\nПришли текст в чат, чтобы искать по рецептам.\n{LIST_WIDTH_LINE}"
+def _recipe_list_message(title: str, *, has_product_differences: bool = False) -> str:
+    lines = [title, "Пришли текст в чат, чтобы искать по рецептам.", LIST_WIDTH_LINE]
+    if has_product_differences:
+        lines.append(RECIPE_PRODUCT_DIFFERENCE_FOOTER)
+    return "\n".join(lines)
 
 
 def _recipe_remote_identities(recipe: Recipe) -> set[tuple[str, str]]:
@@ -648,11 +775,48 @@ class TelegramRecipeBot:
         context.chat_data[RECIPE_CACHE_GROUP_KEY] = group_id
         context.chat_data[RECIPE_CACHE_KEY] = recipes
         context.chat_data[RECIPE_CACHE_LOADED_KEY] = time.time()
+        context.chat_data.pop(RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY, None)
 
     def _clear_recipe_cache(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.chat_data.pop(RECIPE_CACHE_GROUP_KEY, None)
         context.chat_data.pop(RECIPE_CACHE_KEY, None)
         context.chat_data.pop(RECIPE_CACHE_LOADED_KEY, None)
+        context.chat_data.pop(RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY, None)
+
+    def _recipe_product_difference_cache(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> dict[str, bool]:
+        cache = context.chat_data.get(RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY)
+        if not isinstance(cache, dict):
+            cache = {}
+            context.chat_data[RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY] = cache
+        return cache
+
+    async def _recipe_product_difference_ids(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        recipes: list[Recipe],
+    ) -> set[str]:
+        cache = self._recipe_product_difference_cache(context)
+        missing = [recipe for recipe in recipes if recipe.id not in cache]
+        semaphore = asyncio.Semaphore(2)
+
+        async def compare(recipe: Recipe) -> tuple[str, bool]:
+            account_keys = set(recipe.remote_ids) | set(recipe.remote_ids_by_account)
+            if len(account_keys) < 2:
+                return recipe.id, False
+            try:
+                async with semaphore:
+                    variants = await self.sync_engine.hydrate_live_recipe_variants(recipe)
+                return recipe.id, _compare_recipe_products(variants).has_differences
+            except Exception:  # noqa: BLE001 - one unavailable recipe must not break the list.
+                logger.exception("Failed to compare live recipe products recipe_id=%s", recipe.id)
+                return recipe.id, False
+
+        if missing:
+            cache.update(await asyncio.gather(*(compare(recipe) for recipe in missing)))
+        return {recipe.id for recipe in recipes if cache.get(recipe.id) is True}
 
     async def _refresh_recipe_cache_after_sync(
         self,
@@ -1285,14 +1449,19 @@ class TelegramRecipeBot:
         if total_count == 0:
             await status.edit_text("Рецептов пока нет. Создай рецепт в FatSecret и снова нажми «Поиск рецептов».")
             return
+        product_difference_ids = await self._recipe_product_difference_ids(context, recipes)
         await status.edit_text(
-            _recipe_list_message("Общий список рецептов:"),
+            _recipe_list_message(
+                "Общий список рецептов:",
+                has_product_differences=bool(product_difference_ids),
+            ),
             reply_markup=self._recipe_list_keyboard(
                 recipes,
                 page,
                 "list",
                 self._account_labels_for_group(group.id),
                 total_count=total_count,
+                product_difference_ids=product_difference_ids,
             ),
         )
 
@@ -1306,8 +1475,10 @@ class TelegramRecipeBot:
         page_action: str,
         account_labels: dict[str, str] | None = None,
         total_count: int | None = None,
+        product_difference_ids: set[str] | None = None,
     ) -> InlineKeyboardMarkup:
         account_labels = account_labels or {}
+        product_difference_ids = product_difference_ids or set()
         page = max(0, page)
         total_items = len(recipes) if total_count is None else total_count
         total_pages = max(1, (total_items + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE)
@@ -1316,7 +1487,11 @@ class TelegramRecipeBot:
         buttons = [
             [
                 InlineKeyboardButton(
-                    _recipe_list_button_text(recipe, account_labels),
+                    _recipe_list_button_text(
+                        recipe,
+                        account_labels,
+                        has_product_differences=recipe.id in product_difference_ids,
+                    ),
                     callback_data=f"open:{recipe.id}:{page}:{page_action}",
                 )
             ]
@@ -1685,15 +1860,24 @@ class TelegramRecipeBot:
         if total_count == 0:
             await query.edit_message_text("Рецептов пока нет.")
             return
+        product_difference_ids = (
+            await self._recipe_product_difference_ids(context, recipes)
+            if context is not None
+            else set()
+        )
         await self._safe_edit_message_text(
             query,
-            _recipe_list_message("Общий список рецептов:"),
+            _recipe_list_message(
+                "Общий список рецептов:",
+                has_product_differences=bool(product_difference_ids),
+            ),
             reply_markup=self._recipe_list_keyboard(
                 recipes,
                 page,
                 "list",
                 self._account_labels_for_group(group.id),
                 total_count=total_count,
+                product_difference_ids=product_difference_ids,
             ),
         )
         if context is not None:
@@ -1729,16 +1913,28 @@ class TelegramRecipeBot:
                 parse_mode=ParseMode.HTML,
             )
             return
+        page_recipes, page, total_count = self._recipe_page(recipes, page)
         extra = f"{search_query}:{len(recipes)}:{hash(tuple(recipe.id for recipe in recipes))}"
         render_key = self._render_key(query, context, "searchpage", page, extra)
         if self._is_duplicate_render(context, render_key):
             return
         await self._ensure_main_keyboard(query.message, context)
         context.user_data["mode"] = "recipe_search"
+        product_difference_ids = await self._recipe_product_difference_ids(context, page_recipes)
         await self._safe_edit_message_text(
             query,
-            _recipe_list_message(f"Найдено рецептов: {len(recipes)}"),
-            reply_markup=self._recipe_list_keyboard(recipes, page, "searchpage", self._account_labels_for_group(group_id)),
+            _recipe_list_message(
+                f"Найдено рецептов: {len(recipes)}",
+                has_product_differences=bool(product_difference_ids),
+            ),
+            reply_markup=self._recipe_list_keyboard(
+                page_recipes,
+                page,
+                "searchpage",
+                self._account_labels_for_group(group_id),
+                total_count=total_count,
+                product_difference_ids=product_difference_ids,
+            ),
         )
         self._mark_rendered(context, render_key)
 
@@ -1804,6 +2000,7 @@ class TelegramRecipeBot:
             if variants
             else await self.sync_engine.hydrate_recipe_from_remote(recipe_id)
         )
+        product_comparison = _compare_recipe_products(variants)
         if recipe is None:
             await query.edit_message_text("Рецепт не найден.")
             return
@@ -1814,12 +2011,14 @@ class TelegramRecipeBot:
                 for account_key, remote_ids in recipe_ref.remote_ids_by_account.items()
             }
             self._replace_cached_recipe(context, group.id, recipe)
+            self._recipe_product_difference_cache(context)[recipe.id] = product_comparison.has_differences
         total_pages, page_action = self._recipe_detail_page_count(query.from_user.id, context, page_action)
         context.user_data["current_recipe_id"] = recipe.id
         context.user_data["recipe_list_page"] = page
         context.user_data["recipe_page_action"] = page_action
         await self._ensure_main_keyboard(query.message, context)
-        if variants and len({variant.fingerprint.digest for variant in variants}) > 1:
+        fingerprints_differ = len({variant.fingerprint.digest for variant in variants}) > 1
+        if variants and (product_comparison.has_differences or fingerprints_differ):
             account_labels = {
                 account.key: account.label
                 for account in self.storage.list_fatsecret_accounts(recipe.group_id)
@@ -1836,7 +2035,11 @@ class TelegramRecipeBot:
                 )
             buttons.append([InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")])
             await query.edit_message_text(
-                _format_recipe_conflict(variants, account_labels),
+                (
+                    _format_recipe_product_differences(product_comparison, account_labels)
+                    if product_comparison.has_differences
+                    else _format_recipe_conflict(variants, account_labels)
+                ),
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode=ParseMode.HTML,
             )
@@ -3450,7 +3653,19 @@ class TelegramRecipeBot:
                 parse_mode=ParseMode.HTML,
             )
             return
+        page_recipes, page, total_count = self._recipe_page(recipes, 0)
+        product_difference_ids = await self._recipe_product_difference_ids(context, page_recipes)
         await update.effective_message.reply_text(
-            _recipe_list_message(f"Найдено рецептов: {len(recipes)}"),
-            reply_markup=self._recipe_list_keyboard(recipes, 0, "searchpage", self._account_labels_for_group(group_id)),
+            _recipe_list_message(
+                f"Найдено рецептов: {len(recipes)}",
+                has_product_differences=bool(product_difference_ids),
+            ),
+            reply_markup=self._recipe_list_keyboard(
+                page_recipes,
+                page,
+                "searchpage",
+                self._account_labels_for_group(group_id),
+                total_count=total_count,
+                product_difference_ids=product_difference_ids,
+            ),
         )

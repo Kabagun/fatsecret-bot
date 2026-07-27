@@ -14,9 +14,13 @@ from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import RecipeCreateResult
 from fatsecret_bot.telegram_bot import (
     TelegramRecipeBot,
+    _compare_recipe_products,
     _format_recipe,
     _format_recipe_conflict,
+    _format_recipe_product_differences,
     _recipe_actions_keyboard,
+    _recipe_list_button_text,
+    _recipe_list_message,
 )
 
 
@@ -140,6 +144,166 @@ def test_format_recipe_conflict_labels_both_account_versions() -> None:
     assert "Порций: 2" in text and "Порций: 4" in text
 
 
+def _recipe_variant(account_key: str, remote_id: str, ingredients: list[Ingredient]) -> RemoteRecipeVariant:
+    recipe = Recipe(id="local", title="Омлет", ingredients=ingredients)
+    return RemoteRecipeVariant(account_key, remote_id, recipe, recipe_fingerprint(recipe))
+
+
+def _ingredient(
+    identifier: str,
+    title: str,
+    grams: str,
+    *,
+    food_id: str | None = None,
+    portion_id: str = "portion",
+) -> Ingredient:
+    return Ingredient(
+        id=identifier,
+        recipe_id="local",
+        food_id=food_id or f"food-{identifier}",
+        title=title,
+        portion_id=portion_id,
+        amount=Decimal("1"),
+        portion_description="г",
+        grams=Decimal(grams),
+    )
+
+
+def test_compare_recipe_products_ignores_ids_order_and_preserves_duplicate_counts() -> None:
+    first = _recipe_variant(
+        "tg11",
+        "111",
+        [
+            _ingredient("salt-a1", "Соль", "5", food_id="food-a", portion_id="a"),
+            _ingredient("egg-a", "Яйцо", "120"),
+            _ingredient("salt-a2", "Соль", "5", food_id="food-b", portion_id="b"),
+        ],
+    )
+    second = _recipe_variant(
+        "tg22",
+        "222",
+        [
+            _ingredient("salt-b1", "  соль  ", "5", food_id="food-x", portion_id="x"),
+            _ingredient("salt-b2", "СОЛЬ", "5", food_id="food-y", portion_id="y"),
+            _ingredient("egg-b", "Яйцо", "120", food_id="food-z", portion_id="z"),
+        ],
+    )
+
+    comparison = _compare_recipe_products([first, second])
+
+    assert comparison.has_differences is False
+    assert [item.title for item in comparison.same_products] == ["Соль", "Яйцо", "Соль"]
+
+
+def test_format_recipe_product_differences_groups_accounts_and_same_products() -> None:
+    first = _recipe_variant(
+        "tg11",
+        "111",
+        [
+            _ingredient("egg-a", "Яйцо куриное", "120"),
+            _ingredient("milk-a", "Молоко Савушкин 1,5%", "200"),
+            _ingredient("salt-a", "Соль", "5"),
+        ],
+    )
+    second = _recipe_variant(
+        "tg22",
+        "222",
+        [
+            _ingredient("egg-b", "Яйцо столовое С-1", "120"),
+            _ingredient("milk-b", "Молоко Простоквашино 2,5%", "200"),
+            _ingredient("salt-b", "Соль", "5"),
+        ],
+    )
+
+    comparison = _compare_recipe_products([first, second])
+    text = _format_recipe_product_differences(comparison, {"tg11": "thekabaye", "tg22": "Святичек"})
+
+    assert comparison.has_differences is True
+    assert "<b>Продукты отличаются у thekabaye:</b>" in text
+    assert "1. Яйцо куриное — 120 г" in text
+    assert "2. Молоко Савушкин 1,5% — 200 г" in text
+    assert "<b>Продукты отличаются у Святичек:</b>" in text
+    assert "1. Яйцо столовое С-1 — 120 г" in text
+    assert "<b>Совпадающие продукты:</b>" in text
+    assert "1. Соль — 5 г" in text
+    assert "ID <code>" not in text
+
+
+def test_format_recipe_product_differences_shows_absent_account_counterpart() -> None:
+    first = _recipe_variant("tg11", "111", [_ingredient("cheese", "Сыр", "100")])
+    second = _recipe_variant("tg22", "222", [])
+
+    text = _format_recipe_product_differences(
+        _compare_recipe_products([first, second]),
+        {"tg11": "Первый", "tg22": "Второй"},
+    )
+
+    assert "<b>Продукты отличаются у Первый:</b>\n\n1. Сыр — 100 г" in text
+    assert "<b>Продукты отличаются у Второй:</b>\n\n1. Отсутствует" in text
+    assert "<b>Совпадающие продукты:</b>\n\nОтсутствуют." in text
+
+    partial_text = _format_recipe_product_differences(
+        _compare_recipe_products(
+            [
+                _recipe_variant(
+                    "tg11",
+                    "111",
+                    [_ingredient("cheese-a", "Сыр", "100"), _ingredient("ham-a", "Ветчина", "100")],
+                ),
+                _recipe_variant("tg22", "222", [_ingredient("ham-b", "Ветчина", "200")]),
+            ]
+        ),
+        {"tg11": "Первый", "tg22": "Второй"},
+    )
+
+    assert "<b>Продукты отличаются у Второй:</b>\n\n1. Ветчина — 200 г\n2. Отсутствует" in partial_text
+
+
+def test_compare_recipe_products_requires_match_across_three_accounts() -> None:
+    variants = [
+        _recipe_variant(
+            "tg11",
+            "111",
+            [_ingredient("salt-a", "Соль", "5"), _ingredient("egg-a", "Яйцо", "100")],
+        ),
+        _recipe_variant(
+            "tg22",
+            "222",
+            [_ingredient("egg-b", "Яйцо", "100"), _ingredient("salt-b", "Соль", "5")],
+        ),
+        _recipe_variant(
+            "tg33",
+            "333",
+            [_ingredient("salt-c", "Соль", "5"), _ingredient("egg-c", "Яйцо", "200")],
+        ),
+    ]
+
+    comparison = _compare_recipe_products(variants)
+
+    assert [item.title for item in comparison.same_products] == ["Соль"]
+    assert [[item.grams for item in products] for _, products in comparison.different_products] == [
+        [Decimal("100")],
+        [Decimal("100")],
+        [Decimal("200")],
+    ]
+
+
+def test_format_recipe_product_differences_truncates_on_complete_html_lines() -> None:
+    first = _recipe_variant(
+        "tg11",
+        "111",
+        [_ingredient(f"a-{index}", f"Продукт <A> {index} " + "я" * 230, str(index + 1)) for index in range(30)],
+    )
+    second = _recipe_variant("tg22", "222", [])
+
+    text = _format_recipe_product_differences(_compare_recipe_products([first, second]), {})
+
+    assert len(text) <= 4000
+    assert text.endswith("…")
+    assert "&lt;A&gt;" in text
+    assert text.count("<b>") == text.count("</b>")
+
+
 def test_recipe_actions_keyboard_keeps_only_recipe_actions_and_list_return() -> None:
     keyboard = _recipe_actions_keyboard("recipe-1", page=1, page_action="list", total_pages=3)
     rows = keyboard.inline_keyboard
@@ -183,6 +347,171 @@ def test_recipe_list_keyboard_keeps_recipe_buttons_navigation_and_actions_inline
     assert "Создать из списка" not in flat_texts
     assert "Удалить несколько" in flat_texts
     assert "В меню" not in flat_texts
+
+
+def test_recipe_list_marker_has_no_count_and_footer_is_conditional() -> None:
+    recipe = Recipe(
+        id="recipe-1",
+        title="Очень длинное название рецепта " * 5,
+        remote_ids={"tg1": "111", "tg2": "222"},
+    )
+
+    marked = _recipe_list_button_text(
+        recipe,
+        {"tg1": "thekabaye", "tg2": "Святичек"},
+        has_product_differences=True,
+    )
+    plain_message = _recipe_list_message("Общий список рецептов:")
+    marked_message = _recipe_list_message("Общий список рецептов:", has_product_differences=True)
+
+    assert marked.endswith(" ⚠️")
+    assert len(marked) <= 90
+    assert "различ" not in marked
+    assert "⚠️ — в рецепте есть различия между аккаунтами." not in plain_message
+    assert marked_message.endswith("⚠️ — в рецепте есть различия между аккаунтами.")
+
+
+def test_recipe_list_keyboard_marks_only_selected_recipes() -> None:
+    recipes = [
+        Recipe(id="different", title="Омлет", remote_ids={"tg1": "111", "tg2": "222"}),
+        Recipe(id="same", title="Суп", remote_ids={"tg1": "333", "tg2": "444"}),
+    ]
+    bot = object.__new__(TelegramRecipeBot)
+
+    keyboard = TelegramRecipeBot._recipe_list_keyboard(
+        bot,
+        recipes,
+        0,
+        "list",
+        {"tg1": "Каба", "tg2": "Света"},
+        product_difference_ids={"different"},
+    )
+
+    assert keyboard.inline_keyboard[0][0].text == "Омлет · Каба, Света ⚠️"
+    assert keyboard.inline_keyboard[1][0].text == "Суп · Каба, Света"
+
+
+def test_recipe_product_difference_cache_hydrates_only_supplied_page_and_invalidates() -> None:
+    recipes = [
+        Recipe(
+            id=f"recipe-{index}",
+            title=f"Рецепт {index}",
+            group_id="group",
+            remote_ids={"tg11": f"a-{index}", "tg22": f"b-{index}"},
+        )
+        for index in range(9)
+    ]
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def hydrate_live_recipe_variants(self, recipe: Recipe) -> list[RemoteRecipeVariant]:
+            self.calls.append(recipe.id)
+            first = _recipe_variant("tg11", recipe.remote_ids["tg11"], [_ingredient("a", "Яйцо", "100")])
+            second_grams = "200" if recipe.id == "recipe-0" else "100"
+            second = _recipe_variant(
+                "tg22",
+                recipe.remote_ids["tg22"],
+                [_ingredient("b", "Яйцо", second_grams)],
+            )
+            return [first, second]
+
+    bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = FakeEngine()
+    context = SimpleNamespace(chat_data={})
+
+    first_page = asyncio.run(bot._recipe_product_difference_ids(context, recipes[:8]))
+    cached_page = asyncio.run(bot._recipe_product_difference_ids(context, recipes[:8]))
+    second_page = asyncio.run(bot._recipe_product_difference_ids(context, recipes[8:]))
+
+    assert first_page == {"recipe-0"}
+    assert cached_page == {"recipe-0"}
+    assert second_page == set()
+    assert sorted(bot.sync_engine.calls) == sorted(recipe.id for recipe in recipes)
+
+    bot._set_recipe_cache(context, "group", recipes)
+    asyncio.run(bot._recipe_product_difference_ids(context, recipes[:1]))
+
+    assert bot.sync_engine.calls.count("recipe-0") == 2
+
+
+def test_recipe_product_difference_failure_does_not_break_other_recipe_markers() -> None:
+    failing = Recipe(
+        id="failing",
+        title="Ошибка",
+        remote_ids={"tg11": "111", "tg22": "222"},
+    )
+    different = Recipe(
+        id="different",
+        title="Омлет",
+        remote_ids={"tg11": "333", "tg22": "444"},
+    )
+
+    class FakeEngine:
+        async def hydrate_live_recipe_variants(self, recipe: Recipe) -> list[RemoteRecipeVariant]:
+            if recipe.id == "failing":
+                raise RuntimeError("unavailable")
+            return [
+                _recipe_variant("tg11", "333", [_ingredient("a", "Яйцо", "100")]),
+                _recipe_variant("tg22", "444", [_ingredient("b", "Яйцо", "200")]),
+            ]
+
+    bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = FakeEngine()
+    context = SimpleNamespace(chat_data={})
+
+    marked = asyncio.run(bot._recipe_product_difference_ids(context, [failing, different]))
+
+    assert marked == {"different"}
+
+
+def test_recipe_search_compares_only_first_visible_page() -> None:
+    recipes = [
+        Recipe(
+            id=f"recipe-{index}",
+            title=f"Рецепт {index}",
+            group_id="group",
+            remote_ids={"tg11": f"a-{index}", "tg22": f"b-{index}"},
+        )
+        for index in range(9)
+    ]
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def hydrate_live_recipe_variants(self, recipe: Recipe) -> list[RemoteRecipeVariant]:
+            self.calls.append(recipe.id)
+            return [
+                _recipe_variant("tg11", recipe.remote_ids["tg11"], [_ingredient("a", "Соль", "5")]),
+                _recipe_variant("tg22", recipe.remote_ids["tg22"], [_ingredient("b", "Соль", "5")]),
+            ]
+
+    class FakeMessage:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, object]] = []
+
+        async def reply_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+            self.sent.append((text, kwargs.get("reply_markup")))
+
+    bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = FakeEngine()
+    bot.storage = SimpleNamespace(list_fatsecret_accounts=lambda group_id: [])
+    context = SimpleNamespace(
+        user_data={"group_id": "group"},
+        chat_data={"recipe_cache_group_id": "group", "recipe_cache": recipes},
+    )
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message)
+
+    asyncio.run(bot._handle_recipe_search(update, context, "рецепт"))
+
+    assert bot.sync_engine.calls == [recipe.id for recipe in recipes[:8]]
+    assert len(message.sent) == 1
+    keyboard = message.sent[0][1]
+    assert keyboard.inline_keyboard[0][0].text.startswith("Рецепт 0")
+    assert all("Рецепт 8" not in button.text for row in keyboard.inline_keyboard for button in row)
 
 
 def test_ensure_main_keyboard_does_not_send_extra_message() -> None:
