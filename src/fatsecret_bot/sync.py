@@ -1451,6 +1451,60 @@ class RecipeSyncEngine:
             return matching_ids[0], title_conflict
         return None, title_conflict
 
+    async def _verify_custom_food_barcode(
+        self,
+        client: FatSecretClient,
+        definition: CustomFoodDefinition,
+        remote_food_id: str,
+        *,
+        is_new_food: bool,
+        remap_allowed: bool,
+    ) -> bool:
+        """Ensure one barcode resolves to the expected food without blindly replaying remaps."""
+        lookup = await client.lookup_barcode(definition.barcode)
+        if lookup.food_id:
+            if lookup.food_id != remote_food_id:
+                raise FatSecretError(
+                    f"{client.account.label}: штрих-код уже связан с другим продуктом "
+                    f"FatSecret ({lookup.food_id})."
+                )
+            return True
+        if not remap_allowed:
+            return False
+
+        try:
+            await client.remap_barcode(
+                definition.barcode,
+                remote_food_id,
+                is_new_food=is_new_food,
+                barcode_id=lookup.barcode_id,
+            )
+        except Exception as exc:
+            lookup = await client.lookup_barcode(definition.barcode)
+            if lookup.food_id == remote_food_id:
+                return True
+            if lookup.food_id:
+                raise FatSecretError(
+                    f"{client.account.label}: после потерянного ответа штрих-код указывает на другой "
+                    f"продукт FatSecret ({lookup.food_id})."
+                ) from exc
+            raise FatSecretError(
+                f"{client.account.label}: ответ привязки штрих-кода потерян. "
+                "Повтори действие: будет выполнена только безопасная проверка без повторной отправки."
+            ) from exc
+        for delay in (0.0, 0.25, 0.75):
+            if delay:
+                await asyncio.sleep(delay)
+            lookup = await client.lookup_barcode(definition.barcode)
+            if lookup.food_id:
+                if lookup.food_id != remote_food_id:
+                    raise FatSecretError(
+                        f"{client.account.label}: после привязки штрих-код указывает на другой продукт "
+                        f"FatSecret ({lookup.food_id})."
+                    )
+                return True
+        return False
+
     async def create_custom_food_for_group(
         self,
         group_id: str,
@@ -1506,6 +1560,7 @@ class RecipeSyncEngine:
             for account_key, client in clients.items():
                 row = account_rows[account_key]
                 remote_food_id = str(row["remote_food_id"] or "")
+                row_status = str(row["status"])
                 account_definition = (
                     definition
                     if account_key == barcode_account_key
@@ -1518,13 +1573,7 @@ class RecipeSyncEngine:
                             raise FatSecretError(
                                 f"{client.account.label}: сохраненный продукт «{definition.title}» изменился."
                             )
-                        self.storage.update_custom_food_run_account(
-                            str(run["id"]),
-                            account_key,
-                            "verified",
-                            remote_food_id=remote_food_id,
-                        )
-                        row["status"] = "verified"
+                        is_new_food = row_status != "food_reused"
                     else:
                         remote_food_id, title_conflict = await self._existing_custom_food_id(
                             client,
@@ -1532,12 +1581,14 @@ class RecipeSyncEngine:
                         )
                         if remote_food_id:
                             reused_accounts.append(account_key)
+                            is_new_food = False
                         elif title_conflict:
                             raise FatSecretError(
                                 f"{client.account.label}: личный продукт «{definition.title}» уже есть с другими БЖУ. "
                                 "Измени название нового продукта."
                             )
                         else:
+                            is_new_food = True
                             try:
                                 remote_food_id = await client.create_custom_food(account_definition)
                             except Exception as exc:
@@ -1563,14 +1614,58 @@ class RecipeSyncEngine:
                                 raise FatSecretError(
                                     f"{client.account.label}: FatSecret вернул продукт с другими значениями."
                                 )
+                    food_status = "food_created" if is_new_food else "food_reused"
+                    if row_status not in {"barcode_submitting", "barcode_submitted"}:
                         self.storage.update_custom_food_run_account(
                             str(run["id"]),
                             account_key,
-                            "verified",
+                            food_status,
                             remote_food_id=remote_food_id,
                         )
-                        row["remote_food_id"] = remote_food_id
-                        row["status"] = "verified"
+                        row_status = food_status
+                    row["remote_food_id"] = remote_food_id
+                    row["status"] = row_status
+
+                    if account_definition.barcode:
+                        remap_allowed = row_status not in {"barcode_submitting", "barcode_submitted"}
+                        if remap_allowed:
+                            self.storage.update_custom_food_run_account(
+                                str(run["id"]),
+                                account_key,
+                                "barcode_submitting",
+                                remote_food_id=remote_food_id,
+                            )
+                            row_status = "barcode_submitting"
+                            row["status"] = row_status
+                        mapped = await self._verify_custom_food_barcode(
+                            client,
+                            account_definition,
+                            remote_food_id,
+                            is_new_food=is_new_food,
+                            remap_allowed=remap_allowed,
+                        )
+                        if remap_allowed:
+                            self.storage.update_custom_food_run_account(
+                                str(run["id"]),
+                                account_key,
+                                "barcode_submitted",
+                                remote_food_id=remote_food_id,
+                            )
+                            row_status = "barcode_submitted"
+                            row["status"] = row_status
+                        if not mapped:
+                            raise FatSecretError(
+                                f"{client.account.label}: продукт создан, но привязка штрих-кода не подтверждена. "
+                                "Повторная отправка отключена; нужна проверка текущего соответствия."
+                            )
+
+                    self.storage.update_custom_food_run_account(
+                        str(run["id"]),
+                        account_key,
+                        "verified",
+                        remote_food_id=remote_food_id,
+                    )
+                    row["status"] = "verified"
                 except Exception as exc:
                     message = user_safe_error_message(exc)
                     self.storage.update_custom_food_run_account(

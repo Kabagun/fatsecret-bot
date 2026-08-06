@@ -7,8 +7,10 @@ from decimal import Decimal
 from urllib.parse import parse_qs
 
 import httpx
+import pytest
 
 from fatsecret_bot.fatsecret_client import (
+    BARCODE_REMAP_URL,
     DIARY_BULK_UPDATE_URL,
     FatSecretClient,
     FatSecretError,
@@ -538,6 +540,56 @@ def test_lookup_barcode_uses_app_scan_contract_and_parses_match() -> None:
     assert result.food_id == "12345"
     assert result.barcode_id == "67890"
     assert result.food_name == "Known Milk"
+
+
+def test_remap_barcode_uses_apk_contract_without_automatic_replay() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(_account("tg11"), _device(), http=http, session=FatSecretSession("s", "d", "k"))
+    try:
+        asyncio.run(
+            client.remap_barcode(
+                "4006381333931",
+                "12345",
+                is_new_food=True,
+                barcode_id="67890",
+            )
+        )
+    finally:
+        asyncio.run(http.aclose())
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/api/barcode-verification/v1/remap"
+    assert str(requests[0].url).startswith(BARCODE_REMAP_URL)
+    assert json.loads(requests[0].content) == {
+        "rawBarcode": "4006381333931",
+        "foodId": 12345,
+        "isNewFood": True,
+        "globalBarcodeId": 67890,
+    }
+
+
+def test_remap_barcode_does_not_replay_failed_response() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(_account("tg11"), _device(), http=http, session=FatSecretSession("s", "d", "k"))
+    try:
+        with pytest.raises(FatSecretError, match="barcode remap failed with HTTP 500"):
+            asyncio.run(client.remap_barcode("4006381333931", "12345", is_new_food=True))
+    finally:
+        asyncio.run(http.aclose())
+
+    assert len(requests) == 1
 
 
 def test_diary_date_and_range_parser_accepts_manual_dates_and_relative_words() -> None:

@@ -72,6 +72,7 @@ def user_safe_error_message(exc: BaseException) -> str:
 logger = logging.getLogger(__name__)
 FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
 BARCODE_SCAN_URL = "https://app.ftscrt.com/api/barcode-verification/v1/scan"
+BARCODE_REMAP_URL = "https://app.ftscrt.com/api/barcode-verification/v1/remap"
 DIARY_BULK_UPDATE_URL = "https://app.ftscrt.com/api/user-data/v1/update-journal-entries"
 FOOD_SEARCH_PAGE_SIZE = 10
 AUTH_RETRY_STATUS_CODES = {401, 403, 500}
@@ -652,6 +653,36 @@ class FatSecretClient:
             should_prompt=_bool_value(data.get("shouldPrompt")),
         )
 
+    async def remap_barcode(
+        self,
+        barcode: str,
+        food_id: str,
+        *,
+        is_new_food: bool,
+        barcode_id: str | None = None,
+    ) -> None:
+        """Associate a barcode with a food through the Android app's remap endpoint."""
+        try:
+            numeric_food_id = int(food_id)
+            numeric_barcode_id = int(barcode_id) if barcode_id is not None else None
+        except ValueError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid barcode mapping id") from exc
+        if numeric_food_id <= 0 or (numeric_barcode_id is not None and numeric_barcode_id <= 0):
+            raise FatSecretError(f"{self.account.label}: invalid barcode mapping id")
+        payload: dict[str, Any] = {
+            "rawBarcode": barcode,
+            "foodId": numeric_food_id,
+            "isNewFood": is_new_food,
+        }
+        if numeric_barcode_id is not None:
+            payload["globalBarcodeId"] = numeric_barcode_id
+        await self._post_app_json(
+            BARCODE_REMAP_URL,
+            payload,
+            "barcode remap",
+            allow_replay=False,
+        )
+
     async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
         try:
             return await self.search_food(query, page=page)
@@ -1020,7 +1051,14 @@ class FatSecretClient:
         assert last_transport_error is not None
         raise last_transport_error
 
-    async def _post_app_json(self, url: str, payload: dict[str, Any], label: str) -> httpx.Response:
+    async def _post_app_json(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        label: str,
+        *,
+        allow_replay: bool = True,
+    ) -> httpx.Response:
         session = await self.ensure_logged_in()
         session_generation = self._session_generation
         query = self._build_app_query()
@@ -1040,7 +1078,7 @@ class FatSecretClient:
             response.status_code,
             _safe_redirect_location(response) or "-",
         )
-        if _should_retry_with_fresh_login(response):
+        if allow_replay and _should_retry_with_fresh_login(response):
             logger.warning(
                 "App JSON request will replay after fresh login account=%s label=%s status=%d",
                 self.account.label,

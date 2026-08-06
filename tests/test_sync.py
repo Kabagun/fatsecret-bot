@@ -11,6 +11,7 @@ import pytest
 
 from fatsecret_bot.fatsecret_client import FatSecretActionError, FatSecretNotCustomFoodError
 from fatsecret_bot.models import (
+    BarcodeLookupResult,
     CustomFoodDefinition,
     FatSecretAccountConfig,
     FatSecretDeviceConfig,
@@ -25,6 +26,7 @@ from fatsecret_bot.sync import (
     FatSecretError,
     RecipeSyncEngine,
     ResolvedRecipeListItem,
+    _custom_food_request_fingerprint,
     _sync_description,
 )
 
@@ -275,6 +277,8 @@ class FakeGroupCustomFoodClient(FakeFatSecretClient):
         self.custom_foods: dict[str, CustomFoodDefinition] = {}
         self.created_custom_foods: list[CustomFoodDefinition] = []
         self.timeout_after_first_create = timeout_after_first_create
+        self.barcode_food_ids: dict[str, str] = {}
+        self.remap_calls: list[tuple[str, str, bool, str | None]] = []
 
     async def search_food(self, query: str, page: int = 0) -> list[FoodSearchResult]:
         return [
@@ -305,6 +309,42 @@ class FakeGroupCustomFoodClient(FakeFatSecretClient):
         if definition is None:
             raise FatSecretNotCustomFoodError(f"{self.account.label}: no custom food {remote_id}")
         return definition
+
+    async def lookup_barcode(self, barcode: str) -> BarcodeLookupResult:
+        return BarcodeLookupResult(barcode=barcode, food_id=self.barcode_food_ids.get(barcode))
+
+    async def remap_barcode(
+        self,
+        barcode: str,
+        food_id: str,
+        *,
+        is_new_food: bool,
+        barcode_id: str | None = None,
+    ) -> None:
+        self.remap_calls.append((barcode, food_id, is_new_food, barcode_id))
+        self.barcode_food_ids[barcode] = food_id
+
+
+class FakeAmbiguousBarcodeClient(FakeGroupCustomFoodClient):
+    def __init__(self, account_key: str, *, mapping_applied: bool) -> None:
+        super().__init__(account_key)
+        self.mapping_applied = mapping_applied
+
+    async def remap_barcode(
+        self,
+        barcode: str,
+        food_id: str,
+        *,
+        is_new_food: bool,
+        barcode_id: str | None = None,
+    ) -> None:
+        self.remap_calls.append((barcode, food_id, is_new_food, barcode_id))
+        if self.mapping_applied:
+            self.barcode_food_ids[barcode] = food_id
+        raise httpx.ReadTimeout(
+            "ambiguous barcode remap",
+            request=httpx.Request("POST", "https://example.test"),
+        )
 
 
 class FakeFacebookFoodTargetClient(FakeFatSecretClient):
@@ -3486,6 +3526,8 @@ def test_create_custom_food_for_group_journals_verifies_maps_and_reuses(tmp_path
         assert len(second.created_custom_foods) == 1
         assert first.created_custom_foods[0].barcode == "4006381333931"
         assert second.created_custom_foods[0].barcode == ""
+        assert first.remap_calls == [("4006381333931", "a1-food-1", True, None)]
+        assert second.remap_calls == []
         assert storage.custom_food_mapping("a1", "a1-food-1", "a2") == "a2-food-1"
         assert storage.custom_food_mapping("a2", "a2-food-1", "a1") == "a1-food-1"
         run = storage.custom_food_run(created.run_id)
@@ -3510,6 +3552,50 @@ def test_create_custom_food_for_group_recovers_timeout_from_exact_readback(tmp_p
         assert created.food_ids == {"a1": "a1-food-1"}
         assert len(client.created_custom_foods) == 1
         assert storage.custom_food_run(created.run_id)["status"] == "completed"  # type: ignore[index]
+    finally:
+        storage.close()
+
+
+def test_create_custom_food_for_group_recovers_applied_barcode_remap_timeout(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        client = FakeAmbiguousBarcodeClient("a1", mapping_applied=True)
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": client}  # type: ignore[method-assign]
+
+        created = asyncio.run(
+            engine.create_custom_food_for_group(
+                "group",
+                _qa_custom_food_definition(barcode="4006381333931"),
+                11,
+            )
+        )
+
+        assert created.food_ids == {"a1": "a1-food-1"}
+        assert len(client.remap_calls) == 1
+        assert storage.custom_food_run(created.run_id)["status"] == "completed"  # type: ignore[index]
+    finally:
+        storage.close()
+
+
+def test_create_custom_food_for_group_never_replays_uncertain_barcode_remap(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        client = FakeAmbiguousBarcodeClient("a1", mapping_applied=False)
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": client}  # type: ignore[method-assign]
+        definition = _qa_custom_food_definition(barcode="4006381333931")
+
+        with pytest.raises(FatSecretError, match="Продукт создан не во всех аккаунтах"):
+            asyncio.run(engine.create_custom_food_for_group("group", definition, 11))
+        with pytest.raises(FatSecretError, match="Повторная отправка отключена"):
+            asyncio.run(engine.create_custom_food_for_group("group", definition, 11))
+
+        assert len(client.remap_calls) == 1
+        run = storage.matching_custom_food_run("group", _custom_food_request_fingerprint(definition))
+        assert run is not None
+        assert run["status"] == "recovery_pending"
+        assert run["accounts"][0]["status"] == "barcode_submitting"
     finally:
         storage.close()
 
