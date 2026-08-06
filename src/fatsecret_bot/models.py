@@ -211,6 +211,25 @@ class CustomFoodDefinition:
     serving_size: str
     metric_serving_size: str
     nutrients: dict[str, Decimal]
+    barcode: str = ""
+    barcode_type: str = ""
+
+
+@dataclass(frozen=True)
+class BarcodeLookupResult:
+    """FatSecret's current mapping for one decoded retail barcode."""
+
+    barcode: str
+    food_id: str | None = None
+    barcode_id: str | None = None
+    food_name: str = ""
+    brand_name: str = ""
+    should_prompt: bool = False
+
+    @property
+    def found(self) -> bool:
+        """Return whether FatSecret mapped this barcode to an existing food."""
+        return bool(self.food_id)
 
 
 @dataclass(frozen=True)

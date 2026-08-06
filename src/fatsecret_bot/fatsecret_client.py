@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .models import (
+    BarcodeLookupResult,
     CustomFoodDefinition,
     FatSecretAccountConfig,
     FatSecretDeviceConfig,
@@ -70,6 +71,7 @@ def user_safe_error_message(exc: BaseException) -> str:
 
 logger = logging.getLogger(__name__)
 FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
+BARCODE_SCAN_URL = "https://app.ftscrt.com/api/barcode-verification/v1/scan"
 DIARY_BULK_UPDATE_URL = "https://app.ftscrt.com/api/user-data/v1/update-journal-entries"
 FOOD_SEARCH_PAGE_SIZE = 10
 AUTH_RETRY_STATUS_CODES = {401, 403, 500}
@@ -607,6 +609,9 @@ class FatSecretClient:
             "metricServingSize": definition.metric_serving_size,
             **{name: _form_decimal(value) for name, value in definition.nutrients.items()},
         }
+        if definition.barcode:
+            form["barcode"] = definition.barcode
+            form["barcodeType"] = definition.barcode_type or "Other"
         response = await self._post_android("RecipeCustomEntryActionAndroidPage.aspx", form)
         remote_id = _parse_custom_food_save_response(response.text)
         logger.info(
@@ -616,6 +621,36 @@ class FatSecretClient:
             remote_id,
         )
         return remote_id
+
+    async def lookup_barcode(self, barcode: str) -> BarcodeLookupResult:
+        """Resolve a scanned barcode through the authenticated FatSecret app endpoint."""
+        response = await self._post_app_json(
+            BARCODE_SCAN_URL,
+            {"barcode": barcode, "deviceCanPrompt": False},
+            "barcode lookup",
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid barcode lookup JSON") from exc
+        if not isinstance(data, dict):
+            raise FatSecretError(f"{self.account.label}: invalid barcode lookup response")
+
+        def positive_id(value: Any) -> str | None:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            return str(parsed) if parsed > 0 else None
+
+        return BarcodeLookupResult(
+            barcode=barcode,
+            food_id=positive_id(data.get("foodId")),
+            barcode_id=positive_id(data.get("barcodeId")),
+            food_name=_clean_food_text(data.get("foodName") or ""),
+            brand_name=_clean_food_text(data.get("brandName") or ""),
+            should_prompt=_bool_value(data.get("shouldPrompt")),
+        )
 
     async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
         try:

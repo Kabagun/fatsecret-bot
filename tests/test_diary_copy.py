@@ -494,6 +494,8 @@ def test_create_custom_food_uses_apk_saveregional_contract() -> None:
                 serving_size="100",
                 metric_serving_size="100g",
                 nutrients={"calories": Decimal("150"), "protein": Decimal("10")},
+                barcode="4006381333931",
+                barcode_type="EAN_13",
             )
         )
     )
@@ -504,6 +506,38 @@ def test_create_custom_food_uses_apk_saveregional_contract() -> None:
     assert request_body["productName"] == ["Мой продукт"]
     assert request_body["servingType"] == ["Per100g"]
     assert request_body["calories"] == ["150"]
+    assert request_body["barcode"] == ["4006381333931"]
+    assert request_body["barcodeType"] == ["EAN_13"]
+
+
+def test_lookup_barcode_uses_app_scan_contract_and_parses_match() -> None:
+    request_json: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_json
+        request_json = json.loads(request.content)
+        assert request.url.path == "/api/barcode-verification/v1/scan"
+        return httpx.Response(
+            200,
+            json={
+                "foodId": 12345,
+                "barcodeId": 67890,
+                "shouldPrompt": True,
+                "foodName": "Known Milk",
+                "brandName": "QA",
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(_account("tg11"), _device(), http=http, session=FatSecretSession("s", "d", "k"))
+    result = asyncio.run(client.lookup_barcode("4006381333931"))
+    asyncio.run(http.aclose())
+
+    assert request_json == {"barcode": "4006381333931", "deviceCanPrompt": False}
+    assert result.found is True
+    assert result.food_id == "12345"
+    assert result.barcode_id == "67890"
+    assert result.food_name == "Known Milk"
 
 
 def test_diary_date_and_range_parser_accepts_manual_dates_and_relative_words() -> None:

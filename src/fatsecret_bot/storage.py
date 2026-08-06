@@ -27,7 +27,7 @@ from .portions import grams_from_portion, is_bare_weight_portion
 
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
-STORAGE_SCHEMA_VERSION = 3
+STORAGE_SCHEMA_VERSION = 4
 DIARY_COPY_STALE_AFTER = dt.timedelta(minutes=30)
 
 
@@ -292,6 +292,31 @@ class Storage:
                 PRIMARY KEY (source_account_key, source_food_id, target_account_key)
             );
 
+            CREATE TABLE IF NOT EXISTS custom_food_runs (
+                id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                initiated_by INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                definition_json TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS custom_food_run_accounts (
+                run_id TEXT NOT NULL REFERENCES custom_food_runs(id) ON DELETE CASCADE,
+                account_key TEXT NOT NULL,
+                remote_food_id TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, account_key)
+            );
+
             CREATE TABLE IF NOT EXISTS remote_recipe_snapshots (
                 account_key TEXT NOT NULL,
                 remote_recipe_id TEXT NOT NULL,
@@ -391,6 +416,10 @@ class Storage:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_recipe_list_runs_recovery "
             "ON recipe_list_runs(group_id, normalized_title, payload_fingerprint, created_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_custom_food_runs_recovery "
+            "ON custom_food_runs(group_id, request_fingerprint, created_at)"
         )
         self._backfill_default_group()
         current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -2505,6 +2534,142 @@ class Storage:
             (target_account_key, source_account_key, source_food_id),
         ).fetchone()
         return str(reverse["source_food_id"]) if reverse is not None else None
+
+    def create_custom_food_run(
+        self,
+        group_id: str,
+        initiated_by: int,
+        title: str,
+        definition_json: str,
+        request_fingerprint: str,
+        content_hash: str,
+        account_keys: list[str],
+    ) -> str:
+        """Persist a group-wide custom-food operation before its first remote write."""
+        run_id = uuid.uuid4().hex
+        now = _now()
+        if self._conn.in_transaction:
+            self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO custom_food_runs(
+                    id, group_id, initiated_by, title, normalized_title,
+                    definition_json, request_fingerprint, content_hash,
+                    status, error, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+                """,
+                (
+                    run_id,
+                    group_id,
+                    initiated_by,
+                    title,
+                    normalize_title(title),
+                    definition_json,
+                    request_fingerprint,
+                    content_hash,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.executemany(
+                """
+                INSERT INTO custom_food_run_accounts(
+                    run_id, account_key, remote_food_id, status, error, updated_at
+                )
+                VALUES (?, ?, NULL, 'pending', NULL, ?)
+                """,
+                [(run_id, account_key, now) for account_key in account_keys],
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return run_id
+
+    def custom_food_run(self, run_id: str) -> dict[str, Any] | None:
+        """Return one custom-food journal entry and its per-account progress."""
+        row = self._conn.execute(
+            "SELECT * FROM custom_food_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result: dict[str, Any] = dict(row)
+        result["accounts"] = [
+            dict(account)
+            for account in self._conn.execute(
+                """
+                SELECT account_key, remote_food_id, status, error, updated_at
+                FROM custom_food_run_accounts
+                WHERE run_id = ?
+                ORDER BY account_key
+                """,
+                (run_id,),
+            ).fetchall()
+        ]
+        return result
+
+    def matching_custom_food_run(
+        self,
+        group_id: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        """Find the latest retryable or completed operation for the exact product request."""
+        row = self._conn.execute(
+            """
+            SELECT id
+            FROM custom_food_runs
+            WHERE group_id = ? AND request_fingerprint = ? AND status <> 'failed'
+            ORDER BY CASE WHEN status = 'completed' THEN 1 ELSE 0 END ASC, created_at DESC
+            LIMIT 1
+            """,
+            (group_id, request_fingerprint),
+        ).fetchone()
+        return self.custom_food_run(str(row["id"])) if row is not None else None
+
+    def update_custom_food_run(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        """Update the operation-level progress for a group-wide product create."""
+        cursor = self._conn.execute(
+            """
+            UPDATE custom_food_runs
+            SET status = ?, error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, error, _now(), run_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def update_custom_food_run_account(
+        self,
+        run_id: str,
+        account_key: str,
+        status: str,
+        *,
+        remote_food_id: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """Persist one account's verified custom-food identity."""
+        cursor = self._conn.execute(
+            """
+            UPDATE custom_food_run_accounts
+            SET status = ?, remote_food_id = COALESCE(?, remote_food_id),
+                error = ?, updated_at = ?
+            WHERE run_id = ? AND account_key = ?
+            """,
+            (status, remote_food_id, error, _now(), run_id, account_key),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
 
     def set_custom_food_mapping(
         self,

@@ -16,6 +16,42 @@ def test_normalize_title_collapses_case_and_spaces() -> None:
     assert normalize_title("  Курица   В Соусе ") == normalize_title("курица в соусе")
 
 
+def test_custom_food_run_journals_each_account_before_remote_ids(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        run_id = storage.create_custom_food_run(
+            "group-1",
+            11,
+            "QA product",
+            '{"title":"QA product"}',
+            "request-hash",
+            "content-hash",
+            ["a1", "a2"],
+        )
+
+        run = storage.custom_food_run(run_id)
+        assert run is not None
+        assert run["status"] == "pending"
+        assert [row["account_key"] for row in run["accounts"]] == ["a1", "a2"]
+        assert all(row["remote_food_id"] is None for row in run["accounts"])
+
+        assert storage.update_custom_food_run_account(
+            run_id,
+            "a1",
+            "verified",
+            remote_food_id="101",
+        )
+        assert storage.update_custom_food_run(run_id, "recovery_pending", error="retry")
+        matched = storage.matching_custom_food_run("group-1", "request-hash")
+
+        assert matched is not None
+        assert matched["id"] == run_id
+        assert matched["status"] == "recovery_pending"
+        assert matched["accounts"][0]["remote_food_id"] == "101"
+    finally:
+        storage.close()
+
+
 def test_import_remote_recipe_merges_by_title(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -322,7 +358,7 @@ def test_migration_normalizes_legacy_zero_portion_gram_ingredients(tmp_path) -> 
         assert recipe.ingredients[0].amount == Decimal("0.05")
         assert recipe.ingredients[0].portion_description == "100г"
         assert recipe.ingredients[0].grams == Decimal("5")
-        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 4
     finally:
         storage.close()
 
@@ -664,7 +700,7 @@ def test_version_one_account_migration_preserves_credentials_session_and_group(t
         assert storage.fatsecret_account_owner("tg11") == 11
         assert storage.fatsecret_account_group_id("tg11") == "g1"
         assert storage.get_fatsecret_session("tg11") == FatSecretSession("server", "device", "secret")
-        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert storage._conn.execute("PRAGMA user_version").fetchone()[0] == 4
     finally:
         storage.close()
 

@@ -2,18 +2,54 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from fatsecret_bot.models import Ingredient
+from fatsecret_bot.models import CustomFoodDefinition, Ingredient
 from fatsecret_bot.sync import RecipeListItem, ResolvedRecipeListItem
 from fatsecret_bot.telegram_bot import (
     _format_recipe_list_draft,
+    _format_custom_food_draft,
     _format_resolved_item,
     _parse_recipe_list_lines,
     _parse_recipe_list_payload,
     _parse_recipe_steps,
+    _parse_custom_food_macros,
     _recipe_list_candidate_keyboard,
     _recipe_list_draft_keyboard,
     _recipe_list_input_error_keyboard,
 )
+
+
+def test_custom_food_macro_parser_uses_compact_per_100g_order() -> None:
+    assert _parse_custom_food_macros("250 12,5 8 30") == {
+        "calories": Decimal("250"),
+        "protein": Decimal("12.5"),
+        "totalFat": Decimal("8"),
+        "carbohydrate": Decimal("30"),
+    }
+
+
+def test_custom_food_confirmation_shows_barcode_and_group_scope() -> None:
+    definition = CustomFoodDefinition(
+        source_recipe_id="",
+        title="QA product",
+        manufacturer_name="",
+        serving_type="Per100g",
+        serving_size="100",
+        metric_serving_size="100g",
+        nutrients={
+            "calories": Decimal("250"),
+            "protein": Decimal("12"),
+            "totalFat": Decimal("8"),
+            "carbohydrate": Decimal("30"),
+        },
+        barcode="4006381333931",
+        barcode_type="EAN_13",
+    )
+
+    text = _format_custom_food_draft(definition)
+
+    assert "QA product" in text
+    assert "4006381333931" in text
+    assert "во всех FatSecret аккаунтах" in text
 
 
 def test_parse_recipe_list_lines_uses_last_number_as_grams() -> None:
@@ -246,6 +282,7 @@ def test_recipe_list_draft_shows_unresolved_items_and_blocks_create() -> None:
 
     assert "<b>Нужно заполнить или удалить</b>" in text
     assert "- ? Приправа для фарша Green | масса: 3г" in text
-    assert "Заполнить: Приправа для фарша Green" in flat_buttons
+    assert "Найти: Приправа для фарша Green" in flat_buttons
+    assert "Создать" in flat_buttons
     assert "Удалить" in flat_buttons
     assert "Создать рецепт" not in flat_buttons

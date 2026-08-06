@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import datetime as dt
+from dataclasses import replace
 from decimal import Decimal
 
 import httpx
@@ -266,6 +267,44 @@ class FakeCustomFoodTargetClient(FakeFatSecretClient):
         if remote_id == self.cloned_food_id and self.visible_definition is not None:
             return self.visible_definition
         raise FatSecretNotCustomFoodError(f"{self.account.label}: food {remote_id} is not a user-created product")
+
+
+class FakeGroupCustomFoodClient(FakeFatSecretClient):
+    def __init__(self, account_key: str, *, timeout_after_first_create: bool = False) -> None:
+        super().__init__(Recipe(id=f"{account_key}-seed", title="Seed"), account_key=account_key)
+        self.custom_foods: dict[str, CustomFoodDefinition] = {}
+        self.created_custom_foods: list[CustomFoodDefinition] = []
+        self.timeout_after_first_create = timeout_after_first_create
+
+    async def search_food(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        return [
+            FoodSearchResult(food_id=food_id, title=definition.title, is_own=True)
+            for food_id, definition in self.custom_foods.items()
+            if definition.title.casefold() == query.casefold()
+        ]
+
+    async def create_custom_food(self, definition: CustomFoodDefinition) -> str:
+        self.created_custom_foods.append(definition)
+        remote_id = f"{self.account.key}-food-{len(self.created_custom_foods)}"
+        self.custom_foods[remote_id] = replace(
+            definition,
+            nutrients={key: value.quantize(Decimal("0.001")) for key, value in definition.nutrients.items()},
+            barcode="",
+            barcode_type="",
+        )
+        if self.timeout_after_first_create:
+            self.timeout_after_first_create = False
+            raise httpx.ReadTimeout(
+                "ambiguous custom-food create",
+                request=httpx.Request("POST", "https://example.test"),
+            )
+        return remote_id
+
+    async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
+        definition = self.custom_foods.get(remote_id)
+        if definition is None:
+            raise FatSecretNotCustomFoodError(f"{self.account.label}: no custom food {remote_id}")
+        return definition
 
 
 class FakeFacebookFoodTargetClient(FakeFatSecretClient):
@@ -3406,5 +3445,109 @@ def test_delete_recipe_everywhere_keeps_failed_remote_mapping(tmp_path) -> None:
         assert [result.ok for result in results] == [True, False]
         assert storage.get_recipe(recipe_id) is not None
         assert storage.remote_ids(recipe_id) == {"tg22": "222"}
+    finally:
+        storage.close()
+
+
+def _qa_custom_food_definition(*, barcode: str = "") -> CustomFoodDefinition:
+    return CustomFoodDefinition(
+        source_recipe_id="",
+        title="QA Group Product",
+        manufacturer_name="",
+        serving_type="Per100g",
+        serving_size="100",
+        metric_serving_size="100g",
+        nutrients={
+            "calories": Decimal("321"),
+            "protein": Decimal("12.3"),
+            "totalFat": Decimal("4.5"),
+            "carbohydrate": Decimal("56.7"),
+        },
+        barcode=barcode,
+        barcode_type="EAN_13" if barcode else "",
+    )
+
+
+def test_create_custom_food_for_group_journals_verifies_maps_and_reuses(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        first = FakeGroupCustomFoodClient("a1")
+        second = FakeGroupCustomFoodClient("a2")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": first, "a2": second}  # type: ignore[method-assign]
+        definition = _qa_custom_food_definition(barcode="4006381333931")
+
+        created = asyncio.run(engine.create_custom_food_for_group("group", definition, 11))
+        repeated = asyncio.run(engine.create_custom_food_for_group("group", definition, 11))
+
+        assert created.food_ids == {"a1": "a1-food-1", "a2": "a2-food-1"}
+        assert repeated.food_ids == created.food_ids
+        assert len(first.created_custom_foods) == 1
+        assert len(second.created_custom_foods) == 1
+        assert first.created_custom_foods[0].barcode == "4006381333931"
+        assert second.created_custom_foods[0].barcode == ""
+        assert storage.custom_food_mapping("a1", "a1-food-1", "a2") == "a2-food-1"
+        assert storage.custom_food_mapping("a2", "a2-food-1", "a1") == "a1-food-1"
+        run = storage.custom_food_run(created.run_id)
+        assert run is not None
+        assert run["status"] == "completed"
+        assert {row["status"] for row in run["accounts"]} == {"verified"}
+    finally:
+        storage.close()
+
+
+def test_create_custom_food_for_group_recovers_timeout_from_exact_readback(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        client = FakeGroupCustomFoodClient("a1", timeout_after_first_create=True)
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": client}  # type: ignore[method-assign]
+
+        created = asyncio.run(
+            engine.create_custom_food_for_group("group", _qa_custom_food_definition(), 11)
+        )
+
+        assert created.food_ids == {"a1": "a1-food-1"}
+        assert len(client.created_custom_foods) == 1
+        assert storage.custom_food_run(created.run_id)["status"] == "completed"  # type: ignore[index]
+    finally:
+        storage.close()
+
+
+def test_recipe_list_uses_account_specific_ids_for_new_custom_food(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        first = FakeFatSecretClient(Recipe(id="a1-seed", title="Seed"), account_key="a1")
+        second = FakeFatSecretClient(Recipe(id="a2-seed", title="Seed"), account_key="a2")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": first, "a2": second}  # type: ignore[method-assign]
+        definition = _qa_custom_food_definition()
+        item = ResolvedRecipeListItem(
+            requested_query="QA product",
+            grams=Decimal("75"),
+            ingredient=Ingredient(
+                id="draft",
+                recipe_id="",
+                food_id="a1-food-1",
+                title=definition.title,
+                portion_id="0",
+                amount=Decimal("0.75"),
+                portion_description="100г",
+                grams=Decimal("75"),
+            ),
+            source="создан в группе",
+            custom_food_ids={"a1": "a1-food-1", "a2": "a2-food-1"},
+        )
+
+        created = asyncio.run(
+            engine.create_recipe_from_list("group", "QA recipe", [item], 11)
+        )
+
+        assert all(result.ok for result in created.results)
+        assert [ingredient.food_id for ingredient in first.saved_ingredients] == ["a1-food-1"]
+        assert [ingredient.food_id for ingredient in second.saved_ingredients] == ["a2-food-1"]
+        stored = storage.get_recipe(created.recipe_id)
+        assert stored is not None
+        assert [ingredient.food_id for ingredient in stored.ingredients] == ["a1-food-1"]
     finally:
         storage.close()

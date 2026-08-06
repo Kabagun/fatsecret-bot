@@ -24,9 +24,11 @@ from telegram.ext import (
     filters,
 )
 
+from .barcodes import BarcodeDecodeError, DecodedBarcode, decode_barcode_image, normalize_barcode
 from .fatsecret_client import user_safe_error_message
 from .models import (
     MAX_RECIPE_STEPS,
+    CustomFoodDefinition,
     DiaryCopyPreview,
     DiaryCopyResult,
     FatSecretAccountConfig,
@@ -52,7 +54,15 @@ RECIPE_RENDER_KEY = "recipe_render_key"
 RECIPE_SEARCH_IDS_KEY = "recipe_search_ids"
 RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY = "recipe_product_difference_cache"
 RECIPE_PRODUCT_DIFFERENCE_FOOTER = "⚠️ — в рецепте есть различия между аккаунтами."
-MAIN_BUTTONS = {"Поиск рецептов", "Рецепты", "Создать из списка", "Меню / Дневник", "Группы", "Аккаунты"}
+MAIN_BUTTONS = {
+    "Поиск рецептов",
+    "Рецепты",
+    "Создать из списка",
+    "Создать продукт",
+    "Меню / Дневник",
+    "Группы",
+    "Аккаунты",
+}
 LIST_WIDTH_LINE = "--------------------------------"
 PORTION_DESCRIPTION_RE = re.compile(
     r"^\s*(?P<size>\d+(?:[\.,]\d+)?)\s*(?P<unit>г|гр|g|gram|грам|мл|ml)\b",
@@ -77,7 +87,7 @@ RECIPE_STEP_PREFIX_RE = re.compile(r"^\s*(?:\d+[\).]\s*|[-*]\s*)?(?P<step>.+?)\s
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Поиск рецептов", "Создать из списка"],
-        ["Меню / Дневник"],
+        ["Создать продукт", "Меню / Дневник"],
         ["Группы", "Аккаунты"],
     ],
     resize_keyboard=True,
@@ -88,6 +98,7 @@ DIARY_RANGE_RE = re.compile(
     rf"^\s*(?P<start>{DIARY_DATE_TOKEN})(?:\s*(?:\.\.|—|–|\s-\s)\s*(?P<end>{DIARY_DATE_TOKEN}))?\s*$",
     re.IGNORECASE,
 )
+CUSTOM_FOOD_NUMBER_RE = re.compile(r"(?<!\w)[+-]?\d+(?:[,.]\d+)?(?!\w)")
 
 
 def _parse_diary_date(value: str, today: dt.date | None = None) -> dt.date:
@@ -172,6 +183,63 @@ def _format_recipe_conflict(
 
 def _format_decimal_plain(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _parse_custom_food_macros(text: str) -> dict[str, Decimal]:
+    """Parse the compact ``kcal protein fat carbs`` input used by the product wizard."""
+    values = [Decimal(item.replace(",", ".")) for item in CUSTOM_FOOD_NUMBER_RE.findall(text)]
+    if len(values) != 4:
+        raise ValueError("Пришли ровно 4 числа: ккал, белки, жиры, углеводы.")
+    if any(not value.is_finite() or value < 0 for value in values):
+        raise ValueError("Значения должны быть неотрицательными числами.")
+    calories, protein, fat, carbohydrate = values
+    if calories > Decimal("10000") or any(
+        value > Decimal("1000") for value in (protein, fat, carbohydrate)
+    ):
+        raise ValueError("Проверь значения на 100 г: одно из них слишком большое.")
+    return {
+        "calories": calories,
+        "protein": protein,
+        "totalFat": fat,
+        "carbohydrate": carbohydrate,
+    }
+
+
+def _format_custom_food_draft(definition: CustomFoodDefinition) -> str:
+    barcode = (
+        f"\nШтрих-код: <code>{html.escape(definition.barcode)}</code>"
+        if definition.barcode
+        else "\nШтрих-код: нет"
+    )
+    return (
+        f"<b>Новый продукт: {html.escape(definition.title)}</b>\n"
+        "Значения на 100 г\n"
+        f"Ккал: {_format_decimal_plain(definition.nutrients['calories'])}\n"
+        f"Белки: {_format_decimal_plain(definition.nutrients['protein'])} г\n"
+        f"Жиры: {_format_decimal_plain(definition.nutrients['totalFat'])} г\n"
+        f"Углеводы: {_format_decimal_plain(definition.nutrients['carbohydrate'])} г"
+        f"{barcode}\n\n"
+        "Продукт будет создан во всех FatSecret аккаунтах активной группы."
+    )
+
+
+def _custom_food_barcode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Без штрих-кода", callback_data="food_skip_barcode:0")],
+            [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+        ]
+    )
+
+
+def _custom_food_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Создать продукт", callback_data="food_create:0")],
+            [InlineKeyboardButton("Изменить название", callback_data="food_change_title:0")],
+            [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+        ]
+    )
 
 
 def _portion_description_unit(portion_description: str) -> tuple[Decimal, str] | None:
@@ -593,9 +661,10 @@ def _recipe_list_draft_keyboard(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    f"Заполнить: {item.query[:34]}",
+                    f"Найти: {item.query[:24]}",
                     callback_data=f"recipe_list_resolve:{index}",
                 ),
+                InlineKeyboardButton("Создать", callback_data=f"recipe_list_create_food:{index}"),
                 InlineKeyboardButton("Удалить", callback_data=f"recipe_list_drop:{index}"),
             ]
         )
@@ -690,6 +759,7 @@ class TelegramRecipeBot:
         app.add_handler(CommandHandler("groups", self.groups))
         app.add_handler(CommandHandler("diary", self.diary))
         app.add_handler(CallbackQueryHandler(self.on_callback))
+        app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         return app
 
@@ -1772,6 +1842,8 @@ class TelegramRecipeBot:
             await self._start_recipe_list_replace(query, context, int(value or "0"))
         elif action == "recipe_list_resolve":
             await self._start_recipe_list_resolve(query, context, int(value or "0"))
+        elif action == "recipe_list_create_food":
+            await self._start_recipe_list_food_create(query, context, int(value or "0"))
         elif action == "recipe_list_drop":
             await self._drop_recipe_list_unresolved(query, context, int(value or "0"))
         elif action == "recipe_list_pick":
@@ -1787,6 +1859,17 @@ class TelegramRecipeBot:
         elif action == "recipe_list_cancel":
             context.user_data.clear()
             await self._edit_recipe_list(query, 0, context)
+        elif action == "food_skip_barcode":
+            await self._skip_custom_food_barcode(query, context)
+        elif action == "food_ignore_known_barcode":
+            await self._ignore_known_custom_food_barcode(query, context)
+        elif action == "food_create":
+            await self._create_custom_food(query, context, update.effective_user.id)
+        elif action == "food_change_title":
+            context.user_data["mode"] = "custom_food_title"
+            await query.edit_message_text("Пришли новое название продукта.")
+        elif action == "food_cancel":
+            await self._cancel_custom_food(query, context)
         elif action == "refresh":
             context.user_data.clear()
             await self._refresh_from_callback(query, context)
@@ -2619,6 +2702,20 @@ class TelegramRecipeBot:
             await update.effective_message.reply_text("Пришли название рецепта.", reply_markup=MAIN_KEYBOARD)
             context.chat_data["reply_keyboard"] = "main"
             return
+        if mode is None and text == "Создать продукт":
+            group = await self._require_active_group(update)
+            if group is None:
+                return
+            context.user_data.clear()
+            context.user_data["mode"] = "custom_food_title"
+            context.user_data["group_id"] = group.id
+            context.user_data["custom_food_origin"] = "standalone"
+            await update.effective_message.reply_text(
+                "Пришли название продукта. Я создам его во всех FatSecret аккаунтах активной группы.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            context.chat_data["reply_keyboard"] = "main"
+            return
         if mode is None and text == "Удалить несколько":
             page = int(context.user_data.get("recipe_list_page") or 0)
             await self._send_batch_delete(update, context, page)
@@ -2644,6 +2741,12 @@ class TelegramRecipeBot:
             await self._handle_recipe_list_steps(update, context, text)
         elif mode == "recipe_list_replace_query":
             await self._handle_recipe_list_replace_query(update, context, text)
+        elif mode == "custom_food_title":
+            await self._handle_custom_food_title(update, context, text)
+        elif mode == "custom_food_barcode":
+            await self._handle_custom_food_barcode_text(update, context, text)
+        elif mode == "custom_food_macros":
+            await self._handle_custom_food_macros(update, context, text)
         elif mode == "group_create":
             await self._handle_group_create(update, context, text)
         elif mode == "group_join":
@@ -2684,6 +2787,24 @@ class TelegramRecipeBot:
             )
 
     async def _cancel_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if context.user_data.get("custom_food_origin") == "recipe":
+            self._clear_custom_food_wizard(context)
+            title = str(context.user_data.get("recipe_list_title") or "").strip()
+            draft_items = context.user_data.get("recipe_list_draft")
+            unresolved = context.user_data.get("recipe_list_unresolved")
+            steps = context.user_data.get("recipe_list_steps")
+            portions = context.user_data.get("recipe_list_portions")
+            if title and isinstance(draft_items, list):
+                unresolved = unresolved if isinstance(unresolved, list) else []
+                steps = steps if isinstance(steps, list) else []
+                portions = portions if isinstance(portions, Decimal) else Decimal("1")
+                context.user_data["mode"] = "recipe_list_confirm"
+                await update.effective_message.reply_text(
+                    _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
+                    reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
         recipe_id = context.user_data.get("recipe_id")
         context.user_data.clear()
         if recipe_id and (recipe := self.storage.get_recipe(recipe_id)):
@@ -2902,6 +3023,343 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
+    @staticmethod
+    def _clear_custom_food_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
+        for key in (
+            "custom_food_origin",
+            "custom_food_title",
+            "custom_food_barcode",
+            "custom_food_barcode_type",
+            "custom_food_definition",
+            "custom_food_unresolved_index",
+            "custom_food_requested_query",
+        ):
+            context.user_data.pop(key, None)
+
+    @staticmethod
+    def _custom_food_macros_prompt() -> str:
+        return (
+            "Пришли 4 значения <b>на 100 г</b> в одной строке:\n"
+            "<code>ккал белки жиры углеводы</code>\n\n"
+            "Например: <code>250 12 8 30</code>"
+        )
+
+    async def _start_recipe_list_food_create(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        index: int,
+    ) -> None:
+        unresolved = context.user_data.get("recipe_list_unresolved")
+        if not isinstance(unresolved, list) or index < 0 or index >= len(unresolved):
+            await query.edit_message_text(
+                "Неизвестный ингредиент в черновике больше не найден.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]
+                ),
+            )
+            return
+        item = unresolved[index]
+        context.user_data["custom_food_origin"] = "recipe"
+        context.user_data["custom_food_unresolved_index"] = index
+        context.user_data["custom_food_requested_query"] = item.query
+        context.user_data["mode"] = "custom_food_title"
+        await query.edit_message_text(
+            f"Создаем продукт для «{html.escape(item.query)}».\n"
+            "Пришли название продукта. Оно появится во всех FatSecret аккаунтах группы.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _handle_custom_food_title(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        title = " ".join(text.strip().split())
+        if not title:
+            await update.effective_message.reply_text("Название продукта не должно быть пустым.")
+            return
+        if len(title) > 200:
+            await update.effective_message.reply_text("Название слишком длинное. Сократи его до 200 символов.")
+            return
+        context.user_data["custom_food_title"] = title
+        context.user_data["mode"] = "custom_food_barcode"
+        context.user_data.pop("custom_food_definition", None)
+        await update.effective_message.reply_text(
+            "Теперь пришли <b>фото штрих-кода</b>, его цифры текстом или нажми «Без штрих-кода».\n"
+            "По фото бот сам распознает EAN/UPC и проверит, нет ли продукта уже в FatSecret.",
+            reply_markup=_custom_food_barcode_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _handle_custom_food_barcode_text(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        if text.strip() == "-":
+            context.user_data.pop("custom_food_barcode", None)
+            context.user_data.pop("custom_food_barcode_type", None)
+            context.user_data["mode"] = "custom_food_macros"
+            await update.effective_message.reply_text(
+                self._custom_food_macros_prompt(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            decoded = normalize_barcode(text)
+        except BarcodeDecodeError as exc:
+            await update.effective_message.reply_text(str(exc), reply_markup=_custom_food_barcode_keyboard())
+            return
+        status = await update.effective_message.reply_text("Проверяю штрих-код в FatSecret...")
+        await self._accept_custom_food_barcode(status, context, decoded)
+
+    async def on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._require_user(update):
+            return
+        if context.user_data.get("mode") != "custom_food_barcode":
+            await update.effective_message.reply_text(
+                "Фото штрих-кода можно прислать на шаге создания продукта.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        photos = update.effective_message.photo
+        if not photos:
+            await update.effective_message.reply_text("В сообщении не нашел фото.")
+            return
+        status = await update.effective_message.reply_text("Распознаю и проверяю штрих-код...")
+        try:
+            telegram_file = await photos[-1].get_file()
+            image_bytes = bytes(await telegram_file.download_as_bytearray())
+            decoded = await asyncio.to_thread(decode_barcode_image, image_bytes)
+        except BarcodeDecodeError as exc:
+            await status.edit_text(str(exc), reply_markup=_custom_food_barcode_keyboard())
+            return
+        except Exception:  # noqa: BLE001 - Telegram download failures are user-retryable.
+            logger.exception("barcode photo download/decode failed")
+            await status.edit_text(
+                "Не удалось скачать или прочитать фото. Пришли его еще раз или введи цифры штрих-кода.",
+                reply_markup=_custom_food_barcode_keyboard(),
+            )
+            return
+        await self._accept_custom_food_barcode(status, context, decoded)
+
+    async def _accept_custom_food_barcode(
+        self,
+        status,
+        context: ContextTypes.DEFAULT_TYPE,
+        decoded: DecodedBarcode,
+    ) -> None:
+        group_id = context.user_data.get("group_id")
+        if not group_id:
+            await status.edit_text("Активная группа потеряна. Начни создание продукта заново.")
+            return
+        try:
+            lookup = await self.sync_engine.lookup_barcode(str(group_id), decoded.code)
+        except Exception as exc:  # noqa: BLE001 - do not attach an unchecked mapping.
+            logger.exception("barcode lookup failed")
+            await status.edit_text(
+                f"Не удалось проверить штрих-код: {user_safe_error_message(exc)}\n"
+                "Попробуй еще раз или создай продукт без штрих-кода.",
+                reply_markup=_custom_food_barcode_keyboard(),
+            )
+            return
+
+        if lookup.found and context.user_data.get("custom_food_origin") == "recipe":
+            unresolved = context.user_data.get("recipe_list_unresolved")
+            draft_items = context.user_data.get("recipe_list_draft")
+            index = context.user_data.get("custom_food_unresolved_index")
+            if not isinstance(unresolved, list) or not isinstance(draft_items, list) or not isinstance(index, int):
+                await status.edit_text("Черновик рецепта потерян. Начни создание рецепта заново.")
+                return
+            if index < 0 or index >= len(unresolved):
+                await status.edit_text("Неизвестный ингредиент больше не найден в черновике.")
+                return
+            pending_item = unresolved[index]
+            try:
+                resolved = await self.sync_engine.barcode_recipe_list_item(
+                    str(group_id),
+                    lookup,
+                    pending_item.grams,
+                    pending_item.query,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("known barcode ingredient hydration failed")
+                await status.edit_text(
+                    f"Штрих-код найден, но продукт не удалось загрузить: {user_safe_error_message(exc)}",
+                    reply_markup=_custom_food_barcode_keyboard(),
+                )
+                return
+            draft_items.append(resolved)
+            unresolved.pop(index)
+            context.user_data["recipe_list_draft"] = draft_items
+            context.user_data["recipe_list_unresolved"] = unresolved
+            self._clear_custom_food_wizard(context)
+            context.user_data["mode"] = "recipe_list_confirm"
+            title = str(context.user_data.get("recipe_list_title") or "").strip()
+            steps = context.user_data.get("recipe_list_steps")
+            steps = steps if isinstance(steps, list) else []
+            portions = context.user_data.get("recipe_list_portions")
+            portions = portions if isinstance(portions, Decimal) else Decimal("1")
+            await status.edit_text(
+                _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
+                reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if lookup.found:
+            known_name = lookup.food_name or f"ID {lookup.food_id}"
+            await status.edit_text(
+                f"FatSecret уже знает этот штрих-код: <b>{html.escape(known_name)}</b>"
+                f"{f' ({html.escape(lookup.brand_name)})' if lookup.brand_name else ''}.\n"
+                "Новый продукт с тем же кодом создавать небезопасно. Можно продолжить без привязки штрих-кода.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Продолжить без кода", callback_data="food_ignore_known_barcode:0")],
+                        [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+                    ]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        context.user_data["custom_food_barcode"] = decoded.code
+        context.user_data["custom_food_barcode_type"] = decoded.barcode_type
+        context.user_data["mode"] = "custom_food_macros"
+        await status.edit_text(
+            f"Штрих-код <code>{html.escape(decoded.code)}</code> распознан и пока не найден в FatSecret.\n\n"
+            + self._custom_food_macros_prompt(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _skip_custom_food_barcode(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        context.user_data.pop("custom_food_barcode", None)
+        context.user_data.pop("custom_food_barcode_type", None)
+        context.user_data["mode"] = "custom_food_macros"
+        await query.edit_message_text(self._custom_food_macros_prompt(), parse_mode=ParseMode.HTML)
+
+    async def _ignore_known_custom_food_barcode(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._skip_custom_food_barcode(query, context)
+
+    async def _handle_custom_food_macros(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        title = str(context.user_data.get("custom_food_title") or "").strip()
+        if not title:
+            context.user_data["mode"] = "custom_food_title"
+            await update.effective_message.reply_text("Название продукта потеряно. Пришли его еще раз.")
+            return
+        try:
+            nutrients = _parse_custom_food_macros(text)
+        except (InvalidOperation, ValueError) as exc:
+            await update.effective_message.reply_text(str(exc), parse_mode=ParseMode.HTML)
+            return
+        definition = CustomFoodDefinition(
+            source_recipe_id="",
+            title=title,
+            manufacturer_name="",
+            serving_type="Per100g",
+            serving_size="100",
+            metric_serving_size="100g",
+            nutrients=nutrients,
+            barcode=str(context.user_data.get("custom_food_barcode") or ""),
+            barcode_type=str(context.user_data.get("custom_food_barcode_type") or ""),
+        )
+        context.user_data["custom_food_definition"] = definition
+        context.user_data["mode"] = "custom_food_confirm"
+        await update.effective_message.reply_text(
+            _format_custom_food_draft(definition),
+            reply_markup=_custom_food_confirm_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _create_custom_food(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        telegram_id: int,
+    ) -> None:
+        group_id = context.user_data.get("group_id")
+        definition = context.user_data.get("custom_food_definition")
+        if not group_id or not isinstance(definition, CustomFoodDefinition):
+            await query.edit_message_text("Черновик продукта потерян. Начни создание заново.")
+            return
+        await query.edit_message_text("Создаю продукт во всех FatSecret аккаунтах группы и проверяю результат...")
+        try:
+            created = await self.sync_engine.create_custom_food_for_group(
+                str(group_id),
+                definition,
+                telegram_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("group custom food create failed")
+            await query.edit_message_text(
+                f"Ошибка создания продукта: {user_safe_error_message(exc)}",
+                reply_markup=_custom_food_confirm_keyboard(),
+            )
+            return
+
+        if context.user_data.get("custom_food_origin") == "recipe":
+            unresolved = context.user_data.get("recipe_list_unresolved")
+            draft_items = context.user_data.get("recipe_list_draft")
+            index = context.user_data.get("custom_food_unresolved_index")
+            if not isinstance(unresolved, list) or not isinstance(draft_items, list) or not isinstance(index, int):
+                await query.edit_message_text(
+                    "Продукт создан, но черновик рецепта потерян. Начни рецепт заново; продукт уже доступен в FatSecret."
+                )
+                return
+            if index < 0 or index >= len(unresolved):
+                await query.edit_message_text(
+                    "Продукт создан, но неизвестная позиция исчезла из черновика. Продукт уже доступен в FatSecret."
+                )
+                return
+            pending_item = unresolved[index]
+            resolved = self.sync_engine.custom_food_recipe_list_item(
+                definition,
+                created,
+                pending_item.grams,
+                pending_item.query,
+            )
+            draft_items.append(resolved)
+            unresolved.pop(index)
+            context.user_data["recipe_list_draft"] = draft_items
+            context.user_data["recipe_list_unresolved"] = unresolved
+            self._clear_custom_food_wizard(context)
+            context.user_data["mode"] = "recipe_list_confirm"
+            await self._edit_recipe_list_draft(query, context)
+            return
+
+        account_labels = self._account_labels_for_group(str(group_id))
+        lines = [
+            f"{html.escape(account_labels.get(account_key, account_key))}: "
+            f"<code>{html.escape(food_id)}</code>"
+            for account_key, food_id in sorted(created.food_ids.items())
+        ]
+        context.user_data.clear()
+        await query.edit_message_text(
+            f"Продукт <b>{html.escape(created.title)}</b> создан и проверен:\n" + "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+        await self._ensure_main_keyboard(query.message, context)
+
+    async def _cancel_custom_food(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if context.user_data.get("custom_food_origin") == "recipe":
+            self._clear_custom_food_wizard(context)
+            await self._edit_recipe_list_draft(query, context)
+            return
+        context.user_data.clear()
+        await query.edit_message_text("Создание продукта отменено.")
+        await self._ensure_main_keyboard(query.message, context)
+
     async def _handle_recipe_list_title(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         group = await self._require_active_group(update)
         if group is None:
@@ -3072,6 +3530,8 @@ class TelegramRecipeBot:
         )
 
     async def _edit_recipe_list_draft(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if context.user_data.get("custom_food_origin") == "recipe":
+            self._clear_custom_food_wizard(context)
         title = str(context.user_data.get("recipe_list_title") or "").strip()
         draft_items = context.user_data.get("recipe_list_draft")
         if not title or not isinstance(draft_items, list):

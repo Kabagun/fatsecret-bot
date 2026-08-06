@@ -8,7 +8,7 @@ import logging
 import re
 import uuid
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -23,6 +23,7 @@ from .fatsecret_client import (
     user_safe_error_message,
 )
 from .models import (
+    BarcodeLookupResult,
     CustomFoodDefinition,
     DiaryCopyDateResult,
     DiaryCopyPreview,
@@ -108,6 +109,7 @@ class ResolvedRecipeListItem:
     protein_per_100g: Decimal | None = None
     fat_per_100g: Decimal | None = None
     carbohydrate_per_100g: Decimal | None = None
+    custom_food_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,16 @@ class RecipeCreateResult:
     replaced_recipe_id: str | None = None
     replacement_results: list[AccountSyncResult] = field(default_factory=list)
     rename_results: list[AccountSyncResult] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CustomFoodCreateResult:
+    """Verified account-specific IDs for one group-wide personal product."""
+
+    run_id: str
+    title: str
+    food_ids: dict[str, str]
+    reused_accounts: tuple[str, ...] = ()
 
 
 def _recipe_list_request_fingerprint(
@@ -151,6 +163,7 @@ def _recipe_list_request_fingerprint(
                 "ingredient_grams": (
                     str(item.ingredient.grams.normalize()) if item.ingredient.grams is not None else None
                 ),
+                "custom_food_ids": dict(sorted(item.custom_food_ids.items())),
             }
             for item in items
         ],
@@ -159,7 +172,11 @@ def _recipe_list_request_fingerprint(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _recipe_list_payload_json(recipe: Recipe, requested_queries: list[str]) -> str:
+def _recipe_list_payload_json(
+    recipe: Recipe,
+    requested_queries: list[str],
+    custom_food_ids: dict[str, dict[str, str]] | None = None,
+) -> str:
     """Serialize the exact candidate used by a recoverable recipe-list operation."""
     payload = {
         "recipe": {
@@ -185,11 +202,14 @@ def _recipe_list_payload_json(recipe: Recipe, requested_queries: list[str]) -> s
             ],
         },
         "requested_queries": list(requested_queries),
+        "custom_food_ids": custom_food_ids or {},
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def _recipe_list_payload(payload_json: str) -> tuple[Recipe, list[str]]:
+def _recipe_list_payload(
+    payload_json: str,
+) -> tuple[Recipe, list[str], dict[str, dict[str, str]]]:
     """Restore an exact recipe-list candidate from its durable journal payload."""
     payload = json.loads(payload_json)
     recipe_data = payload["recipe"]
@@ -220,7 +240,17 @@ def _recipe_list_payload(payload_json: str) -> tuple[Recipe, list[str]]:
                 ),
             )
         )
-    return recipe, [str(query) for query in payload.get("requested_queries") or []]
+    custom_food_ids: dict[str, dict[str, str]] = {}
+    raw_custom_food_ids = payload.get("custom_food_ids") or {}
+    if isinstance(raw_custom_food_ids, dict):
+        for ingredient_id, mappings in raw_custom_food_ids.items():
+            if isinstance(mappings, dict):
+                custom_food_ids[str(ingredient_id)] = {
+                    str(account_key): str(food_id)
+                    for account_key, food_id in mappings.items()
+                    if str(account_key) and str(food_id)
+                }
+    return recipe, [str(query) for query in payload.get("requested_queries") or []], custom_food_ids
 
 
 def _inclusive_dates(start: dt.date, end: dt.date) -> list[dt.date]:
@@ -813,17 +843,105 @@ def _recipe_ingredient_membership_differences(expected: Recipe, actual: Recipe) 
 
 
 def _custom_food_content_hash(definition: CustomFoodDefinition) -> str:
+    """Fingerprint fields that can be verified through authoritative food readback."""
     return hashlib.sha256(
         json.dumps(
             {
-                "title": definition.title,
-                "manufacturer": definition.manufacturer_name,
-                "nutrients": {key: str(value) for key, value in sorted(definition.nutrients.items())},
+                "title": normalize_title(definition.title),
+                "manufacturer": normalize_title(definition.manufacturer_name),
+                "serving_type": definition.serving_type,
+                "serving_size": definition.serving_size,
+                "metric_serving_size": definition.metric_serving_size,
+                "nutrients": {
+                    key: format(value.normalize(), "f")
+                    for key, value in sorted(definition.nutrients.items())
+                },
             },
             ensure_ascii=False,
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _custom_food_definition_json(definition: CustomFoodDefinition) -> str:
+    return json.dumps(
+        {
+            "source_recipe_id": definition.source_recipe_id,
+            "title": definition.title,
+            "manufacturer_name": definition.manufacturer_name,
+            "serving_type": definition.serving_type,
+            "serving_size": definition.serving_size,
+            "metric_serving_size": definition.metric_serving_size,
+            "nutrients": {key: str(value) for key, value in sorted(definition.nutrients.items())},
+            "barcode": definition.barcode,
+            "barcode_type": definition.barcode_type,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _custom_food_definition(payload_json: str) -> CustomFoodDefinition:
+    payload = json.loads(payload_json)
+    if not isinstance(payload, dict):
+        raise ValueError("invalid custom-food journal payload")
+    nutrients = payload.get("nutrients") or {}
+    if not isinstance(nutrients, dict):
+        raise ValueError("invalid custom-food journal nutrients")
+    return CustomFoodDefinition(
+        source_recipe_id=str(payload.get("source_recipe_id") or ""),
+        title=str(payload.get("title") or ""),
+        manufacturer_name=str(payload.get("manufacturer_name") or ""),
+        serving_type=str(payload.get("serving_type") or "Per100g"),
+        serving_size=str(payload.get("serving_size") or "100"),
+        metric_serving_size=str(payload.get("metric_serving_size") or "100g"),
+        nutrients={str(key): Decimal(str(value)) for key, value in nutrients.items()},
+        barcode=str(payload.get("barcode") or ""),
+        barcode_type=str(payload.get("barcode_type") or ""),
+    )
+
+
+def _custom_food_request_fingerprint(definition: CustomFoodDefinition) -> str:
+    return hashlib.sha256(_custom_food_definition_json(definition).encode("utf-8")).hexdigest()
+
+
+def _custom_food_definition_matches(
+    expected: CustomFoodDefinition,
+    actual: CustomFoodDefinition,
+) -> bool:
+    return _custom_food_content_hash(expected) == _custom_food_content_hash(actual)
+
+
+def _recipe_for_account(
+    recipe: Recipe,
+    account_key: str,
+    custom_food_ids: dict[str, dict[str, str]],
+) -> Recipe:
+    """Return an account-specific recipe with every personal product ID replaced."""
+    account_recipe = _copy_recipe_from_remote(recipe.id, recipe)
+    account_recipe.group_id = recipe.group_id
+    account_recipe.title = recipe.title
+    account_recipe.description = recipe.description
+    account_recipe.portions = recipe.portions
+    account_recipe.prep_time = recipe.prep_time
+    account_recipe.cook_time = recipe.cook_time
+    account_recipe.steps = list(recipe.steps)
+    account_recipe.ingredients = []
+    for ingredient in recipe.ingredients:
+        mappings = custom_food_ids.get(ingredient.id)
+        if mappings is None:
+            account_recipe.ingredients.append(_ingredient_for_target_create(ingredient))
+            continue
+        food_id = mappings.get(account_key)
+        if not food_id:
+            raise FatSecretError(
+                f"Для личного продукта «{ingredient.title}» потеряна привязка аккаунта {account_key}."
+            )
+        account_recipe.ingredients.append(
+            _ingredient_with_food_id(_ingredient_for_target_create(ingredient), food_id)
+        )
+    return account_recipe
 
 
 def _is_ambiguous_mutation_error(exc: Exception) -> bool:
@@ -1226,6 +1344,308 @@ class RecipeSyncEngine:
         if self.storage.fatsecret_account_count(group_id) == 0:
             return
         await self.refresh_food_usage_cache(group_id)
+
+    async def lookup_barcode(self, group_id: str, barcode: str) -> BarcodeLookupResult:
+        """Look up a barcode with one connected account because mappings are global."""
+        clients = self._build_clients(group_id)
+        try:
+            return await next(iter(clients.values())).lookup_barcode(barcode)
+        finally:
+            await self._close_clients(clients)
+
+    async def barcode_recipe_list_item(
+        self,
+        group_id: str,
+        lookup: BarcodeLookupResult,
+        grams: Decimal,
+        requested_query: str,
+    ) -> ResolvedRecipeListItem:
+        """Hydrate a known barcode mapping into a normal recipe-list ingredient."""
+        if not lookup.food_id:
+            raise FatSecretError("FatSecret пока не знает этот штрих-код.")
+        clients = self._build_clients(group_id)
+        try:
+            client = next(iter(clients.values()))
+            found = await client.resolve_food_detail(
+                FoodSearchResult(
+                    food_id=lookup.food_id,
+                    title=lookup.food_name or requested_query,
+                    brand=lookup.brand_name,
+                )
+            )
+        finally:
+            await self._close_clients(clients)
+        protein = found.protein_per_portion
+        fat = found.fat_per_portion
+        carbohydrate = found.carbohydrate_per_portion
+        return ResolvedRecipeListItem(
+            requested_query=requested_query,
+            grams=grams,
+            ingredient=_ingredient_from_food_result(found, grams),
+            source="штрих-код FatSecret",
+            brand=found.brand or lookup.brand_name,
+            energy_per_100g=_correct_energy(found.energy_per_portion, protein, fat, carbohydrate),
+            protein_per_100g=protein,
+            fat_per_100g=fat,
+            carbohydrate_per_100g=carbohydrate,
+        )
+
+    @staticmethod
+    def _validate_custom_food_definition(definition: CustomFoodDefinition) -> None:
+        title = definition.title.strip()
+        if not title:
+            raise FatSecretError("Название продукта не должно быть пустым.")
+        if len(title) > 200:
+            raise FatSecretError("Название продукта слишком длинное.")
+        if definition.serving_type != "Per100g":
+            raise FatSecretError("Сейчас поддерживаются только значения на 100 г.")
+        required = {
+            "calories": Decimal("10000"),
+            "protein": Decimal("1000"),
+            "totalFat": Decimal("1000"),
+            "carbohydrate": Decimal("1000"),
+        }
+        for name, maximum in required.items():
+            value = definition.nutrients.get(name)
+            if value is None or not value.is_finite() or value < 0 or value > maximum:
+                raise FatSecretError("Ккал, белки, жиры и углеводы должны быть неотрицательными числами.")
+        if definition.barcode and definition.barcode_type not in {
+            "EAN_8",
+            "EAN_13",
+            "UPC_A",
+            "UPC_E",
+            "Other",
+        }:
+            raise FatSecretError("FatSecret не поддерживает этот тип штрих-кода.")
+
+    async def _existing_custom_food_id(
+        self,
+        client: FatSecretClient,
+        definition: CustomFoodDefinition,
+    ) -> tuple[str | None, bool]:
+        """Find an exact owned match and report whether the title is already conflicting."""
+        exact_title = normalize_title(definition.title)
+        candidates: list[FoodSearchResult] = []
+        for page in range(3):
+            page_items = await client.search_food(definition.title, page=page)
+            candidates.extend(
+                item
+                for item in page_items
+                if item.is_own and normalize_title(item.title) == exact_title and item.food_id
+            )
+            if not page_items:
+                break
+        matching_ids: list[str] = []
+        title_conflict = False
+        for candidate in _dedupe_food_results(candidates):
+            try:
+                actual = await client.get_custom_food_definition(candidate.food_id)
+            except FatSecretNotCustomFoodError:
+                continue
+            if _custom_food_definition_matches(definition, actual):
+                matching_ids.append(candidate.food_id)
+            else:
+                title_conflict = True
+        if matching_ids:
+            matching_ids.sort(key=lambda item: (not item.isdigit(), int(item) if item.isdigit() else item))
+            return matching_ids[0], title_conflict
+        return None, title_conflict
+
+    async def create_custom_food_for_group(
+        self,
+        group_id: str,
+        definition: CustomFoodDefinition,
+        initiated_by: int,
+    ) -> CustomFoodCreateResult:
+        """Create and read back one personal product in every connected group account."""
+        self._validate_custom_food_definition(definition)
+        request_fingerprint = _custom_food_request_fingerprint(definition)
+        content_hash = _custom_food_content_hash(definition)
+        clients = self._build_clients(group_id)
+        try:
+            run = self.storage.matching_custom_food_run(group_id, request_fingerprint)
+            if run is None:
+                run_id = self.storage.create_custom_food_run(
+                    group_id,
+                    initiated_by,
+                    definition.title.strip(),
+                    _custom_food_definition_json(definition),
+                    request_fingerprint,
+                    content_hash,
+                    list(clients),
+                )
+                run = self.storage.custom_food_run(run_id)
+                if run is None:
+                    raise FatSecretError("Не удалось сохранить журнал создания продукта.")
+            else:
+                definition = _custom_food_definition(str(run["definition_json"]))
+
+            account_rows = {str(row["account_key"]): row for row in list(run.get("accounts") or [])}
+            if set(account_rows) != set(clients):
+                message = "Набор FatSecret аккаунтов изменился; создание продукта остановлено для проверки."
+                self.storage.update_custom_food_run(str(run["id"]), "recovery_pending", error=message)
+                raise FatSecretError(message)
+            if str(run["status"]) == "completed":
+                completed_food_ids = {
+                    account_key: str(row["remote_food_id"] or "")
+                    for account_key, row in account_rows.items()
+                }
+                if any(not food_id for food_id in completed_food_ids.values()):
+                    message = "В завершенном журнале продукта потерян FatSecret ID; нужна ручная проверка."
+                    self.storage.update_custom_food_run(str(run["id"]), "recovery_pending", error=message)
+                    raise FatSecretError(message)
+                return CustomFoodCreateResult(
+                    run_id=str(run["id"]),
+                    title=definition.title,
+                    food_ids=completed_food_ids,
+                    reused_accounts=tuple(sorted(account_rows)),
+                )
+
+            reused_accounts: list[str] = []
+            barcode_account_key = sorted(clients)[0]
+            for account_key, client in clients.items():
+                row = account_rows[account_key]
+                remote_food_id = str(row["remote_food_id"] or "")
+                account_definition = (
+                    definition
+                    if account_key == barcode_account_key
+                    else replace(definition, barcode="", barcode_type="")
+                )
+                try:
+                    if remote_food_id:
+                        actual = await client.get_custom_food_definition(remote_food_id)
+                        if not _custom_food_definition_matches(account_definition, actual):
+                            raise FatSecretError(
+                                f"{client.account.label}: сохраненный продукт «{definition.title}» изменился."
+                            )
+                        self.storage.update_custom_food_run_account(
+                            str(run["id"]),
+                            account_key,
+                            "verified",
+                            remote_food_id=remote_food_id,
+                        )
+                        row["status"] = "verified"
+                    else:
+                        remote_food_id, title_conflict = await self._existing_custom_food_id(
+                            client,
+                            account_definition,
+                        )
+                        if remote_food_id:
+                            reused_accounts.append(account_key)
+                        elif title_conflict:
+                            raise FatSecretError(
+                                f"{client.account.label}: личный продукт «{definition.title}» уже есть с другими БЖУ. "
+                                "Измени название нового продукта."
+                            )
+                        else:
+                            try:
+                                remote_food_id = await client.create_custom_food(account_definition)
+                            except Exception as exc:
+                                if not _is_ambiguous_mutation_error(exc):
+                                    raise
+                                logger.warning(
+                                    "Custom food create ambiguous; searching exact readback account=%s title=%r",
+                                    client.account.label,
+                                    definition.title,
+                                    exc_info=True,
+                                )
+                                remote_food_id, _ = await self._existing_custom_food_id(
+                                    client,
+                                    account_definition,
+                                )
+                                if not remote_food_id:
+                                    raise FatSecretError(
+                                        f"{client.account.label}: ответ создания продукта потерян. "
+                                        "Повтори действие: журнал сохранен и дубль не будет создан."
+                                    ) from exc
+                            actual = await client.get_custom_food_definition(remote_food_id)
+                            if not _custom_food_definition_matches(account_definition, actual):
+                                raise FatSecretError(
+                                    f"{client.account.label}: FatSecret вернул продукт с другими значениями."
+                                )
+                        self.storage.update_custom_food_run_account(
+                            str(run["id"]),
+                            account_key,
+                            "verified",
+                            remote_food_id=remote_food_id,
+                        )
+                        row["remote_food_id"] = remote_food_id
+                        row["status"] = "verified"
+                except Exception as exc:
+                    message = user_safe_error_message(exc)
+                    self.storage.update_custom_food_run_account(
+                        str(run["id"]),
+                        account_key,
+                        str(row["status"]),
+                        remote_food_id=remote_food_id or None,
+                        error=message,
+                    )
+                    self.storage.update_custom_food_run(str(run["id"]), "recovery_pending", error=message)
+                    raise FatSecretError(
+                        "Продукт создан не во всех аккаунтах. Уже подтвержденные ID сохранены; "
+                        f"повтори действие для безопасного продолжения. {message}"
+                    ) from exc
+
+            food_ids = {
+                account_key: str(row["remote_food_id"])
+                for account_key, row in account_rows.items()
+                if row.get("remote_food_id")
+            }
+            if set(food_ids) != set(clients):
+                raise FatSecretError("Не для всех аккаунтов подтвержден ID созданного продукта.")
+            for source_account_key, source_food_id in food_ids.items():
+                for target_account_key, target_food_id in food_ids.items():
+                    if source_account_key == target_account_key:
+                        continue
+                    self.storage.set_custom_food_mapping(
+                        source_account_key,
+                        source_food_id,
+                        target_account_key,
+                        target_food_id,
+                        content_hash,
+                    )
+            self.storage.update_custom_food_run(str(run["id"]), "completed")
+            return CustomFoodCreateResult(
+                run_id=str(run["id"]),
+                title=definition.title,
+                food_ids=food_ids,
+                reused_accounts=tuple(sorted(reused_accounts)),
+            )
+        finally:
+            await self._close_clients(clients)
+
+    @staticmethod
+    def custom_food_recipe_list_item(
+        definition: CustomFoodDefinition,
+        created: CustomFoodCreateResult,
+        grams: Decimal,
+        requested_query: str,
+    ) -> ResolvedRecipeListItem:
+        """Build a recipe ingredient backed by verified account-specific personal-food IDs."""
+        if not created.food_ids:
+            raise FatSecretError("У созданного продукта нет подтвержденных FatSecret ID.")
+        canonical_account_key = sorted(created.food_ids)[0]
+        canonical_food_id = created.food_ids[canonical_account_key]
+        return ResolvedRecipeListItem(
+            requested_query=requested_query,
+            grams=grams,
+            ingredient=Ingredient(
+                id=str(uuid.uuid4()),
+                recipe_id="",
+                food_id=canonical_food_id,
+                title=definition.title,
+                portion_id="0",
+                amount=_gram_portion_amount(grams),
+                portion_description="100г",
+                grams=grams,
+            ),
+            source="создан в группе",
+            energy_per_100g=definition.nutrients.get("calories"),
+            protein_per_100g=definition.nutrients.get("protein"),
+            fat_per_100g=definition.nutrients.get("totalFat"),
+            carbohydrate_per_100g=definition.nutrients.get("carbohydrate"),
+            custom_food_ids=dict(created.food_ids),
+        )
 
     async def _normalize_recipe_ingredients(
         self,
@@ -2264,6 +2684,22 @@ class RecipeSyncEngine:
         try:
             if run is None:
                 candidate_recipe_id = str(uuid.uuid4())
+                candidate_ingredients: list[Ingredient] = []
+                custom_food_ids: dict[str, dict[str, str]] = {}
+                for item in items:
+                    ingredient = Ingredient(
+                        id=str(uuid.uuid4()),
+                        recipe_id=candidate_recipe_id,
+                        food_id=item.ingredient.food_id,
+                        title=item.ingredient.title,
+                        portion_id=item.ingredient.portion_id or "0",
+                        amount=item.ingredient.amount,
+                        portion_description=item.ingredient.portion_description or "г",
+                        grams=item.ingredient.grams,
+                    )
+                    candidate_ingredients.append(ingredient)
+                    if item.custom_food_ids:
+                        custom_food_ids[ingredient.id] = dict(item.custom_food_ids)
                 candidate = Recipe(
                     id=candidate_recipe_id,
                     title=create_title,
@@ -2273,19 +2709,7 @@ class RecipeSyncEngine:
                     cook_time=0,
                     steps=clean_steps,
                     group_id=group_id,
-                    ingredients=[
-                        Ingredient(
-                            id=str(uuid.uuid4()),
-                            recipe_id=candidate_recipe_id,
-                            food_id=item.ingredient.food_id,
-                            title=item.ingredient.title,
-                            portion_id=item.ingredient.portion_id or "0",
-                            amount=item.ingredient.amount,
-                            portion_description=item.ingredient.portion_description or "г",
-                            grams=item.ingredient.grams,
-                        )
-                        for item in items
-                    ],
+                    ingredients=candidate_ingredients,
                 )
                 canonical_recipe_id = replaced_recipe.id if replace_existing_local and replaced_recipe is not None else None
                 if canonical_recipe_id is None and replaced_recipe is not None:
@@ -2311,6 +2735,7 @@ class RecipeSyncEngine:
                     payload_json=_recipe_list_payload_json(
                         candidate,
                         [item.requested_query for item in items],
+                        custom_food_ids,
                     ),
                     payload_fingerprint=payload_fingerprint,
                     old_remote_ids=old_remote_ids,
@@ -2324,7 +2749,7 @@ class RecipeSyncEngine:
                 self.storage.update_recipe_list_run(str(run["id"]), "recovery_pending", error=message)
                 raise FatSecretError(message)
 
-            recipe, requested_queries = _recipe_list_payload(str(run["payload_json"]))
+            recipe, requested_queries, custom_food_ids = _recipe_list_payload(str(run["payload_json"]))
             if run["status"] == "remote_complete":
                 return self._finalize_recipe_list_run(run, recipe)
 
@@ -2341,6 +2766,7 @@ class RecipeSyncEngine:
                         client,
                         recipe,
                         requested_queries,
+                        custom_food_ids,
                     )
                 except Exception as exc:  # noqa: BLE001 - rollback is coordinated after all journal writes.
                     phase_one_error = (account_key, exc)
@@ -2392,15 +2818,19 @@ class RecipeSyncEngine:
                     account["status"] = "old_deleted"
 
                 recipe.title = str(run["requested_title"])
-                self.storage.update_recipe_list_run_payload(str(run["id"]), _recipe_list_payload_json(recipe, requested_queries))
+                self.storage.update_recipe_list_run_payload(
+                    str(run["id"]),
+                    _recipe_list_payload_json(recipe, requested_queries, custom_food_ids),
+                )
                 for account_key, client in clients.items():
                     active_account_key = account_key
                     account = account_rows[account_key]
                     if str(account["status"]) in {"renamed", "completed"}:
                         continue
                     remote_id = str(account["new_remote_id"])
-                    await self._save_recipe_meta_with_readback(client, recipe, remote_id)
-                    await self._verify_remote_recipe(client, account_key, remote_id, recipe)
+                    account_recipe = _recipe_for_account(recipe, account_key, custom_food_ids)
+                    await self._save_recipe_meta_with_readback(client, account_recipe, remote_id)
+                    await self._verify_remote_recipe(client, account_key, remote_id, account_recipe)
                     self.storage.update_recipe_list_run_account(
                         str(run["id"]),
                         account_key,
@@ -2433,7 +2863,7 @@ class RecipeSyncEngine:
             completed_run = self.storage.recipe_list_run(str(run["id"]))
             if completed_run is None:
                 raise FatSecretError("Журнал создания рецепта потерян перед локальной фиксацией.")
-            recipe, _ = _recipe_list_payload(str(completed_run["payload_json"]))
+            recipe, _, _ = _recipe_list_payload(str(completed_run["payload_json"]))
             return self._finalize_recipe_list_run(completed_run, recipe)
         finally:
             await self._close_clients(clients)
@@ -2497,37 +2927,43 @@ class RecipeSyncEngine:
         client: FatSecretClient,
         recipe: Recipe,
         requested_queries: list[str],
+        custom_food_ids: dict[str, dict[str, str]],
     ) -> None:
         """Create, fill, and exactly verify one temporary remote candidate."""
+        account_recipe = _recipe_for_account(recipe, account_key, custom_food_ids)
         remote_id = str(account["new_remote_id"]) if account.get("new_remote_id") else ""
         if not remote_id:
             title_matches = [
                 summary.remote_id
                 for summary in await client.cookbook()
-                if normalize_title(summary.title) == normalize_title(recipe.title)
+                if normalize_title(summary.title) == normalize_title(account_recipe.title)
             ]
             matching_ids: list[str] = []
             for matching_id in title_matches:
                 existing = await client.get_recipe(matching_id)
                 if (
-                    normalize_title(existing.title) == normalize_title(recipe.title)
-                    and existing.description == recipe.description
-                    and existing.portions == recipe.portions
-                    and existing.prep_time == recipe.prep_time
-                    and existing.cook_time == recipe.cook_time
+                    normalize_title(existing.title) == normalize_title(account_recipe.title)
+                    and existing.description == account_recipe.description
+                    and existing.portions == account_recipe.portions
+                    and existing.prep_time == account_recipe.prep_time
+                    and existing.cook_time == account_recipe.cook_time
                 ):
                     matching_ids.append(matching_id)
             if len(matching_ids) > 1:
                 raise FatSecretError(
-                    f"{client.account.label}: найдено несколько временных рецептов «{recipe.title}»; "
+                    f"{client.account.label}: найдено несколько временных рецептов «{account_recipe.title}»; "
                     "операция остановлена без нового создания"
                 )
             if title_matches and not matching_ids:
                 raise FatSecretError(
-                    f"{client.account.label}: рецепт «{recipe.title}» уже существует, но не принадлежит "
+                    f"{client.account.label}: рецепт «{account_recipe.title}» уже существует, но не принадлежит "
                     "этой незавершённой операции"
                 )
-            remote_id = matching_ids[0] if matching_ids else await self._create_recipe_with_readback(client, recipe)
+            remote_id = (
+                matching_ids[0]
+                if matching_ids
+                else await self._create_recipe_with_readback(client, account_recipe)
+            )
             account["new_remote_id"] = remote_id
             account["status"] = "created"
             self.storage.update_recipe_list_run_account(
@@ -2538,7 +2974,7 @@ class RecipeSyncEngine:
             )
 
         current = await client.get_recipe(remote_id)
-        if recipe_fingerprint(current).digest == recipe_fingerprint(recipe).digest:
+        if recipe_fingerprint(current).digest == recipe_fingerprint(account_recipe).digest:
             self.storage.upsert_remote_recipe_snapshot(
                 account_key,
                 remote_id,
@@ -2566,20 +3002,23 @@ class RecipeSyncEngine:
                 )
 
         payload_changed = False
-        for index, ingredient in enumerate(list(recipe.ingredients)):
+        for index, ingredient in enumerate(list(account_recipe.ingredients)):
             requested_query = requested_queries[index] if index < len(requested_queries) else ingredient.title
+            canonical_ingredient = recipe.ingredients[index]
+            is_custom_food = canonical_ingredient.id in custom_food_ids
             accepted = await self._add_ingredient_with_fallback(
                 client,
                 remote_id,
                 ingredient,
                 requested_query,
+                allow_legacy_fallback=not is_custom_food,
             )
             if accepted is None:
                 raise FatSecretError(f"{client.account.label}: FatSecret не принял ингредиент «{ingredient.title}».")
             if _ingredient_needs_update(ingredient, accepted):
-                recipe.ingredients[index] = Ingredient(
+                updated_ingredient = Ingredient(
                     id=ingredient.id,
-                    recipe_id=recipe.id,
+                    recipe_id=account_recipe.id,
                     food_id=accepted.food_id,
                     title=accepted.title,
                     portion_id=accepted.portion_id or "0",
@@ -2587,14 +3026,17 @@ class RecipeSyncEngine:
                     portion_description=accepted.portion_description,
                     grams=accepted.grams,
                 )
-                payload_changed = True
+                account_recipe.ingredients[index] = updated_ingredient
+                if not is_custom_food:
+                    recipe.ingredients[index] = updated_ingredient
+                    payload_changed = True
         if payload_changed:
             self.storage.update_recipe_list_run_payload(
                 run_id,
-                _recipe_list_payload_json(recipe, requested_queries),
+                _recipe_list_payload_json(recipe, requested_queries, custom_food_ids),
             )
-        await self._save_recipe_meta_with_readback(client, recipe, remote_id)
-        await self._verify_remote_recipe(client, account_key, remote_id, recipe)
+        await self._save_recipe_meta_with_readback(client, account_recipe, remote_id)
+        await self._verify_remote_recipe(client, account_key, remote_id, account_recipe)
         self.storage.update_recipe_list_run_account(
             run_id,
             account_key,
