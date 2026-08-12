@@ -12,6 +12,8 @@ from fatsecret_bot.telegram_bot import (
     _parse_recipe_list_payload,
     _parse_recipe_steps,
     _parse_custom_food_macros,
+    _custom_food_barcode_keyboard,
+    _custom_food_brand_keyboard,
     _recipe_list_candidate_keyboard,
     _recipe_list_draft_keyboard,
     _recipe_list_input_error_keyboard,
@@ -27,11 +29,11 @@ def test_custom_food_macro_parser_uses_compact_per_100g_order() -> None:
     }
 
 
-def test_custom_food_confirmation_shows_barcode_and_group_scope() -> None:
+def test_custom_food_confirmation_shows_brand_barcode_and_group_scope() -> None:
     definition = CustomFoodDefinition(
         source_recipe_id="",
         title="QA product",
-        manufacturer_name="",
+        manufacturer_name="Burger King",
         serving_type="Per100g",
         serving_size="100",
         metric_serving_size="100g",
@@ -48,8 +50,25 @@ def test_custom_food_confirmation_shows_barcode_and_group_scope() -> None:
     text = _format_custom_food_draft(definition)
 
     assert "QA product" in text
+    assert "Burger King" in text
     assert "4006381333931" in text
     assert "во всех FatSecret аккаунтах" in text
+
+
+def test_custom_food_optional_steps_have_explicit_skip_buttons() -> None:
+    barcode_buttons = [
+        (button.text, button.callback_data)
+        for row in _custom_food_barcode_keyboard().inline_keyboard
+        for button in row
+    ]
+    brand_buttons = [
+        (button.text, button.callback_data)
+        for row in _custom_food_brand_keyboard().inline_keyboard
+        for button in row
+    ]
+
+    assert ("Без штрих-кода", "food_skip_barcode:0") in barcode_buttons
+    assert ("Без бренда", "food_skip_brand:0") in brand_buttons
 
 
 def test_parse_recipe_list_lines_uses_last_number_as_grams() -> None:

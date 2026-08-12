@@ -1397,6 +1397,8 @@ class RecipeSyncEngine:
             raise FatSecretError("Название продукта не должно быть пустым.")
         if len(title) > 200:
             raise FatSecretError("Название продукта слишком длинное.")
+        if len(definition.manufacturer_name.strip()) > 200:
+            raise FatSecretError("Название бренда слишком длинное.")
         if definition.serving_type != "Per100g":
             raise FatSecretError("Сейчас поддерживаются только значения на 100 г.")
         required = {

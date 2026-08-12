@@ -508,8 +508,44 @@ def test_create_custom_food_uses_apk_saveregional_contract() -> None:
     assert request_body["productName"] == ["Мой продукт"]
     assert request_body["servingType"] == ["Per100g"]
     assert request_body["calories"] == ["150"]
+    assert request_body["manufacturerType"] == ["1"]
+    assert request_body["manufacturerName"] == ["Бренд"]
     assert request_body["barcode"] == ["4006381333931"]
     assert request_body["barcodeType"] == ["EAN_13"]
+
+
+def test_create_custom_food_omits_skipped_brand_and_barcode() -> None:
+    request_body: dict[str, list[str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_body
+        request_body = parse_qs(request.content.decode())
+        return httpx.Response(200, text="SUCCESS:778")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(_account("tg11"), _device(), http=http, session=FatSecretSession("s", "d", "k"))
+    try:
+        remote_id = asyncio.run(
+            client.create_custom_food(
+                CustomFoodDefinition(
+                    source_recipe_id="",
+                    title="Без бренда",
+                    manufacturer_name="",
+                    serving_type="Per100g",
+                    serving_size="100",
+                    metric_serving_size="100g",
+                    nutrients={"calories": Decimal("100"), "protein": Decimal("5")},
+                )
+            )
+        )
+    finally:
+        asyncio.run(http.aclose())
+
+    assert remote_id == "778"
+    assert "manufacturerType" not in request_body
+    assert "manufacturerName" not in request_body
+    assert "barcode" not in request_body
+    assert "barcodeType" not in request_body
 
 
 def test_lookup_barcode_uses_app_scan_contract_and_parses_match() -> None:

@@ -206,6 +206,11 @@ def _parse_custom_food_macros(text: str) -> dict[str, Decimal]:
 
 
 def _format_custom_food_draft(definition: CustomFoodDefinition) -> str:
+    brand = (
+        f"\nБренд: {html.escape(definition.manufacturer_name)}"
+        if definition.manufacturer_name
+        else "\nБренд: нет"
+    )
     barcode = (
         f"\nШтрих-код: <code>{html.escape(definition.barcode)}</code>"
         if definition.barcode
@@ -218,7 +223,7 @@ def _format_custom_food_draft(definition: CustomFoodDefinition) -> str:
         f"Белки: {_format_decimal_plain(definition.nutrients['protein'])} г\n"
         f"Жиры: {_format_decimal_plain(definition.nutrients['totalFat'])} г\n"
         f"Углеводы: {_format_decimal_plain(definition.nutrients['carbohydrate'])} г"
-        f"{barcode}\n\n"
+        f"{brand}{barcode}\n\n"
         "Продукт будет создан во всех FatSecret аккаунтах активной группы."
     )
 
@@ -227,6 +232,15 @@ def _custom_food_barcode_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Без штрих-кода", callback_data="food_skip_barcode:0")],
+            [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+        ]
+    )
+
+
+def _custom_food_brand_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Без бренда", callback_data="food_skip_brand:0")],
             [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
         ]
     )
@@ -1861,6 +1875,8 @@ class TelegramRecipeBot:
             await self._edit_recipe_list(query, 0, context)
         elif action == "food_skip_barcode":
             await self._skip_custom_food_barcode(query, context)
+        elif action == "food_skip_brand":
+            await self._skip_custom_food_brand(query, context)
         elif action == "food_ignore_known_barcode":
             await self._ignore_known_custom_food_barcode(query, context)
         elif action == "food_create":
@@ -2745,6 +2761,8 @@ class TelegramRecipeBot:
             await self._handle_custom_food_title(update, context, text)
         elif mode == "custom_food_barcode":
             await self._handle_custom_food_barcode_text(update, context, text)
+        elif mode == "custom_food_brand":
+            await self._handle_custom_food_brand(update, context, text)
         elif mode == "custom_food_macros":
             await self._handle_custom_food_macros(update, context, text)
         elif mode == "group_create":
@@ -3030,6 +3048,7 @@ class TelegramRecipeBot:
             "custom_food_title",
             "custom_food_barcode",
             "custom_food_barcode_type",
+            "custom_food_manufacturer_name",
             "custom_food_definition",
             "custom_food_unresolved_index",
             "custom_food_requested_query",
@@ -3042,6 +3061,13 @@ class TelegramRecipeBot:
             "Пришли 4 значения <b>на 100 г</b> в одной строке:\n"
             "<code>ккал белки жиры углеводы</code>\n\n"
             "Например: <code>250 12 8 30</code>"
+        )
+
+    @staticmethod
+    def _custom_food_brand_prompt() -> str:
+        return (
+            "Пришли <b>бренд продукта</b>, например <code>McDonald's</code> или "
+            "<code>Burger King</code>, либо нажми «Без бренда»."
         )
 
     async def _start_recipe_list_food_create(
@@ -3105,9 +3131,10 @@ class TelegramRecipeBot:
         if text.strip() == "-":
             context.user_data.pop("custom_food_barcode", None)
             context.user_data.pop("custom_food_barcode_type", None)
-            context.user_data["mode"] = "custom_food_macros"
+            context.user_data["mode"] = "custom_food_brand"
             await update.effective_message.reply_text(
-                self._custom_food_macros_prompt(),
+                self._custom_food_brand_prompt(),
+                reply_markup=_custom_food_brand_keyboard(),
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -3231,21 +3258,60 @@ class TelegramRecipeBot:
 
         context.user_data["custom_food_barcode"] = decoded.code
         context.user_data["custom_food_barcode_type"] = decoded.barcode_type
-        context.user_data["mode"] = "custom_food_macros"
+        context.user_data["mode"] = "custom_food_brand"
         await status.edit_text(
             f"Штрих-код <code>{html.escape(decoded.code)}</code> распознан и пока не найден в FatSecret.\n\n"
-            + self._custom_food_macros_prompt(),
+            + self._custom_food_brand_prompt(),
+            reply_markup=_custom_food_brand_keyboard(),
             parse_mode=ParseMode.HTML,
         )
 
     async def _skip_custom_food_barcode(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop("custom_food_barcode", None)
         context.user_data.pop("custom_food_barcode_type", None)
-        context.user_data["mode"] = "custom_food_macros"
-        await query.edit_message_text(self._custom_food_macros_prompt(), parse_mode=ParseMode.HTML)
+        context.user_data["mode"] = "custom_food_brand"
+        await query.edit_message_text(
+            self._custom_food_brand_prompt(),
+            reply_markup=_custom_food_brand_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
 
     async def _ignore_known_custom_food_barcode(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._skip_custom_food_barcode(query, context)
+
+    async def _handle_custom_food_brand(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        brand = " ".join(text.strip().split())
+        if brand == "-":
+            context.user_data.pop("custom_food_manufacturer_name", None)
+        elif not brand:
+            await update.effective_message.reply_text(
+                "Название бренда не должно быть пустым. Введи бренд или нажми «Без бренда».",
+                reply_markup=_custom_food_brand_keyboard(),
+            )
+            return
+        elif len(brand) > 200:
+            await update.effective_message.reply_text(
+                "Название бренда слишком длинное. Сократи его до 200 символов.",
+                reply_markup=_custom_food_brand_keyboard(),
+            )
+            return
+        else:
+            context.user_data["custom_food_manufacturer_name"] = brand
+        context.user_data["mode"] = "custom_food_macros"
+        await update.effective_message.reply_text(
+            self._custom_food_macros_prompt(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _skip_custom_food_brand(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        context.user_data.pop("custom_food_manufacturer_name", None)
+        context.user_data["mode"] = "custom_food_macros"
+        await query.edit_message_text(self._custom_food_macros_prompt(), parse_mode=ParseMode.HTML)
 
     async def _handle_custom_food_macros(
         self,
@@ -3266,7 +3332,7 @@ class TelegramRecipeBot:
         definition = CustomFoodDefinition(
             source_recipe_id="",
             title=title,
-            manufacturer_name="",
+            manufacturer_name=str(context.user_data.get("custom_food_manufacturer_name") or ""),
             serving_type="Per100g",
             serving_size="100",
             metric_serving_size="100g",

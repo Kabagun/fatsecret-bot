@@ -536,6 +536,60 @@ def test_ensure_main_keyboard_does_not_send_extra_message() -> None:
     assert context.chat_data["reply_keyboard"] == "main"
 
 
+def test_custom_food_skip_buttons_advance_optional_steps() -> None:
+    query = SimpleNamespace(edit_message_text=AsyncMock())
+    context = SimpleNamespace(
+        user_data={
+            "mode": "custom_food_barcode",
+            "custom_food_barcode": "4006381333931",
+            "custom_food_barcode_type": "EAN_13",
+            "custom_food_manufacturer_name": "stale brand",
+        }
+    )
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._skip_custom_food_barcode(query, context))
+
+    assert context.user_data["mode"] == "custom_food_brand"
+    assert "custom_food_barcode" not in context.user_data
+    assert "custom_food_barcode_type" not in context.user_data
+    barcode_skip_kwargs = query.edit_message_text.await_args.kwargs
+    brand_buttons = [
+        button.callback_data
+        for row in barcode_skip_kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert "food_skip_brand:0" in brand_buttons
+
+    asyncio.run(bot._skip_custom_food_brand(query, context))
+
+    assert context.user_data["mode"] == "custom_food_macros"
+    assert "custom_food_manufacturer_name" not in context.user_data
+
+
+def test_custom_food_brand_is_normalized_and_added_to_definition() -> None:
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(
+        user_data={
+            "mode": "custom_food_brand",
+            "custom_food_title": "QA Burger",
+        }
+    )
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._handle_custom_food_brand(update, context, "  Burger   King  "))
+
+    assert context.user_data["custom_food_manufacturer_name"] == "Burger King"
+    assert context.user_data["mode"] == "custom_food_macros"
+
+    asyncio.run(bot._handle_custom_food_macros(update, context, "250 12 8 30"))
+
+    definition = context.user_data["custom_food_definition"]
+    assert definition.manufacturer_name == "Burger King"
+    assert context.user_data["mode"] == "custom_food_confirm"
+
+
 def test_next_food_usage_refresh_runs_at_noon_in_bot_timezone() -> None:
     bot = object.__new__(TelegramRecipeBot)
     bot.sync_engine = type("Engine", (), {"timezone": "Europe/Minsk"})()

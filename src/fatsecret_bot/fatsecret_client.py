@@ -600,8 +600,6 @@ class FatSecretClient:
         )
         form = {
             "action": "saveregional",
-            "manufacturerType": "0",
-            "manufacturerName": definition.manufacturer_name,
             "productName": definition.title,
             "tags": "",
             "isSalt": "false",
@@ -610,6 +608,9 @@ class FatSecretClient:
             "metricServingSize": definition.metric_serving_size,
             **{name: _form_decimal(value) for name, value in definition.nutrients.items()},
         }
+        if definition.manufacturer_name:
+            form["manufacturerType"] = "1"
+            form["manufacturerName"] = definition.manufacturer_name
         if definition.barcode:
             form["barcode"] = definition.barcode
             form["barcodeType"] = definition.barcode_type or "Other"
