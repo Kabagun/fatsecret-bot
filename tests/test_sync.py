@@ -3501,7 +3501,7 @@ def _qa_custom_food_definition(*, barcode: str = "") -> CustomFoodDefinition:
         title="QA Group Product",
         manufacturer_name="",
         serving_type="Per100g",
-        serving_size="100",
+        serving_size="",
         metric_serving_size="100g",
         nutrients={
             "calories": Decimal("321"),

@@ -3488,7 +3488,7 @@ class TelegramRecipeBot:
             title=title,
             manufacturer_name=str(context.user_data.get("custom_food_manufacturer_name") or ""),
             serving_type="Per100g",
-            serving_size="100",
+            serving_size="",
             metric_serving_size="100g",
             nutrients=nutrients,
             barcode=str(context.user_data.get("custom_food_barcode") or ""),

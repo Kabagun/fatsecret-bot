@@ -896,7 +896,7 @@ def _custom_food_definition(payload_json: str) -> CustomFoodDefinition:
         title=str(payload.get("title") or ""),
         manufacturer_name=str(payload.get("manufacturer_name") or ""),
         serving_type=str(payload.get("serving_type") or "Per100g"),
-        serving_size=str(payload.get("serving_size") or "100"),
+        serving_size=str(payload.get("serving_size") or ""),
         metric_serving_size=str(payload.get("metric_serving_size") or "100g"),
         nutrients={str(key): Decimal(str(value)) for key, value in nutrients.items()},
         barcode=str(payload.get("barcode") or ""),

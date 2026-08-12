@@ -613,6 +613,8 @@ def test_custom_food_brand_is_normalized_and_added_to_definition() -> None:
 
     definition = context.user_data["custom_food_definition"]
     assert definition.manufacturer_name == "Burger King"
+    assert definition.serving_size == ""
+    assert definition.metric_serving_size == "100g"
     assert context.user_data["mode"] == "custom_food_confirm"
 
 

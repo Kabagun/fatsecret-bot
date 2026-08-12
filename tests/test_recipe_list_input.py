@@ -53,7 +53,7 @@ def test_custom_food_confirmation_shows_brand_barcode_and_group_scope() -> None:
         title="QA product",
         manufacturer_name="Burger King",
         serving_type="Per100g",
-        serving_size="100",
+        serving_size="",
         metric_serving_size="100g",
         nutrients={
             "calories": Decimal("250"),

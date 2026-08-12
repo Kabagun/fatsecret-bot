@@ -392,6 +392,14 @@ def _stable_device_key(device_identifier: str, account_key: str) -> str:
     return f"|{device_identifier}|{seed.hex}"
 
 
+def _localized_metric_serving_size(value: str, language: str) -> str:
+    compact = value.replace(" ", "").casefold()
+    primary_language = re.split(r"[-_]", language.casefold(), maxsplit=1)[0]
+    if compact in {"100g", "100г"} and primary_language in {"be", "ru", "uk"}:
+        return "100г"
+    return value
+
+
 class FatSecretClient:
     def __init__(
         self,
@@ -629,10 +637,14 @@ class FatSecretClient:
             "tags": "",
             "isSalt": "false",
             "servingType": definition.serving_type,
-            "servingSize": definition.serving_size,
-            "metricServingSize": definition.metric_serving_size,
+            "metricServingSize": _localized_metric_serving_size(
+                definition.metric_serving_size,
+                self.account.language,
+            ),
             **{name: _form_decimal(value) for name, value in definition.nutrients.items()},
         }
+        if definition.serving_size:
+            form["servingSize"] = definition.serving_size
         if definition.manufacturer_name:
             form["manufacturerType"] = "1"
             form["manufacturerName"] = definition.manufacturer_name
@@ -1370,6 +1382,11 @@ class FatSecretClient:
         if not nutrients:
             raise FatSecretError(f"{self.account.label}: custom food {remote_id} has no nutrition data")
         short_description = _text(root, "shortDescription")
+        raw_serving_size = _text(root, "servingSize")
+        has_named_serving = any(
+            portion["id"].isdecimal() and int(portion["id"]) > 0
+            for portion in _recipe_portions(root)
+        )
         return CustomFoodDefinition(
             source_recipe_id=remote_id,
             title=_text(root, "title"),
@@ -1379,7 +1396,12 @@ class FatSecretClient:
                 or _metadata_value(short_description, "mname")
             ),
             serving_type="Per100g",
-            serving_size="100",
+            serving_size=(
+                ""
+                if not has_named_serving
+                and raw_serving_size.replace(" ", "").casefold() in {"100g", "100г"}
+                else raw_serving_size
+            ),
             metric_serving_size="100g",
             nutrients=nutrients,
         )

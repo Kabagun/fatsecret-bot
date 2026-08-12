@@ -520,7 +520,7 @@ def test_create_custom_food_uses_apk_saveregional_contract() -> None:
                 title="Мой продукт",
                 manufacturer_name="Бренд",
                 serving_type="Per100g",
-                serving_size="100",
+                serving_size="",
                 metric_serving_size="100g",
                 nutrients={"calories": Decimal("150"), "protein": Decimal("10")},
                 barcode="4006381333931",
@@ -534,6 +534,8 @@ def test_create_custom_food_uses_apk_saveregional_contract() -> None:
     assert request_body["action"] == ["saveregional"]
     assert request_body["productName"] == ["Мой продукт"]
     assert request_body["servingType"] == ["Per100g"]
+    assert "servingSize" not in request_body
+    assert request_body["metricServingSize"] == ["100г"]
     assert request_body["calories"] == ["150"]
     assert request_body["manufacturerType"] == ["1"]
     assert request_body["manufacturerName"] == ["Бренд"]
@@ -559,7 +561,7 @@ def test_create_custom_food_omits_skipped_brand_and_barcode() -> None:
                     title="Без бренда",
                     manufacturer_name="",
                     serving_type="Per100g",
-                    serving_size="100",
+                    serving_size="",
                     metric_serving_size="100g",
                     nutrients={"calories": Decimal("100"), "protein": Decimal("5")},
                 )
@@ -573,6 +575,28 @@ def test_create_custom_food_omits_skipped_brand_and_barcode() -> None:
     assert "manufacturerName" not in request_body
     assert "barcode" not in request_body
     assert "barcodeType" not in request_body
+
+
+def test_custom_food_readback_normalizes_metric_100g_without_named_serving() -> None:
+    client = FatSecretClient(_account("tg11"), _device())
+    correct_xml = """
+    <recipe><id>1</id><title>КСБ-80</title><isOwn>True</isOwn><servingSize>100г</servingSize>
+    <gramsPerPortion>100</gramsPerPortion><energyPerPortion>380</energyPerPortion>
+    <recipeportion><id>-1</id><description>g</description><gramWeight>100</gramWeight></recipeportion></recipe>
+    """
+    legacy_bad_xml = """
+    <recipe><id>2</id><title>Стрипсы</title><isOwn>True</isOwn><servingSize>100g</servingSize>
+    <gramsPerPortion>100</gramsPerPortion><energyPerPortion>260</energyPerPortion>
+    <recipeportion><id>99</id><description>100g</description><gramWeight>100</gramWeight></recipeportion>
+    <recipeportion><id>-1</id><description>g</description><gramWeight>100</gramWeight></recipeportion></recipe>
+    """
+
+    correct = client._parse_custom_food_definition(correct_xml, "1")
+    legacy_bad = client._parse_custom_food_definition(legacy_bad_xml, "2")
+
+    assert correct.serving_size == ""
+    assert correct.metric_serving_size == "100g"
+    assert legacy_bad.serving_size == "100g"
 
 
 def test_lookup_barcode_uses_app_scan_contract_and_parses_match() -> None:
