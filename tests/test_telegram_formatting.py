@@ -660,6 +660,26 @@ def test_custom_food_brand_rejects_stale_suggestion_without_changing_current_cho
     assert "устарел" in query.edit_message_text.await_args.args[0]
 
 
+def test_custom_food_macro_step_notifies_user_about_inconsistent_kbju() -> None:
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(
+        user_data={
+            "mode": "custom_food_macros",
+            "custom_food_title": "QA impossible macros",
+        }
+    )
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._handle_custom_food_macros(update, context, "100 0 100 0"))
+
+    notification = message.reply_text.await_args.args[0]
+    assert "4×Б + 9×Ж + 4×У" in notification
+    assert "примерно 900 ккал" in notification
+    assert context.user_data["mode"] == "custom_food_macros"
+    assert "custom_food_definition" not in context.user_data
+
+
 def test_next_food_usage_refresh_runs_at_noon_in_bot_timezone() -> None:
     bot = object.__new__(TelegramRecipeBot)
     bot.sync_engine = type("Engine", (), {"timezone": "Europe/Minsk"})()

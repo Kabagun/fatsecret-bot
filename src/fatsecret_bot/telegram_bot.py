@@ -37,6 +37,7 @@ from .models import (
     RecipeGroup,
     RemoteRecipeVariant,
 )
+from .nutrition import custom_food_macro_error
 from .storage import Storage, normalize_title
 from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 
@@ -197,6 +198,8 @@ def _parse_custom_food_macros(text: str) -> dict[str, Decimal]:
         value > Decimal("1000") for value in (protein, fat, carbohydrate)
     ):
         raise ValueError("Проверь значения на 100 г: одно из них слишком большое.")
+    if error := custom_food_macro_error(calories, protein, fat, carbohydrate):
+        raise ValueError(error)
     return {
         "calories": calories,
         "protein": protein,
@@ -225,6 +228,24 @@ def _format_custom_food_draft(definition: CustomFoodDefinition) -> str:
         f"Углеводы: {_format_decimal_plain(definition.nutrients['carbohydrate'])} г"
         f"{brand}{barcode}\n\n"
         "Продукт будет создан во всех FatSecret аккаунтах активной группы."
+    )
+
+
+def _format_custom_food_created(
+    title: str,
+    food_ids: dict[str, str],
+    account_labels: dict[str, str],
+) -> str:
+    lines = [
+        f"{html.escape(account_labels.get(account_key, account_key))}: "
+        f"<code>{html.escape(food_id)}</code>"
+        for account_key, food_id in sorted(food_ids.items())
+    ]
+    return (
+        f"Продукт <b>{html.escape(title)}</b> создан и проверен:\n"
+        + "\n".join(lines)
+        + "\n\nFatSecret может добавить новый продукт в поиск с задержкой в несколько минут. "
+        "Если его пока нет, подожди и повтори поиск в нужном аккаунте по точному названию."
     )
 
 
@@ -3538,14 +3559,9 @@ class TelegramRecipeBot:
             return
 
         account_labels = self._account_labels_for_group(str(group_id))
-        lines = [
-            f"{html.escape(account_labels.get(account_key, account_key))}: "
-            f"<code>{html.escape(food_id)}</code>"
-            for account_key, food_id in sorted(created.food_ids.items())
-        ]
         context.user_data.clear()
         await query.edit_message_text(
-            f"Продукт <b>{html.escape(created.title)}</b> создан и проверен:\n" + "\n".join(lines),
+            _format_custom_food_created(created.title, created.food_ids, account_labels),
             parse_mode=ParseMode.HTML,
         )
         await self._ensure_main_keyboard(query.message, context)

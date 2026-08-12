@@ -37,6 +37,7 @@ from .models import (
     Recipe,
     RemoteRecipeVariant,
 )
+from .nutrition import custom_food_macro_error, estimated_macro_energy
 from .portions import grams_from_portion, is_explicit_weight_portion, portion_unit_size
 from .recipe_compare import recipe_content_fingerprint, recipe_fingerprint, recipe_fingerprint_diff
 from .storage import Storage, normalize_title
@@ -582,7 +583,7 @@ def _macro_energy(
 ) -> Decimal | None:
     if protein is None or fat is None or carbohydrate is None:
         return None
-    return protein * Decimal("4") + fat * Decimal("9") + carbohydrate * Decimal("4")
+    return estimated_macro_energy(protein, fat, carbohydrate)
 
 
 def _correct_energy(
@@ -1457,6 +1458,13 @@ class RecipeSyncEngine:
             value = definition.nutrients.get(name)
             if value is None or not value.is_finite() or value < 0 or value > maximum:
                 raise FatSecretError("Ккал, белки, жиры и углеводы должны быть неотрицательными числами.")
+        if error := custom_food_macro_error(
+            definition.nutrients["calories"],
+            definition.nutrients["protein"],
+            definition.nutrients["totalFat"],
+            definition.nutrients["carbohydrate"],
+        ):
+            raise FatSecretError(error)
         if definition.barcode and definition.barcode_type not in {
             "EAN_8",
             "EAN_13",

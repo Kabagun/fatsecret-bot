@@ -3538,6 +3538,21 @@ def test_suggest_custom_food_brands_ranks_canonical_matches_and_caches_catalog(t
         storage.close()
 
 
+def test_custom_food_engine_rejects_inconsistent_macro_energy() -> None:
+    definition = replace(
+        _qa_custom_food_definition(),
+        nutrients={
+            "calories": Decimal("100"),
+            "protein": Decimal("0"),
+            "totalFat": Decimal("100"),
+            "carbohydrate": Decimal("0"),
+        },
+    )
+
+    with pytest.raises(FatSecretError, match=r"примерно 900 ккал, но указано 100 ккал"):
+        RecipeSyncEngine._validate_custom_food_definition(definition)
+
+
 def test_create_custom_food_for_group_journals_verifies_maps_and_reuses(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

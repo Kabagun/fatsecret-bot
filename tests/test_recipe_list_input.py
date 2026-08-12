@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from fatsecret_bot.models import CustomFoodDefinition, Ingredient
 from fatsecret_bot.sync import RecipeListItem, ResolvedRecipeListItem
 from fatsecret_bot.telegram_bot import (
     _format_recipe_list_draft,
     _format_custom_food_draft,
+    _format_custom_food_created,
     _format_resolved_item,
     _parse_recipe_list_lines,
     _parse_recipe_list_payload,
@@ -28,6 +31,20 @@ def test_custom_food_macro_parser_uses_compact_per_100g_order() -> None:
         "totalFat": Decimal("8"),
         "carbohydrate": Decimal("30"),
     }
+
+
+def test_custom_food_macro_parser_rejects_impossible_calories_for_fat() -> None:
+    with pytest.raises(ValueError, match=r"примерно 900 ккал, но указано 100 ккал"):
+        _parse_custom_food_macros("100 0 100 0")
+
+
+def test_custom_food_macro_parser_allows_normal_label_rounding() -> None:
+    assert _parse_custom_food_macros("250 12 8 30")["calories"] == Decimal("250")
+
+
+def test_custom_food_macro_parser_rejects_impossible_macro_mass() -> None:
+    with pytest.raises(ValueError, match=r"сумма белков, жиров и углеводов равна 120 г"):
+        _parse_custom_food_macros("480 40 40 40")
 
 
 def test_custom_food_confirmation_shows_brand_barcode_and_group_scope() -> None:
@@ -54,6 +71,19 @@ def test_custom_food_confirmation_shows_brand_barcode_and_group_scope() -> None:
     assert "Burger King" in text
     assert "4006381333931" in text
     assert "во всех FatSecret аккаунтах" in text
+
+
+def test_custom_food_created_message_explains_search_index_delay() -> None:
+    text = _format_custom_food_created(
+        "Стрипсы куриные",
+        {"a2": "134894994", "a1": "134894999"},
+        {"a1": "Святичек", "a2": "Анечка"},
+    )
+
+    assert "Святичек: <code>134894999</code>" in text
+    assert "Анечка: <code>134894994</code>" in text
+    assert "с задержкой в несколько минут" in text
+    assert "по точному названию" in text
 
 
 def test_custom_food_optional_steps_have_explicit_skip_buttons() -> None:
