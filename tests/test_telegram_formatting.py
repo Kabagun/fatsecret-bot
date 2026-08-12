@@ -544,6 +544,9 @@ def test_custom_food_skip_buttons_advance_optional_steps() -> None:
             "custom_food_barcode": "4006381333931",
             "custom_food_barcode_type": "EAN_13",
             "custom_food_manufacturer_name": "stale brand",
+            "custom_food_brand_query": "stale query",
+            "custom_food_brand_suggestions": ["stale suggestion"],
+            "custom_food_brand_choice_token": "stale token",
         }
     )
     bot = object.__new__(TelegramRecipeBot)
@@ -565,20 +568,43 @@ def test_custom_food_skip_buttons_advance_optional_steps() -> None:
 
     assert context.user_data["mode"] == "custom_food_macros"
     assert "custom_food_manufacturer_name" not in context.user_data
+    assert "custom_food_brand_query" not in context.user_data
+    assert "custom_food_brand_suggestions" not in context.user_data
+    assert "custom_food_brand_choice_token" not in context.user_data
 
 
 def test_custom_food_brand_is_normalized_and_added_to_definition() -> None:
-    message = SimpleNamespace(reply_text=AsyncMock())
+    status = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(reply_text=AsyncMock(return_value=status))
     update = SimpleNamespace(effective_message=message)
     context = SimpleNamespace(
         user_data={
             "mode": "custom_food_brand",
             "custom_food_title": "QA Burger",
+            "group_id": "group",
         }
     )
     bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = SimpleNamespace(
+        suggest_custom_food_brands=AsyncMock(return_value=["Burger King"]),
+    )
 
     asyncio.run(bot._handle_custom_food_brand(update, context, "  Burger   King  "))
+
+    assert context.user_data["custom_food_brand_query"] == "Burger King"
+    assert context.user_data["custom_food_brand_suggestions"] == ["Burger King"]
+    assert context.user_data["mode"] == "custom_food_brand_choice"
+    choice_token = context.user_data["custom_food_brand_choice_token"]
+    suggestion_buttons = [
+        button.callback_data
+        for row in status.edit_text.await_args.kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert f"food_brand_pick:{choice_token}:0" in suggestion_buttons
+    assert f"food_brand_custom:{choice_token}" in suggestion_buttons
+
+    query = SimpleNamespace(edit_message_text=AsyncMock())
+    asyncio.run(bot._pick_custom_food_brand(query, context, f"{choice_token}:0"))
 
     assert context.user_data["custom_food_manufacturer_name"] == "Burger King"
     assert context.user_data["mode"] == "custom_food_macros"
@@ -588,6 +614,50 @@ def test_custom_food_brand_is_normalized_and_added_to_definition() -> None:
     definition = context.user_data["custom_food_definition"]
     assert definition.manufacturer_name == "Burger King"
     assert context.user_data["mode"] == "custom_food_confirm"
+
+
+def test_custom_food_brand_allows_explicit_new_free_text_when_catalog_has_no_match() -> None:
+    status = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(reply_text=AsyncMock(return_value=status))
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(
+        user_data={
+            "mode": "custom_food_brand",
+            "custom_food_title": "QA custom brand",
+            "group_id": "group",
+        }
+    )
+    bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = SimpleNamespace(
+        suggest_custom_food_brands=AsyncMock(return_value=[]),
+    )
+
+    asyncio.run(bot._handle_custom_food_brand(update, context, "  Новый   Бренд  "))
+    query = SimpleNamespace(edit_message_text=AsyncMock())
+    choice_token = context.user_data["custom_food_brand_choice_token"]
+    asyncio.run(bot._use_custom_food_brand_text(query, context, choice_token))
+
+    assert context.user_data["custom_food_manufacturer_name"] == "Новый Бренд"
+    assert context.user_data["mode"] == "custom_food_macros"
+
+
+def test_custom_food_brand_rejects_stale_suggestion_without_changing_current_choice() -> None:
+    context = SimpleNamespace(
+        user_data={
+            "mode": "custom_food_brand_choice",
+            "custom_food_brand_query": "Санта",
+            "custom_food_brand_suggestions": ["Санта"],
+            "custom_food_brand_choice_token": "current",
+        }
+    )
+    query = SimpleNamespace(edit_message_text=AsyncMock())
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._pick_custom_food_brand(query, context, "old:0"))
+
+    assert context.user_data["mode"] == "custom_food_brand_choice"
+    assert context.user_data["custom_food_brand_suggestions"] == ["Санта"]
+    assert "устарел" in query.edit_message_text.await_args.args[0]
 
 
 def test_next_food_usage_refresh_runs_at_noon_in_bot_timezone() -> None:

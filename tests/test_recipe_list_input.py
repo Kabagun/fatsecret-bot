@@ -14,6 +14,7 @@ from fatsecret_bot.telegram_bot import (
     _parse_custom_food_macros,
     _custom_food_barcode_keyboard,
     _custom_food_brand_keyboard,
+    _custom_food_brand_suggestions_keyboard,
     _recipe_list_candidate_keyboard,
     _recipe_list_draft_keyboard,
     _recipe_list_input_error_keyboard,
@@ -69,6 +70,23 @@ def test_custom_food_optional_steps_have_explicit_skip_buttons() -> None:
 
     assert ("Без штрих-кода", "food_skip_barcode:0") in barcode_buttons
     assert ("Без бренда", "food_skip_brand:0") in brand_buttons
+
+
+def test_custom_food_brand_suggestions_use_index_callbacks_and_keep_fallbacks() -> None:
+    buttons = [
+        (button.text, button.callback_data)
+        for row in _custom_food_brand_suggestions_keyboard(
+            ["Санта", "Санта Бремор"],
+            "санта",
+            "token",
+        ).inline_keyboard
+        for button in row
+    ]
+
+    assert ("Санта", "food_brand_pick:token:0") in buttons
+    assert ("Санта Бремор", "food_brand_pick:token:1") in buttons
+    assert ("Использовать введённое: санта", "food_brand_custom:token") in buttons
+    assert ("Без бренда", "food_skip_brand:0") in buttons
 
 
 def test_parse_recipe_list_lines_uses_last_number_as_grams() -> None:

@@ -279,6 +279,12 @@ class FakeGroupCustomFoodClient(FakeFatSecretClient):
         self.timeout_after_first_create = timeout_after_first_create
         self.barcode_food_ids: dict[str, str] = {}
         self.remap_calls: list[tuple[str, str, bool, str | None]] = []
+        self.brand_catalog: list[str] = []
+        self.brand_catalog_calls = 0
+
+    async def list_custom_food_brands(self) -> list[str]:
+        self.brand_catalog_calls += 1
+        return list(self.brand_catalog)
 
     async def search_food(self, query: str, page: int = 0) -> list[FoodSearchResult]:
         return [
@@ -3506,6 +3512,30 @@ def _qa_custom_food_definition(*, barcode: str = "") -> CustomFoodDefinition:
         barcode=barcode,
         barcode_type="EAN_13" if barcode else "",
     )
+
+
+def test_suggest_custom_food_brands_ranks_canonical_matches_and_caches_catalog(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        client = FakeGroupCustomFoodClient("a1")
+        client.brand_catalog = [
+            "Santa Maria",
+            "Санта Ритейл",
+            "Санта",
+            "Санта Бремор",
+            "Несквик",
+        ]
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": client}  # type: ignore[method-assign]
+
+        first = asyncio.run(engine.suggest_custom_food_brands("group", "  санта  "))
+        second = asyncio.run(engine.suggest_custom_food_brands("group", "санта б"))
+
+        assert first == ["Санта", "Санта Бремор", "Санта Ритейл"]
+        assert second == ["Санта Бремор"]
+        assert client.brand_catalog_calls == 1
+    finally:
+        storage.close()
 
 
 def test_create_custom_food_for_group_journals_verifies_maps_and_reuses(tmp_path) -> None:

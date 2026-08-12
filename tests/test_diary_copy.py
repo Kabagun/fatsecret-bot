@@ -476,6 +476,33 @@ def test_facebook_source_is_not_custom_when_is_own_is_false() -> None:
         raise AssertionError("expected public Facebook food to stay non-custom")
 
 
+def test_list_custom_food_brands_uses_quick_picks_manufacturer_catalog() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            text="""
+            <item><man>true</man><manType>Manufacturer</manType>
+              <item><name>Санта</name></item>
+              <item><name>  Санта   Бремор </name></item>
+              <item><name>санта</name></item>
+            </item>
+            """,
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = FatSecretClient(_account("tg11"), _device(), http=http, session=FatSecretSession("s", "d", "k"))
+    try:
+        brands = asyncio.run(client.list_custom_food_brands())
+    finally:
+        asyncio.run(http.aclose())
+
+    assert brands == ["Санта", "Санта Бремор"]
+    assert requests[0].url.path == "/android/QuickPicksAndroidPage.aspx"
+
+
 def test_create_custom_food_uses_apk_saveregional_contract() -> None:
     request_body: dict[str, list[str]] = {}
 

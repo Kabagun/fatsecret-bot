@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 SEARCH_TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 INGREDIENT_NORMALIZE_CONCURRENCY = 6
 MAX_DIARY_COPY_DAYS = 7
+CUSTOM_FOOD_BRAND_CATALOG_TTL = dt.timedelta(hours=24)
 
 
 @dataclass(frozen=True)
@@ -955,6 +956,10 @@ class RecipeSyncEngine:
         self.storage = storage
         self.device = device
         self.timezone = timezone
+        self._custom_food_brand_catalogs: dict[
+            tuple[str, str],
+            tuple[dt.datetime, tuple[str, ...]],
+        ] = {}
 
     async def close(self) -> None:
         return None
@@ -1009,6 +1014,47 @@ class RecipeSyncEngine:
             await client.login()
         finally:
             await client.close()
+
+    async def suggest_custom_food_brands(
+        self,
+        group_id: str,
+        query: str,
+        *,
+        limit: int = 6,
+    ) -> list[str]:
+        """Return ranked canonical brand names for the active group's FatSecret locale."""
+        normalized_query = normalize_title(query)
+        if not normalized_query:
+            return []
+        limit = max(1, min(limit, 8))
+        clients = self._build_clients(group_id)
+        try:
+            source = next(iter(clients.values()))
+            catalog_key = (source.account.market.casefold(), source.account.language.casefold())
+            now = dt.datetime.now(dt.timezone.utc)
+            cached = self._custom_food_brand_catalogs.get(catalog_key)
+            if cached is None or now - cached[0] >= CUSTOM_FOOD_BRAND_CATALOG_TTL:
+                catalog = tuple(await source.list_custom_food_brands())
+                self._custom_food_brand_catalogs[catalog_key] = (now, catalog)
+            else:
+                catalog = cached[1]
+        finally:
+            await self._close_clients(clients)
+
+        def rank(brand: str) -> tuple[int, int, str]:
+            normalized_brand = normalize_title(brand)
+            if normalized_brand == normalized_query:
+                match_type = 0
+            elif normalized_brand.startswith(normalized_query):
+                match_type = 1
+            elif any(word.startswith(normalized_query) for word in normalized_brand.split()):
+                match_type = 2
+            else:
+                match_type = 3
+            return match_type, len(normalized_brand), normalized_brand
+
+        matches = [brand for brand in catalog if normalized_query in normalize_title(brand)]
+        return sorted(matches, key=rank)[:limit]
 
     async def prepare_diary_copy(
         self,

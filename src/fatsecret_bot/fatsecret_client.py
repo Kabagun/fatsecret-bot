@@ -589,6 +589,31 @@ class FatSecretClient:
         )
         return self._parse_custom_food_definition(response.text, remote_id)
 
+    async def list_custom_food_brands(self) -> list[str]:
+        """Load canonical manufacturer names from the app's locale-specific quick picks."""
+        response = await self._post_android("QuickPicksAndroidPage.aspx", {}, read_only=True)
+        try:
+            root = ET.fromstring(response.text)
+        except ET.ParseError as exc:
+            raise FatSecretError(f"{self.account.label}: invalid manufacturer catalog XML") from exc
+
+        brands: list[str] = []
+        seen: set[str] = set()
+        for group in root.iter("item"):
+            if not _bool_value(_text(group, "man")):
+                continue
+            if _text(group, "manType").casefold() != "manufacturer":
+                continue
+            for item in group.findall("item"):
+                brand = " ".join(_text(item, "name").split())
+                key = brand.casefold()
+                if brand and key not in seen:
+                    seen.add(key)
+                    brands.append(brand)
+        if not brands:
+            raise FatSecretError(f"{self.account.label}: manufacturer catalog is empty")
+        return brands
+
     async def create_custom_food(self, definition: CustomFoodDefinition) -> str:
         """Create a user-owned food and return its new FatSecret recipe id."""
         logger.info(

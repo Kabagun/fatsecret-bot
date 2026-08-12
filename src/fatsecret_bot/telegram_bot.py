@@ -246,6 +246,31 @@ def _custom_food_brand_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _custom_food_brand_suggestions_keyboard(
+    suggestions: list[str],
+    entered_brand: str,
+    choice_token: str,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(brand[:60], callback_data=f"food_brand_pick:{choice_token}:{index}")]
+        for index, brand in enumerate(suggestions)
+    ]
+    entered_label = entered_brand if len(entered_brand) <= 42 else f"{entered_brand[:39]}..."
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Использовать введённое: {entered_label}",
+                    callback_data=f"food_brand_custom:{choice_token}",
+                )
+            ],
+            [InlineKeyboardButton("Без бренда", callback_data="food_skip_brand:0")],
+            [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 def _custom_food_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -1877,6 +1902,10 @@ class TelegramRecipeBot:
             await self._skip_custom_food_barcode(query, context)
         elif action == "food_skip_brand":
             await self._skip_custom_food_brand(query, context)
+        elif action == "food_brand_pick":
+            await self._pick_custom_food_brand(query, context, value)
+        elif action == "food_brand_custom":
+            await self._use_custom_food_brand_text(query, context, value)
         elif action == "food_ignore_known_barcode":
             await self._ignore_known_custom_food_barcode(query, context)
         elif action == "food_create":
@@ -2761,7 +2790,7 @@ class TelegramRecipeBot:
             await self._handle_custom_food_title(update, context, text)
         elif mode == "custom_food_barcode":
             await self._handle_custom_food_barcode_text(update, context, text)
-        elif mode == "custom_food_brand":
+        elif mode in {"custom_food_brand", "custom_food_brand_choice"}:
             await self._handle_custom_food_brand(update, context, text)
         elif mode == "custom_food_macros":
             await self._handle_custom_food_macros(update, context, text)
@@ -3049,6 +3078,9 @@ class TelegramRecipeBot:
             "custom_food_barcode",
             "custom_food_barcode_type",
             "custom_food_manufacturer_name",
+            "custom_food_brand_query",
+            "custom_food_brand_suggestions",
+            "custom_food_brand_choice_token",
             "custom_food_definition",
             "custom_food_unresolved_index",
             "custom_food_requested_query",
@@ -3066,8 +3098,9 @@ class TelegramRecipeBot:
     @staticmethod
     def _custom_food_brand_prompt() -> str:
         return (
-            "Пришли <b>бренд продукта</b>, например <code>McDonald's</code> или "
-            "<code>Burger King</code>, либо нажми «Без бренда»."
+            "Пришли <b>бренд продукта</b> или его часть, например <code>McDonald's</code> или "
+            "<code>Санта</code>. Я предложу существующее название из FatSecret. "
+            "Также можно нажать «Без бренда»."
         )
 
     async def _start_recipe_list_food_create(
@@ -3287,7 +3320,12 @@ class TelegramRecipeBot:
     ) -> None:
         brand = " ".join(text.strip().split())
         if brand == "-":
-            context.user_data.pop("custom_food_manufacturer_name", None)
+            self._set_custom_food_brand(context, "")
+            await update.effective_message.reply_text(
+                self._custom_food_macros_prompt(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
         elif not brand:
             await update.effective_message.reply_text(
                 "Название бренда не должно быть пустым. Введи бренд или нажми «Без бренда».",
@@ -3300,17 +3338,112 @@ class TelegramRecipeBot:
                 reply_markup=_custom_food_brand_keyboard(),
             )
             return
+        group_id = context.user_data.get("group_id")
+        if not group_id:
+            await update.effective_message.reply_text("Активная группа потеряна. Начни создание продукта заново.")
+            return
+
+        status = await update.effective_message.reply_text("Ищу существующий бренд в FatSecret...")
+        catalog_error = False
+        try:
+            suggestions = await self.sync_engine.suggest_custom_food_brands(str(group_id), brand)
+        except Exception:  # noqa: BLE001 - catalog failure must not block manual product creation.
+            logger.exception("custom food manufacturer catalog lookup failed")
+            suggestions = []
+            catalog_error = True
+
+        context.user_data.pop("custom_food_manufacturer_name", None)
+        context.user_data["custom_food_brand_query"] = brand
+        context.user_data["custom_food_brand_suggestions"] = suggestions
+        choice_token = f"{time.monotonic_ns():x}"[-10:]
+        context.user_data["custom_food_brand_choice_token"] = choice_token
+        context.user_data["mode"] = "custom_food_brand_choice"
+        if suggestions:
+            prompt = (
+                "Нашёл существующие бренды. Выбери каноническое название FatSecret либо явно "
+                "используй введённый вариант. Можно также прислать другой запрос."
+            )
+        elif catalog_error:
+            prompt = (
+                "Каталог брендов сейчас недоступен. Можно явно использовать введённый вариант, "
+                "прислать другой запрос или продолжить без бренда."
+            )
         else:
-            context.user_data["custom_food_manufacturer_name"] = brand
-        context.user_data["mode"] = "custom_food_macros"
-        await update.effective_message.reply_text(
-            self._custom_food_macros_prompt(),
-            parse_mode=ParseMode.HTML,
+            prompt = (
+                "Совпадений в каталоге FatSecret не найдено. Можно явно использовать введённый "
+                "вариант как новый, прислать другой запрос или продолжить без бренда."
+            )
+        await status.edit_text(
+            prompt,
+            reply_markup=_custom_food_brand_suggestions_keyboard(suggestions, brand, choice_token),
         )
 
-    async def _skip_custom_food_brand(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
-        context.user_data.pop("custom_food_manufacturer_name", None)
+    @staticmethod
+    def _set_custom_food_brand(context: ContextTypes.DEFAULT_TYPE, brand: str) -> None:
+        if brand:
+            context.user_data["custom_food_manufacturer_name"] = brand
+        else:
+            context.user_data.pop("custom_food_manufacturer_name", None)
+        context.user_data.pop("custom_food_brand_query", None)
+        context.user_data.pop("custom_food_brand_suggestions", None)
+        context.user_data.pop("custom_food_brand_choice_token", None)
         context.user_data["mode"] = "custom_food_macros"
+
+    async def _pick_custom_food_brand(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        value: str,
+    ) -> None:
+        choice_token, separator, index_text = value.partition(":")
+        try:
+            index = int(index_text)
+        except ValueError:
+            index = -1
+        suggestions = context.user_data.get("custom_food_brand_suggestions")
+        expected_token = str(context.user_data.get("custom_food_brand_choice_token") or "")
+        if expected_token and choice_token != expected_token:
+            await query.edit_message_text("Этот список брендов устарел. Используй последнее сообщение бота.")
+            return
+        if (
+            not separator
+            or not expected_token
+            or not isinstance(suggestions, list)
+            or index < 0
+            or index >= len(suggestions)
+        ):
+            await query.edit_message_text(
+                "Список брендов устарел. Пришли название бренда ещё раз.",
+                reply_markup=_custom_food_brand_keyboard(),
+            )
+            context.user_data["mode"] = "custom_food_brand"
+            return
+        self._set_custom_food_brand(context, str(suggestions[index]))
+        await query.edit_message_text(self._custom_food_macros_prompt(), parse_mode=ParseMode.HTML)
+
+    async def _use_custom_food_brand_text(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        choice_token: str,
+    ) -> None:
+        brand = str(context.user_data.get("custom_food_brand_query") or "").strip()
+        expected_token = str(context.user_data.get("custom_food_brand_choice_token") or "")
+        if expected_token and choice_token != expected_token:
+            await query.edit_message_text("Этот список брендов устарел. Используй последнее сообщение бота.")
+            return
+        if not brand or not expected_token:
+            await query.edit_message_text(
+                "Введённое название потеряно. Пришли бренд ещё раз.",
+                reply_markup=_custom_food_brand_keyboard(),
+            )
+            context.user_data["mode"] = "custom_food_brand"
+            return
+        self._set_custom_food_brand(context, brand)
+        await query.edit_message_text(self._custom_food_macros_prompt(), parse_mode=ParseMode.HTML)
+
+    async def _skip_custom_food_brand(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self._set_custom_food_brand(context, "")
         await query.edit_message_text(self._custom_food_macros_prompt(), parse_mode=ParseMode.HTML)
 
     async def _handle_custom_food_macros(
