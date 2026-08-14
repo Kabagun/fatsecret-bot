@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from fatsecret_bot.models import Ingredient, Recipe, RemoteRecipeVariant
 from fatsecret_bot.recipe_compare import recipe_fingerprint
 from fatsecret_bot.storage import Storage
-from fatsecret_bot.sync import RecipeCreateResult
+from fatsecret_bot.sync import AccountSyncResult, RecipeCreateResult
 from fatsecret_bot.telegram_bot import (
     TelegramRecipeBot,
     _compare_recipe_products,
@@ -128,9 +128,9 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     assert "1. Смешать" in text
 
 
-def test_format_recipe_conflict_labels_both_account_versions() -> None:
+def test_format_recipe_conflict_shows_only_differing_fields() -> None:
     first = Recipe(id="local", title="Омлет", portions=Decimal("2"), steps=["Смешать"])
-    second = Recipe(id="local", title="Омлет", portions=Decimal("4"), steps=["Запечь"])
+    second = Recipe(id="local", title="Омлет", portions=Decimal("4"), steps=["Смешать"])
     variants = [
         RemoteRecipeVariant("tg11", "111", first, recipe_fingerprint(first)),
         RemoteRecipeVariant("tg22", "222", second, recipe_fingerprint(second)),
@@ -139,9 +139,13 @@ def test_format_recipe_conflict_labels_both_account_versions() -> None:
     text = _format_recipe_conflict(variants, {"tg11": "thekabaye", "tg22": "Святичек"})
 
     assert "Версии рецепта различаются" in text
-    assert "thekabaye" in text and "ID <code>111</code>" in text
-    assert "Святичек" in text and "ID <code>222</code>" in text
-    assert "Порций: 2" in text and "Порций: 4" in text
+    assert "<b>Порций</b>" in text
+    assert "• thekabaye — 2" in text
+    assert "• Святичек — 4" in text
+    assert "Ингредиенты и остальные поля совпадают." in text
+    assert "ID <code>" not in text
+    assert "<b>Ингредиенты</b>" not in text
+    assert "<b>Шаги</b>" not in text
 
 
 def _recipe_variant(account_key: str, remote_id: str, ingredients: list[Ingredient]) -> RemoteRecipeVariant:
@@ -309,9 +313,11 @@ def test_recipe_actions_keyboard_keeps_only_recipe_actions_and_list_return() -> 
     rows = keyboard.inline_keyboard
 
     assert [button.text for button in rows[0]] == ["Синхронизировать"]
-    assert [button.text for button in rows[1]] == ["Удалить в FatSecret"]
-    assert [button.text for button in rows[2]] == ["К списку"]
-    assert rows[2][0].callback_data == "list:1"
+    assert [button.text for button in rows[1]] == ["Переименовать"]
+    assert rows[1][0].callback_data == "recipe_rename:recipe-1"
+    assert [button.text for button in rows[2]] == ["Удалить в FatSecret"]
+    assert [button.text for button in rows[3]] == ["К списку"]
+    assert rows[3][0].callback_data == "list:1"
     flat_texts = [button.text for row in rows for button in row]
     assert "Назад" not in flat_texts
     assert "Дальше" not in flat_texts
@@ -808,6 +814,82 @@ def test_recipe_cache_is_reloaded_from_authoritative_cookbook_after_sync() -> No
     assert refreshed is True
     assert bot._recipe_cache(context, "group") == [fresh]
     bot.sync_engine.load_remote_recipe_index.assert_awaited_once_with("group")
+
+
+def test_recipe_rename_replaces_duplicate_only_after_selected_recipe_is_renamed(tmp_path) -> None:
+    selected = Recipe(
+        id="selected",
+        title="Старое имя",
+        group_id="group",
+        remote_ids={"tg11": "111"},
+        remote_ids_by_account={"tg11": ["111"]},
+    )
+    duplicate = Recipe(
+        id="duplicate",
+        title="Новое имя",
+        group_id="group",
+        remote_ids={"tg11": "222"},
+        remote_ids_by_account={"tg11": ["222"]},
+    )
+    renamed = Recipe(
+        id="renamed",
+        title="Новое имя",
+        group_id="group",
+        remote_ids={"tg11": "111"},
+        remote_ids_by_account={"tg11": ["111"]},
+    )
+
+    class FakeTarget:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def edit_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+            self.messages.append(text)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, set[tuple[str, str]]]] = []
+            self.loads = 0
+
+        async def load_remote_recipe_index(self, group_id: str) -> list[Recipe]:
+            self.loads += 1
+            return [selected, duplicate] if self.loads == 1 else [renamed]
+
+        async def rename_live_recipe_everywhere(self, recipe: Recipe, title: str) -> list[AccountSyncResult]:
+            self.events.append(("rename", {(key, value) for key, value in recipe.remote_ids.items()}))
+            assert title == "Новое имя"
+            return [AccountSyncResult("tg11", "111", True, "переименован")]
+
+        async def delete_live_recipe_everywhere(self, recipe: Recipe) -> list[AccountSyncResult]:
+            self.events.append(("delete", {(key, value) for key, value in recipe.remote_ids.items()}))
+            return [AccountSyncResult("tg11", "222", True, "удален")]
+
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = FakeEngine()
+        context = SimpleNamespace(
+            user_data={
+                "recipe_rename_title": "Новое имя",
+                "recipe_rename_group_id": "group",
+                "recipe_rename_updated_by": 11,
+                "recipe_rename_ref": selected,
+            },
+            chat_data={},
+        )
+        target = FakeTarget()
+
+        asyncio.run(bot._execute_recipe_rename(target, context, replace_existing=True))
+
+        assert bot.sync_engine.events == [
+            ("rename", {("tg11", "111")}),
+            ("delete", {("tg11", "222")}),
+        ]
+        assert "Прежний одноимённый рецепт удалён" in target.messages[-1]
+        assert context.user_data["current_recipe_id"] == "renamed"
+    finally:
+        storage.close()
 
 
 def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path) -> None:

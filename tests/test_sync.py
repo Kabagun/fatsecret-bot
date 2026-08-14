@@ -3402,6 +3402,36 @@ def test_delete_live_recipes_everywhere_does_not_require_local_recipe_rows(tmp_p
         storage.close()
 
 
+def test_rename_live_recipe_everywhere_updates_and_verifies_every_remote_identity(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_ref = Recipe(
+            id="local-live",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "111", "tg22": "222"},
+            remote_ids_by_account={"tg11": ["111", "112"], "tg22": ["222"]},
+        )
+        first = FakeFatSecretClient(Recipe(id="111", title="Омлет"), account_key="tg11")
+        first.recipes["112"] = Recipe(id="112", title="Омлет")
+        second = FakeFatSecretClient(Recipe(id="222", title="Омлет"), account_key="tg22")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
+
+        results = asyncio.run(engine.rename_live_recipe_everywhere(recipe_ref, "Омлет новый"))
+
+        assert [(result.account_key, result.remote_recipe_id, result.ok) for result in results] == [
+            ("tg11", "111", True),
+            ("tg11", "112", True),
+            ("tg22", "222", True),
+        ]
+        assert {recipe.title for recipe in first.recipes.values()} == {"Омлет новый"}
+        assert second.recipes["222"].title == "Омлет новый"
+        assert storage.remote_recipe_snapshot("tg11", "112")[0].title == "Омлет новый"
+    finally:
+        storage.close()
+
+
 def test_delete_live_recipe_removes_matching_local_mappings(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

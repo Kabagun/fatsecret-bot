@@ -163,23 +163,66 @@ def _format_recipe_conflict(
     variants: list[RemoteRecipeVariant],
     account_labels: dict[str, str],
 ) -> str:
-    """Render conflicting account versions without pretending that one is authoritative."""
-    sections = ["<b>Версии рецепта различаются</b>"]
-    for variant in variants:
-        label = account_labels.get(variant.account_key, variant.account_key)
-        ingredients = "\n".join(
-            f"- {html.escape(item.title)}: {html.escape(_format_ingredient_amount(item))}"
-            for item in variant.recipe.ingredients
-        ) or "Ингредиентов нет."
-        steps = "\n".join(_format_steps_lines(variant.recipe.steps, limit=10)) or "Шагов нет."
-        sections.append(
-            f"<b>{html.escape(label)}</b> · ID <code>{html.escape(variant.remote_recipe_id)}</code>\n"
-            f"Порций: {_format_decimal_plain(variant.recipe.portions)}; "
-            f"подготовка: {variant.recipe.prep_time} мин; готовка: {variant.recipe.cook_time} мин\n"
-            f"<b>Ингредиенты</b>\n{ingredients}\n<b>Шаги</b>\n{steps}"
+    """Render only differing fields instead of repeating every complete recipe."""
+    if not variants:
+        return ""
+
+    account_counts = Counter(variant.account_key for variant in variants)
+
+    def label(variant: RemoteRecipeVariant) -> str:
+        value = account_labels.get(variant.account_key, variant.account_key)
+        if account_counts[variant.account_key] > 1:
+            value = f"{value} (ID {variant.remote_recipe_id})"
+        return value
+
+    def add_field(lines: list[str], heading: str, values: list[str]) -> bool:
+        if len(set(values)) <= 1:
+            return False
+        lines.extend(["", f"<b>{html.escape(heading)}</b>"])
+        lines.extend(
+            f"• {html.escape(label(variant))} — {html.escape(value) if value else 'не указано'}"
+            for variant, value in zip(variants, values, strict=True)
         )
-    text = "\n\n".join(sections)
-    return text if len(text) <= 4000 else text[:3970] + "\n…"
+        return True
+
+    title = variants[0].recipe.title.strip() or "Рецепт"
+    lines = ["<b>Версии рецепта различаются</b>", "", f"<b>{html.escape(title)}</b>", "", "<b>Отличия</b>"]
+    differences_found = False
+    differences_found |= add_field(lines, "Название", [variant.recipe.title.strip() for variant in variants])
+    differences_found |= add_field(
+        lines,
+        "Порций",
+        [_format_decimal_plain(variant.recipe.portions) for variant in variants],
+    )
+    differences_found |= add_field(
+        lines,
+        "Подготовка",
+        [f"{variant.recipe.prep_time} мин" for variant in variants],
+    )
+    differences_found |= add_field(
+        lines,
+        "Готовка",
+        [f"{variant.recipe.cook_time} мин" for variant in variants],
+    )
+    differences_found |= add_field(
+        lines,
+        "Описание",
+        [variant.recipe.description.strip() for variant in variants],
+    )
+
+    steps_by_variant = [
+        [step.strip() for step in variant.recipe.steps if step.strip()]
+        for variant in variants
+    ]
+    max_steps = max((len(steps) for steps in steps_by_variant), default=0)
+    for index in range(max_steps):
+        values = [steps[index] if index < len(steps) else "отсутствует" for steps in steps_by_variant]
+        differences_found |= add_field(lines, f"Шаг {index + 1}", values)
+
+    if not differences_found:
+        lines.extend(["", "Различаются внутренние данные FatSecret."])
+    lines.extend(["", "Ингредиенты и остальные поля совпадают."])
+    return _truncate_html_lines(lines)
 
 
 def _format_decimal_plain(value: Decimal) -> str:
@@ -480,6 +523,7 @@ def _recipe_actions_keyboard(
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")],
+            [InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{recipe_id}")],
             [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}")],
             [InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")],
         ]
@@ -522,6 +566,67 @@ def _recipe_remote_identities(recipe: Recipe) -> set[tuple[str, str]]:
         for remote_id in remote_ids
     )
     return identities
+
+
+def _recipe_reference_for_identities(
+    recipe_id: str,
+    title: str,
+    group_id: str | None,
+    identities: set[tuple[str, str]],
+) -> Recipe:
+    """Build a live recipe reference containing only the supplied remote identities."""
+    remote_ids_by_account: dict[str, list[str]] = {}
+    for account_key, remote_id in sorted(identities):
+        remote_ids_by_account.setdefault(account_key, []).append(remote_id)
+    return Recipe(
+        id=recipe_id,
+        title=title,
+        group_id=group_id,
+        remote_ids={account_key: remote_ids[0] for account_key, remote_ids in remote_ids_by_account.items()},
+        remote_ids_by_account=remote_ids_by_account,
+    )
+
+
+def _fresh_recipe_reference(reference: Recipe, live_recipes: list[Recipe]) -> Recipe | None:
+    """Recover one logical selection by remote identity even after a partial title change."""
+    wanted = _recipe_remote_identities(reference)
+    live = set().union(*(_recipe_remote_identities(recipe) for recipe in live_recipes)) if live_recipes else set()
+    existing = wanted & live
+    if not existing:
+        return None
+    return _recipe_reference_for_identities(
+        reference.id,
+        reference.title,
+        reference.group_id,
+        existing,
+    )
+
+
+def _duplicate_recipe_reference(
+    live_recipes: list[Recipe],
+    title: str,
+    *,
+    exclude: set[tuple[str, str]],
+) -> Recipe | None:
+    """Return every live identity with a colliding title except the selected recipe itself."""
+    normalized = normalize_title(title)
+    identities = set().union(
+        *(
+            _recipe_remote_identities(recipe)
+            for recipe in live_recipes
+            if normalize_title(recipe.title) == normalized
+        )
+    ) if live_recipes else set()
+    identities -= exclude
+    if not identities:
+        return None
+    group_id = next((recipe.group_id for recipe in live_recipes if normalize_title(recipe.title) == normalized), None)
+    return _recipe_reference_for_identities(
+        f"rename-conflict:{normalized}",
+        title,
+        group_id,
+        identities,
+    )
 
 
 def _next_live_recipe_title(title: str, recipes: list[Recipe]) -> str:
@@ -1682,6 +1787,18 @@ class TelegramRecipeBot:
             await self._open_recipe_variant(query, context, int(value or "0"))
         elif action == "syncvariant":
             await self._sync_recipe_variant(query, context, int(value or "0"))
+        elif action == "recipe_rename":
+            await self._start_recipe_rename(query, context, value)
+        elif action == "recipe_rename_replace":
+            await self._execute_recipe_rename(query, context, replace_existing=True)
+        elif action == "recipe_rename_copy":
+            await self._execute_recipe_rename(query, context, create_copy=True)
+        elif action == "recipe_rename_retry":
+            await self._execute_recipe_rename(
+                query,
+                context,
+                replace_existing=bool(context.user_data.get("recipe_rename_replace_existing")),
+            )
         elif action == "noop":
             return
         elif action == "menu":
@@ -2132,6 +2249,282 @@ class TelegramRecipeBot:
         recipes = self._recipe_cache(context, group.id) or []
         return max(1, (len(recipes) + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE), "list"
 
+    async def _edit_recipe_rename_status(self, target, text: str, **kwargs) -> None:
+        """Edit either a callback query message or a status Message."""
+        edit = target.edit_message_text if hasattr(target, "edit_message_text") else target.edit_text
+        await edit(text, **kwargs)
+
+    def _recipe_rename_back_callback(self, context: ContextTypes.DEFAULT_TYPE, recipe_id: str) -> str:
+        page = max(0, int(context.user_data.get("recipe_list_page") or 0))
+        page_action = str(context.user_data.get("recipe_page_action") or "list")
+        page_action = page_action if page_action in {"list", "searchpage"} else "list"
+        return f"open:{recipe_id}:{page}:{page_action}"
+
+    async def _start_recipe_rename(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        recipe_id: str,
+    ) -> None:
+        group = self.storage.active_group_for_user(query.from_user.id)
+        recipe = self._cached_or_stored_recipe(context, group.id, recipe_id) if group is not None else None
+        if not await self._require_recipe_in_active_group(query, recipe):
+            return
+        context.user_data["mode"] = "recipe_rename"
+        context.user_data["recipe_rename_group_id"] = recipe.group_id
+        context.user_data["recipe_rename_updated_by"] = query.from_user.id
+        context.user_data["recipe_rename_ref"] = recipe
+        context.user_data.pop("recipe_rename_title", None)
+        context.user_data.pop("recipe_rename_replace_existing", None)
+        await query.edit_message_text(
+            f"Текущее имя: <b>{html.escape(recipe.title)}</b>\nПришли новое имя рецепта.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data=self._recipe_rename_back_callback(context, recipe.id))]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _handle_recipe_rename(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        title = text.strip()
+        reference = context.user_data.get("recipe_rename_ref")
+        group = self.storage.active_group_for_user(update.effective_user.id)
+        if not title:
+            await update.effective_message.reply_text("Название не должно быть пустым.")
+            return
+        if not isinstance(reference, Recipe) or group is None or reference.group_id != group.id:
+            context.user_data.clear()
+            await update.effective_message.reply_text("Контекст переименования устарел. Открой рецепт заново.")
+            return
+        if title == reference.title.strip():
+            for key in (
+                "mode",
+                "recipe_rename_group_id",
+                "recipe_rename_updated_by",
+                "recipe_rename_ref",
+                "recipe_rename_title",
+                "recipe_rename_conflict_ref",
+                "recipe_rename_replace_existing",
+            ):
+                context.user_data.pop(key, None)
+            await update.effective_message.reply_text(
+                "Название не изменилось.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Открыть рецепт", callback_data=self._recipe_rename_back_callback(context, reference.id))]]
+                ),
+            )
+            return
+        context.user_data["recipe_rename_title"] = title
+        status = await update.effective_message.reply_text("Проверяю актуальные названия рецептов в FatSecret...")
+        await self._execute_recipe_rename(status, context)
+
+    async def _show_recipe_rename_duplicate(
+        self,
+        target,
+        context: ContextTypes.DEFAULT_TYPE,
+        duplicate: Recipe,
+        live_recipes: list[Recipe],
+    ) -> None:
+        title = str(context.user_data.get("recipe_rename_title") or "").strip()
+        reference = context.user_data.get("recipe_rename_ref")
+        if not title or not isinstance(reference, Recipe):
+            await self._edit_recipe_rename_status(target, "Контекст переименования устарел. Открой рецепт заново.")
+            return
+        copy_title = _next_live_recipe_title(title, live_recipes)
+        context.user_data["mode"] = "recipe_rename_conflict"
+        context.user_data["recipe_rename_conflict_ref"] = duplicate
+        await self._edit_recipe_rename_status(
+            target,
+            "Рецепт с таким названием уже есть.\n\n"
+            "Можно обновить существующий: выбранный рецепт сохраню под новым именем, "
+            "а прежний одноимённый рецепт удалю только после успешного переименования.\n\n"
+            f"Для отдельной копии использую имя: <b>{html.escape(copy_title)}</b>",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Обновить существующий", callback_data="recipe_rename_replace:0")],
+                    [InlineKeyboardButton(f"Создать «{copy_title}»"[:60], callback_data="recipe_rename_copy:0")],
+                    [
+                        InlineKeyboardButton(
+                            "Отмена",
+                            callback_data=self._recipe_rename_back_callback(context, reference.id),
+                        )
+                    ],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _execute_recipe_rename(
+        self,
+        target,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        replace_existing: bool = False,
+        create_copy: bool = False,
+    ) -> None:
+        requested_title = str(context.user_data.get("recipe_rename_title") or "").strip()
+        group_id = str(context.user_data.get("recipe_rename_group_id") or "")
+        reference = context.user_data.get("recipe_rename_ref")
+        if not requested_title or not group_id or not isinstance(reference, Recipe):
+            await self._edit_recipe_rename_status(target, "Контекст переименования устарел. Открой рецепт заново.")
+            return
+
+        await self._edit_recipe_rename_status(target, "Проверяю актуальные названия рецептов в FatSecret...")
+        try:
+            live_recipes = await self.sync_engine.load_remote_recipe_index(group_id)
+        except Exception as exc:  # Rename must never use stale collision data.
+            logger.exception("live recipe rename check failed")
+            await self._edit_recipe_rename_status(
+                target,
+                f"Не удалось проверить актуальные названия рецептов: {user_safe_error_message(exc)}",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Повторить", callback_data="recipe_rename_retry:0")]]
+                ),
+            )
+            return
+        self._set_recipe_cache(context, group_id, live_recipes)
+        selected = _fresh_recipe_reference(reference, live_recipes)
+        if selected is None:
+            await self._edit_recipe_rename_status(
+                target,
+                "Выбранный рецепт изменился или был удалён. Обнови список и выбери его заново.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+            )
+            return
+
+        selected_identities = _recipe_remote_identities(reference)
+        final_title = _next_live_recipe_title(requested_title, live_recipes) if create_copy else requested_title
+        if create_copy:
+            context.user_data["recipe_rename_title"] = final_title
+        duplicate = _duplicate_recipe_reference(
+            live_recipes,
+            requested_title,
+            exclude=selected_identities,
+        )
+        if duplicate is not None and not replace_existing and not create_copy:
+            await self._show_recipe_rename_duplicate(target, context, duplicate, live_recipes)
+            return
+        context.user_data["recipe_rename_replace_existing"] = replace_existing
+
+        await self._edit_recipe_rename_status(target, "Переименовываю рецепт во всех FatSecret аккаунтах...")
+        try:
+            rename_results = await self.sync_engine.rename_live_recipe_everywhere(selected, final_title)
+        except Exception as exc:
+            logger.exception("recipe rename failed")
+            await self._edit_recipe_rename_status(
+                target,
+                f"Ошибка переименования: {user_safe_error_message(exc)}",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Повторить", callback_data="recipe_rename_retry:0")]]
+                ),
+            )
+            return
+        if not rename_results or not all(result.ok for result in rename_results):
+            account_labels = self._account_labels_for_group(group_id)
+            lines = [
+                f"{account_labels.get(result.account_key, result.account_key)}: "
+                f"{'OK' if result.ok else 'ERROR'} — {result.message}"
+                for result in rename_results
+            ]
+            await self._edit_recipe_rename_status(
+                target,
+                "Переименование выполнено не во всех аккаунтах. Другой рецепт не удалялся.\n\n"
+                + "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Повторить", callback_data="recipe_rename_retry:0")]]
+                ),
+            )
+            return
+
+        delete_results = []
+        if replace_existing and duplicate is not None:
+            await self._edit_recipe_rename_status(
+                target,
+                "Новое имя проверено во всех аккаунтах. Удаляю прежний одноимённый рецепт...",
+            )
+            try:
+                delete_results = await self.sync_engine.delete_live_recipe_everywhere(duplicate)
+            except Exception as exc:
+                logger.exception("duplicate recipe cleanup after rename failed")
+                await self._edit_recipe_rename_status(
+                    target,
+                    f"Рецепт переименован в «{html.escape(final_title)}», но прежний одноимённый рецепт "
+                    f"пока не удалён: {html.escape(user_safe_error_message(exc))}",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("Повторить очистку", callback_data="recipe_rename_retry:0")]]
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            if delete_results and not all(result.ok for result in delete_results):
+                account_labels = self._account_labels_for_group(group_id)
+                lines = [
+                    f"{html.escape(account_labels.get(result.account_key, result.account_key))}: "
+                    f"{'OK' if result.ok else 'ERROR'} — {html.escape(result.message)}"
+                    for result in delete_results
+                ]
+                await self._edit_recipe_rename_status(
+                    target,
+                    f"Рецепт переименован в «{html.escape(final_title)}», но старый одноимённый рецепт "
+                    "удалён не во всех аккаунтах.\n\n" + "\n".join(lines),
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("Повторить очистку", callback_data="recipe_rename_retry:0")]]
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+        try:
+            refreshed = await self.sync_engine.load_remote_recipe_index(group_id)
+            self._set_recipe_cache(context, group_id, refreshed)
+        except Exception:  # The verified remote rename remains successful.
+            logger.exception("recipe cache refresh after rename failed")
+            refreshed = []
+        selected_ids = _recipe_remote_identities(reference)
+        local_warning = ""
+        try:
+            self.storage.rename_recipe_for_remote_identities(
+                group_id,
+                selected_ids,
+                final_title,
+                int(context.user_data.get("recipe_rename_updated_by") or 0) or None,
+            )
+        except Exception:  # Remote readback is authoritative; surface the repair need.
+            logger.exception("local recipe title finalization after remote rename failed")
+            local_warning = " Локальный индекс не обновился; обнови список перед следующим действием."
+        renamed_card = next(
+            (recipe for recipe in refreshed if selected_ids & _recipe_remote_identities(recipe)),
+            None,
+        )
+        renamed_id = renamed_card.id if renamed_card is not None else reference.id
+        context.user_data["current_recipe_id"] = renamed_id
+        for key in (
+            "mode",
+            "recipe_rename_group_id",
+            "recipe_rename_updated_by",
+            "recipe_rename_ref",
+            "recipe_rename_title",
+            "recipe_rename_conflict_ref",
+            "recipe_rename_replace_existing",
+        ):
+            context.user_data.pop(key, None)
+        suffix = " Прежний одноимённый рецепт удалён." if replace_existing and delete_results else ""
+        await self._edit_recipe_rename_status(
+            target,
+            f"Рецепт переименован: <b>{html.escape(final_title)}</b>.{suffix}{local_warning}",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Открыть рецепт", callback_data=f"open:{renamed_id}")],
+                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
     async def _open_recipe(self, query, context: ContextTypes.DEFAULT_TYPE, value: str) -> None:
         recipe_id, page, page_action = _parse_open_recipe_value(value)
         group = self.storage.active_group_for_user(query.from_user.id)
@@ -2182,6 +2575,7 @@ class TelegramRecipeBot:
                         InlineKeyboardButton(f"Источник: {label}"[:50], callback_data=f"syncvariant:{index}"),
                     ]
                 )
+            buttons.append([InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{recipe.id}")])
             buttons.append([InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")])
             await query.edit_message_text(
                 (
@@ -2234,6 +2628,7 @@ class TelegramRecipeBot:
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton(f"Синхронизировать из {label}"[:60], callback_data=f"syncvariant:{index}")],
+                    [InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{variant.recipe.id}")],
                     [InlineKeyboardButton("Показать обе версии", callback_data=f"open:{variant.recipe.id}")],
                 ]
             ),
@@ -2803,6 +3198,8 @@ class TelegramRecipeBot:
             await self._handle_recipe_list_items(update, context, text)
         elif mode == "recipe_list_rename":
             await self._handle_recipe_list_rename(update, context, text)
+        elif mode == "recipe_rename":
+            await self._handle_recipe_rename(update, context, text)
         elif mode == "recipe_list_steps":
             await self._handle_recipe_list_steps(update, context, text)
         elif mode == "recipe_list_replace_query":

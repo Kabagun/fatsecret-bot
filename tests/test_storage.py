@@ -83,6 +83,30 @@ def test_import_remote_recipe_is_group_scoped(tmp_path) -> None:
         storage.close()
 
 
+def test_rename_recipe_for_remote_identities_updates_matching_local_row(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        recipe_id = storage.create_recipe("Старое имя", "", Decimal("1"), 0, 0, updated_by=11, group_id="group")
+        storage.set_remote_recipe_id(recipe_id, "a1", "101", last_synced_version=1)
+        storage.set_remote_recipe_id(recipe_id, "a2", "202", last_synced_version=1)
+
+        renamed_id = storage.rename_recipe_for_remote_identities(
+            "group",
+            {("a1", "101"), ("a2", "202")},
+            "Новое имя",
+            updated_by=22,
+        )
+
+        renamed = storage.get_recipe(recipe_id)
+        assert renamed_id == recipe_id
+        assert renamed is not None
+        assert renamed.title == "Новое имя"
+        assert renamed.version == 2
+        assert renamed.remote_ids == {"a1": "101", "a2": "202"}
+    finally:
+        storage.close()
+
+
 def test_count_recipes_and_list_recipe_page_are_group_scoped(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

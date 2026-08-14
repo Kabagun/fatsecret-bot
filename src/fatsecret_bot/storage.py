@@ -1449,6 +1449,51 @@ class Storage:
             )
         self._conn.commit()
 
+    def rename_recipe_for_remote_identities(
+        self,
+        group_id: str,
+        identities: set[tuple[str, str]],
+        title: str,
+        updated_by: int | None,
+    ) -> str | None:
+        """Rename the local recipe owning the most supplied remote identities, if one exists."""
+        if not identities:
+            return None
+        clauses = " OR ".join("(ar.account_key = ? AND ar.remote_recipe_id = ?)" for _ in identities)
+        params: list[object] = [group_id]
+        for account_key, remote_id in sorted(identities):
+            params.extend((account_key, remote_id))
+        row = self._conn.execute(
+            f"""
+            SELECT ar.recipe_id, COUNT(*) AS matches
+            FROM account_recipes ar
+            JOIN recipes r ON r.id = ar.recipe_id
+            WHERE r.group_id = ? AND ({clauses})
+            GROUP BY ar.recipe_id
+            ORDER BY matches DESC, ar.recipe_id
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        recipe_id = str(row["recipe_id"])
+        try:
+            self._conn.execute(
+                """
+                UPDATE recipes
+                SET title = ?, normalized_title = ?, version = version + 1,
+                    updated_by = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (title, normalize_title(title), updated_by, _now(), recipe_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return recipe_id
+
     def get_recipe(self, recipe_id: str) -> Recipe | None:
         row = self._conn.execute("SELECT * FROM recipes WHERE id = ?", (recipe_id,)).fetchone()
         if row is None:

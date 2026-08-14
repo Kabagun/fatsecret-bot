@@ -3761,6 +3761,70 @@ class RecipeSyncEngine:
         finally:
             await self._close_clients(clients)
 
+    async def rename_live_recipe_everywhere(
+        self,
+        recipe_ref: Recipe,
+        title: str,
+    ) -> list[AccountSyncResult]:
+        """Rename every remote identity represented by one live recipe card and verify readback."""
+        final_title = title.strip()
+        if not final_title:
+            raise FatSecretError("Название рецепта не должно быть пустым.")
+
+        clients = self._build_clients(recipe_ref.group_id)
+        results: list[AccountSyncResult] = []
+        try:
+            account_keys = set(recipe_ref.remote_ids) | set(recipe_ref.remote_ids_by_account)
+            for account_key in sorted(account_keys):
+                remote_ids = _remote_ids_for_account(recipe_ref, account_key)
+                client = clients.get(account_key)
+                if client is None:
+                    results.extend(
+                        AccountSyncResult(
+                            account_key,
+                            remote_id,
+                            False,
+                            "FatSecret аккаунт больше не подключен",
+                        )
+                        for remote_id in remote_ids
+                    )
+                    continue
+                for remote_id in remote_ids:
+                    try:
+                        expected = await client.get_recipe(remote_id)
+                        expected.title = final_title
+                        await self._save_recipe_meta_with_readback(client, expected, remote_id)
+                        actual = await client.get_recipe(remote_id)
+                        if normalize_title(actual.title) != normalize_title(final_title):
+                            raise FatSecretError(
+                                f"{client.account.label}: после переименования FatSecret вернул «{actual.title}»"
+                            )
+                        self.storage.upsert_remote_recipe_snapshot(
+                            account_key,
+                            remote_id,
+                            actual,
+                            recipe_fingerprint(actual),
+                        )
+                        results.append(AccountSyncResult(account_key, remote_id, True, "переименован"))
+                    except Exception as exc:  # Keep account results explicit for safe retry.
+                        logger.exception(
+                            "Live recipe rename failed account=%s remote_recipe_id=%s title=%r",
+                            client.account.label,
+                            remote_id,
+                            final_title,
+                        )
+                        results.append(
+                            AccountSyncResult(
+                                account_key,
+                                remote_id,
+                                False,
+                                user_safe_error_message(exc),
+                            )
+                        )
+        finally:
+            await self._close_clients(clients)
+        return results
+
     async def delete_live_recipes_everywhere(self, recipe_refs: list[Recipe]) -> dict[str, list[AccountSyncResult]]:
         """Delete several in-memory recipe references from FatSecret."""
         results: dict[str, list[AccountSyncResult]] = {}
