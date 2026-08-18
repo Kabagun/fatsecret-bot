@@ -795,7 +795,7 @@ class Storage:
     def list_group_ids(self) -> list[str]:
         """Return all recipe group ids known to the bot."""
         rows = self._conn.execute(
-            "SELECT id FROM recipe_groups ORDER BY created_at ASC, id ASC"
+            "SELECT id FROM recipe_groups ORDER BY created_at ASC, rowid ASC"
         ).fetchall()
         return [row["id"] for row in rows]
 

@@ -440,7 +440,7 @@ def test_recipe_export_uses_in_memory_text_document_when_telegram_text_is_too_la
         storage.close()
 
 
-def test_recipe_version_difference_requires_one_identical_version_per_connected_account() -> None:
+def test_recipe_version_difference_compares_existing_versions_and_ignores_missing_copies() -> None:
     same_a = _recipe_variant("tg11", "111", [_ingredient("a", "Яйцо", "100")])
     same_b = _recipe_variant("tg22", "222", [_ingredient("b", "Яйцо", "100")])
     duplicate_b = _recipe_variant("tg22", "223", [_ingredient("c", "Яйцо", "100")])
@@ -459,7 +459,7 @@ def test_recipe_version_difference_requires_one_identical_version_per_connected_
     ingredient_b = _recipe_variant("tg22", "222", [_ingredient("e", "Яйцо", "200")])
 
     assert _recipe_versions_differ([same_a, same_b], {"tg11", "tg22"}) is False
-    assert _recipe_versions_differ([same_a], {"tg11", "tg22"}) is True
+    assert _recipe_versions_differ([same_a], {"tg11", "tg22"}) is False
     assert _recipe_versions_differ([same_a, same_b, duplicate_b], {"tg11", "tg22"}) is True
     assert _recipe_versions_differ([same_a, metadata_b], {"tg11", "tg22"}) is True
     assert _recipe_versions_differ([same_a, ingredient_b], {"tg11", "tg22"}) is True
@@ -563,7 +563,34 @@ def test_open_identical_recipe_versions_renders_one_shared_card_without_sync(tmp
         storage.close()
 
 
-def test_open_missing_or_duplicate_recipe_versions_uses_simple_account_buttons(tmp_path) -> None:
+def test_open_single_account_recipe_renders_shared_card_without_warning_or_sync(tmp_path) -> None:
+    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        variants = [_flow_variant(recipe_ref, "tg11", "111")]
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=variants),
+        )
+
+        asyncio.run(bot._open_recipe(query, context, f"{recipe_ref.id}:0:list"))
+
+        rendered = query.edit_message_text.await_args
+        assert rendered.args[0].startswith("<b>Омлет</b>")
+        assert "Версии рецепта различаются" not in rendered.args[0]
+        buttons = [
+            button.text
+            for row in rendered.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "Экспортировать" in buttons
+        assert "Синхронизировать" not in buttons
+        assert context.user_data["recipe_versions_differ"] is False
+    finally:
+        storage.close()
+
+
+def test_open_duplicate_recipe_versions_uses_simple_account_buttons(tmp_path) -> None:
     storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
     try:
         variants = [
@@ -844,19 +871,30 @@ def _recipe_search_bot_and_context(recipes: list[Recipe], engine):  # noqa: ANN0
     return bot, context, application
 
 
-def test_recipe_warning_state_marks_structural_differences_without_hydration() -> None:
-    recipe = Recipe(
+def test_recipe_warning_state_ignores_missing_copy_but_marks_duplicate_without_hydration() -> None:
+    missing = Recipe(
         id="missing",
         title="Нет копии",
         group_id="group",
         remote_ids={"tg11": "111"},
         remote_ids_by_account={"tg11": ["111"]},
     )
-    bot, context, _ = _recipe_search_bot_and_context([recipe], SimpleNamespace())
+    duplicate = Recipe(
+        id="duplicate",
+        title="Дубликат",
+        group_id="group",
+        remote_ids={"tg11": "222"},
+        remote_ids_by_account={"tg11": ["222", "223"]},
+    )
+    bot, context, _ = _recipe_search_bot_and_context([missing, duplicate], SimpleNamespace())
 
-    marked, pending, accounts = bot._recipe_warning_state(context, "group", [recipe])
+    marked, pending, accounts = bot._recipe_warning_state(
+        context,
+        "group",
+        [missing, duplicate],
+    )
 
-    assert marked == {"missing"}
+    assert marked == {"duplicate"}
     assert pending == []
     assert accounts == {"tg11", "tg22"}
 

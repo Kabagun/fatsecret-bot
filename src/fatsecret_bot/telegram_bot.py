@@ -507,15 +507,13 @@ def _compare_recipe_products(variants: list[RemoteRecipeVariant]) -> _RecipeProd
 
 def _recipe_versions_differ(
     variants: list[RemoteRecipeVariant],
-    connected_account_keys: set[str],
+    _connected_account_keys: set[str],
 ) -> bool:
-    """Return whether connected accounts do not contain one identical recipe each."""
+    """Compare versions that exist; a missing account copy alone is not a difference."""
     if not variants:
         return True
     counts = Counter(variant.account_key for variant in variants)
-    if any(counts.get(account_key, 0) != 1 for account_key in connected_account_keys):
-        return True
-    if any(account_key not in connected_account_keys for account_key in counts):
+    if any(count > 1 for count in counts.values()):
         return True
     return len({variant.fingerprint.digest for variant in variants}) > 1
 
@@ -1163,12 +1161,13 @@ class TelegramRecipeBot:
         pending: list[Recipe] = []
         for recipe in recipes:
             signature = _recipe_remote_signature(recipe, connected_account_keys)
-            has_structural_difference = any(len(remote_ids) != 1 for _, remote_ids in signature)
-            if has_structural_difference:
+            has_duplicate = any(len(remote_ids) > 1 for _, remote_ids in signature)
+            if has_duplicate:
                 cache[recipe.id] = _RecipeWarningCacheEntry(signature, True, now)
                 warning_ids.add(recipe.id)
                 continue
-            if len(connected_account_keys) < 2:
+            version_count = sum(len(remote_ids) for _, remote_ids in signature)
+            if version_count <= 1:
                 cache[recipe.id] = _RecipeWarningCacheEntry(signature, False, now)
                 continue
             entry = cache.get(recipe.id)
