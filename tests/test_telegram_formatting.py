@@ -871,6 +871,7 @@ def _recipe_search_bot_and_context(recipes: list[Recipe], engine):  # noqa: ANN0
             "recipe_cache_group_id": "group",
             "recipe_cache": recipes,
             "recipe_cache_loaded_at": time.time(),
+            "recipe_warning_cache_checked_at": time.time(),
         },
     )
     return bot, context, application
@@ -1064,6 +1065,7 @@ def test_recipe_warning_cache_lasts_ten_minutes_then_requests_explicit_reload() 
         assert engine.calls == 1
 
         context.chat_data["recipe_cache_loaded_at"] = time.time() - 599
+        context.chat_data["recipe_warning_cache_checked_at"] = time.time() - 599
         await bot._handle_recipe_search(update, context, "рецепт")
         fresh_text, _, _ = message.sent[-1]
         assert "Проверяю версии в фоне" not in fresh_text
@@ -1071,6 +1073,7 @@ def test_recipe_warning_cache_lasts_ten_minutes_then_requests_explicit_reload() 
         assert engine.calls == 1
 
         context.chat_data["recipe_cache_loaded_at"] = time.time() - 601
+        context.chat_data["recipe_warning_cache_checked_at"] = time.time() - 601
         await bot._handle_recipe_search(update, context, "рецепт")
         stale_text, stale_keyboard, _ = message.sent[-1]
         assert "Данные о версиях старше 10 минут" in stale_text

@@ -58,6 +58,7 @@ RECIPE_SEARCH_IDS_KEY = "recipe_search_ids"
 RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY = "recipe_product_difference_cache"
 RECIPE_PRODUCT_DIFFERENCE_FOOTER = "⚠️ — в рецепте есть различия между аккаунтами."
 RECIPE_WARNING_CACHE_TTL_SECONDS = 10 * 60.0
+RECIPE_WARNING_CACHE_CHECKED_KEY = "recipe_warning_cache_checked_at"
 RECIPE_WARNING_RENDER_TOKEN_KEY = "recipe_warning_render_token"
 RECIPE_WARNING_RENDER_TASK_KEY = "recipe_warning_render_task"
 TELEGRAM_SAFE_TEXT_LIMIT = 4000
@@ -1122,10 +1123,13 @@ class TelegramRecipeBot:
     def _recipe_cache_needs_reload(context: ContextTypes.DEFAULT_TYPE, group_id: str) -> bool:
         if context.chat_data.get(RECIPE_CACHE_GROUP_KEY) != group_id:
             return True
-        loaded_at = context.chat_data.get(RECIPE_CACHE_LOADED_KEY)
-        if not isinstance(loaded_at, (int, float)):
+        checked_at = context.chat_data.get(
+            RECIPE_WARNING_CACHE_CHECKED_KEY,
+            context.chat_data.get(RECIPE_CACHE_LOADED_KEY),
+        )
+        if not isinstance(checked_at, (int, float)):
             return True
-        return time.time() - float(loaded_at) >= RECIPE_WARNING_CACHE_TTL_SECONDS
+        return time.time() - float(checked_at) >= RECIPE_WARNING_CACHE_TTL_SECONDS
 
     def _set_recipe_cache(
         self,
@@ -1138,6 +1142,7 @@ class TelegramRecipeBot:
         context.chat_data[RECIPE_CACHE_GROUP_KEY] = group_id
         context.chat_data[RECIPE_CACHE_KEY] = recipes
         context.chat_data[RECIPE_CACHE_LOADED_KEY] = time.time()
+        context.chat_data[RECIPE_WARNING_CACHE_CHECKED_KEY] = time.time()
         if invalidate_warnings:
             context.chat_data.pop(RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY, None)
 
@@ -1146,6 +1151,7 @@ class TelegramRecipeBot:
         context.chat_data.pop(RECIPE_CACHE_GROUP_KEY, None)
         context.chat_data.pop(RECIPE_CACHE_KEY, None)
         context.chat_data.pop(RECIPE_CACHE_LOADED_KEY, None)
+        context.chat_data.pop(RECIPE_WARNING_CACHE_CHECKED_KEY, None)
         context.chat_data.pop(RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY, None)
 
     def _recipe_product_difference_cache(
@@ -1251,6 +1257,7 @@ class TelegramRecipeBot:
                 bool(result.differences.get(recipe.id)),
                 checked_at,
             )
+        context.chat_data[RECIPE_WARNING_CACHE_CHECKED_KEY] = time.time()
 
     def _shared_recipe_warning_scan(
         self,
@@ -1383,7 +1390,7 @@ class TelegramRecipeBot:
         if context.chat_data.get(RECIPE_WARNING_RENDER_TOKEN_KEY) != render_token:
             return
         if result.failed:
-            context.chat_data[RECIPE_CACHE_LOADED_KEY] = (
+            context.chat_data[RECIPE_WARNING_CACHE_CHECKED_KEY] = (
                 time.time() - RECIPE_WARNING_CACHE_TTL_SECONDS
             )
         self._store_recipe_warning_scan_result(
