@@ -57,7 +57,7 @@ RECIPE_RENDER_KEY = "recipe_render_key"
 RECIPE_SEARCH_IDS_KEY = "recipe_search_ids"
 RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY = "recipe_product_difference_cache"
 RECIPE_PRODUCT_DIFFERENCE_FOOTER = "⚠️ — в рецепте есть различия между аккаунтами."
-RECIPE_WARNING_CACHE_TTL_SECONDS = 60.0
+RECIPE_WARNING_CACHE_TTL_SECONDS = 10 * 60.0
 RECIPE_WARNING_RENDER_TOKEN_KEY = "recipe_warning_render_token"
 RECIPE_WARNING_RENDER_TASK_KEY = "recipe_warning_render_task"
 TELEGRAM_SAFE_TEXT_LIMIT = 4000
@@ -652,12 +652,15 @@ def _recipe_list_message(
     *,
     has_product_differences: bool = False,
     checking_versions: bool = False,
+    needs_reload: bool = False,
 ) -> str:
     lines = [title, "Пришли текст в чат, чтобы искать по рецептам.", LIST_WIDTH_LINE]
     if has_product_differences:
         lines.append(RECIPE_PRODUCT_DIFFERENCE_FOOTER)
     if checking_versions:
         lines.append("⏳ Проверяю версии в фоне…")
+    if needs_reload:
+        lines.append("🔄 Данные о версиях старше 10 минут. Нажми «Обновить список».")
     return "\n".join(lines)
 
 
@@ -1115,6 +1118,15 @@ class TelegramRecipeBot:
         recipes = context.chat_data.get(RECIPE_CACHE_KEY)
         return recipes if isinstance(recipes, list) else None
 
+    @staticmethod
+    def _recipe_cache_needs_reload(context: ContextTypes.DEFAULT_TYPE, group_id: str) -> bool:
+        if context.chat_data.get(RECIPE_CACHE_GROUP_KEY) != group_id:
+            return True
+        loaded_at = context.chat_data.get(RECIPE_CACHE_LOADED_KEY)
+        if not isinstance(loaded_at, (int, float)):
+            return True
+        return time.time() - float(loaded_at) >= RECIPE_WARNING_CACHE_TTL_SECONDS
+
     def _set_recipe_cache(
         self,
         context: ContextTypes.DEFAULT_TYPE,
@@ -1151,6 +1163,8 @@ class TelegramRecipeBot:
         context: ContextTypes.DEFAULT_TYPE,
         group_id: str,
         recipes: list[Recipe],
+        *,
+        refresh_expired: bool = True,
     ) -> tuple[set[str], list[Recipe], set[str]]:
         connected_account_keys = {
             account.key for account in self.storage.list_fatsecret_accounts(group_id)
@@ -1171,15 +1185,13 @@ class TelegramRecipeBot:
                 cache[recipe.id] = _RecipeWarningCacheEntry(signature, False, now)
                 continue
             entry = cache.get(recipe.id)
-            if (
-                isinstance(entry, _RecipeWarningCacheEntry)
-                and entry.signature == signature
-                and now - entry.checked_at <= RECIPE_WARNING_CACHE_TTL_SECONDS
-            ):
+            if isinstance(entry, _RecipeWarningCacheEntry) and entry.signature == signature:
                 if entry.has_differences:
                     warning_ids.add(recipe.id)
-                continue
-            pending.append(recipe)
+                if not refresh_expired or now - entry.checked_at <= RECIPE_WARNING_CACHE_TTL_SECONDS:
+                    continue
+            if refresh_expired:
+                pending.append(recipe)
         return warning_ids, pending, connected_account_keys
 
     async def _run_recipe_warning_scan(
@@ -1213,6 +1225,32 @@ class TelegramRecipeBot:
             time.monotonic() - started_at,
         )
         return _RecipeWarningScanResult(differences)
+
+    def _store_recipe_warning_scan_result(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        group_id: str,
+        recipes: list[Recipe],
+        connected_account_keys: set[str],
+        result: _RecipeWarningScanResult,
+    ) -> None:
+        if result.failed or context.chat_data.get(RECIPE_CACHE_GROUP_KEY) != group_id:
+            return
+        current_recipes = {
+            recipe.id: recipe for recipe in self._recipe_cache(context, group_id) or []
+        }
+        cache = self._recipe_product_difference_cache(context)
+        checked_at = time.monotonic()
+        for recipe in recipes:
+            current = current_recipes.get(recipe.id)
+            signature = _recipe_remote_signature(recipe, connected_account_keys)
+            if current is None or _recipe_remote_signature(current, connected_account_keys) != signature:
+                continue
+            cache[recipe.id] = _RecipeWarningCacheEntry(
+                signature,
+                bool(result.differences.get(recipe.id)),
+                checked_at,
+            )
 
     def _shared_recipe_warning_scan(
         self,
@@ -1277,6 +1315,23 @@ class TelegramRecipeBot:
             pending,
             connected_account_keys,
         )
+
+        def cache_completed_scan(completed: asyncio.Task[_RecipeWarningScanResult]) -> None:
+            try:
+                result = completed.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001 - the render path reports scan failures separately.
+                return
+            self._store_recipe_warning_scan_result(
+                context,
+                group_id,
+                pending,
+                connected_account_keys,
+                result,
+            )
+
+        shared_scan.add_done_callback(cache_completed_scan)
         task = application.create_task(
             self._apply_recipe_warning_update(
                 target,
@@ -1327,19 +1382,28 @@ class TelegramRecipeBot:
             raise
         if context.chat_data.get(RECIPE_WARNING_RENDER_TOKEN_KEY) != render_token:
             return
-        if not result.failed:
-            cache = self._recipe_product_difference_cache(context)
-            checked_at = time.monotonic()
-            for recipe in pending:
-                cache[recipe.id] = _RecipeWarningCacheEntry(
-                    _recipe_remote_signature(recipe, connected_account_keys),
-                    bool(result.differences.get(recipe.id)),
-                    checked_at,
-                )
-        warning_ids, _, _ = self._recipe_warning_state(context, group_id, recipes)
+        if result.failed:
+            context.chat_data[RECIPE_CACHE_LOADED_KEY] = (
+                time.time() - RECIPE_WARNING_CACHE_TTL_SECONDS
+            )
+        self._store_recipe_warning_scan_result(
+            context,
+            group_id,
+            pending,
+            connected_account_keys,
+            result,
+        )
+        needs_reload = self._recipe_cache_needs_reload(context, group_id)
+        warning_ids, _, _ = self._recipe_warning_state(
+            context,
+            group_id,
+            recipes,
+            refresh_expired=not needs_reload,
+        )
         text = _recipe_list_message(
             title,
             has_product_differences=bool(warning_ids),
+            needs_reload=needs_reload,
         )
         reply_markup = self._recipe_list_keyboard(
             recipes,
@@ -1348,6 +1412,7 @@ class TelegramRecipeBot:
             account_labels,
             total_count=total_count,
             product_difference_ids=warning_ids,
+            needs_reload=needs_reload,
         )
         edit = getattr(target, "edit_message_text", None) or getattr(target, "edit_text")
         try:
@@ -1990,17 +2055,21 @@ class TelegramRecipeBot:
         if total_count == 0:
             await status.edit_text("Рецептов пока нет. Создай рецепт в FatSecret и снова нажми «Поиск рецептов».")
             return
+        needs_reload = self._recipe_cache_needs_reload(context, group.id)
         product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
             context,
             group.id,
-            recipes,
+            all_recipes,
+            refresh_expired=not needs_reload,
         )
+        visible_difference_ids = product_difference_ids & {recipe.id for recipe in recipes}
         account_labels = self._account_labels_for_group(group.id)
         await status.edit_text(
             _recipe_list_message(
                 "Общий список рецептов:",
-                has_product_differences=bool(product_difference_ids),
+                has_product_differences=bool(visible_difference_ids),
                 checking_versions=bool(pending and getattr(context, "application", None)),
+                needs_reload=needs_reload,
             ),
             reply_markup=self._recipe_list_keyboard(
                 recipes,
@@ -2008,7 +2077,8 @@ class TelegramRecipeBot:
                 "list",
                 account_labels,
                 total_count=total_count,
-                product_difference_ids=product_difference_ids,
+                product_difference_ids=visible_difference_ids,
+                needs_reload=needs_reload,
             ),
         )
         self._schedule_recipe_warning_update(
@@ -2036,6 +2106,7 @@ class TelegramRecipeBot:
         account_labels: dict[str, str] | None = None,
         total_count: int | None = None,
         product_difference_ids: set[str] | None = None,
+        needs_reload: bool = False,
     ) -> InlineKeyboardMarkup:
         account_labels = account_labels or {}
         product_difference_ids = product_difference_ids or set()
@@ -2069,6 +2140,8 @@ class TelegramRecipeBot:
                 )
             )
             buttons.append(nav)
+        if needs_reload:
+            buttons.append([InlineKeyboardButton("Обновить список", callback_data="refresh:0")])
         buttons.append([InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}")])
         return InlineKeyboardMarkup(buttons)
 
@@ -2469,20 +2542,25 @@ class TelegramRecipeBot:
             await query.edit_message_text("Рецептов пока нет.")
             return
         if context is not None:
+            needs_reload = self._recipe_cache_needs_reload(context, group.id)
             product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
                 context,
                 group.id,
-                recipes,
+                all_recipes,
+                refresh_expired=not needs_reload,
             )
         else:
             product_difference_ids, pending, connected_account_keys = set(), [], set()
+            needs_reload = False
+        visible_difference_ids = product_difference_ids & {recipe.id for recipe in recipes}
         account_labels = self._account_labels_for_group(group.id)
         await self._safe_edit_message_text(
             query,
             _recipe_list_message(
                 "Общий список рецептов:",
-                has_product_differences=bool(product_difference_ids),
+                has_product_differences=bool(visible_difference_ids),
                 checking_versions=bool(pending and getattr(context, "application", None)),
+                needs_reload=needs_reload,
             ),
             reply_markup=self._recipe_list_keyboard(
                 recipes,
@@ -2490,7 +2568,8 @@ class TelegramRecipeBot:
                 "list",
                 account_labels,
                 total_count=total_count,
-                product_difference_ids=product_difference_ids,
+                product_difference_ids=visible_difference_ids,
+                needs_reload=needs_reload,
             ),
         )
         if context is not None:
@@ -2546,19 +2625,23 @@ class TelegramRecipeBot:
             return
         await self._ensure_main_keyboard(query.message, context)
         context.user_data["mode"] = "recipe_search"
+        needs_reload = self._recipe_cache_needs_reload(context, str(group_id))
         product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
             context,
             str(group_id),
-            page_recipes,
+            cached,
+            refresh_expired=not needs_reload,
         )
+        visible_difference_ids = product_difference_ids & {recipe.id for recipe in page_recipes}
         account_labels = self._account_labels_for_group(group_id)
         title = f"Найдено рецептов: {len(recipes)}"
         await self._safe_edit_message_text(
             query,
             _recipe_list_message(
                 title,
-                has_product_differences=bool(product_difference_ids),
+                has_product_differences=bool(visible_difference_ids),
                 checking_versions=bool(pending and getattr(context, "application", None)),
+                needs_reload=needs_reload,
             ),
             reply_markup=self._recipe_list_keyboard(
                 page_recipes,
@@ -2566,7 +2649,8 @@ class TelegramRecipeBot:
                 "searchpage",
                 account_labels,
                 total_count=total_count,
-                product_difference_ids=product_difference_ids,
+                product_difference_ids=visible_difference_ids,
+                needs_reload=needs_reload,
             ),
         )
         self._mark_rendered(context, render_key)
@@ -5285,18 +5369,22 @@ class TelegramRecipeBot:
             )
             return
         page_recipes, page, total_count = self._recipe_page(recipes, 0)
+        needs_reload = self._recipe_cache_needs_reload(context, str(group_id))
         product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
             context,
             str(group_id),
-            page_recipes,
+            cached,
+            refresh_expired=not needs_reload,
         )
+        visible_difference_ids = product_difference_ids & {recipe.id for recipe in page_recipes}
         account_labels = self._account_labels_for_group(group_id)
         title = f"Найдено рецептов: {len(recipes)}"
         sent = await update.effective_message.reply_text(
             _recipe_list_message(
                 title,
-                has_product_differences=bool(product_difference_ids),
+                has_product_differences=bool(visible_difference_ids),
                 checking_versions=bool(pending and getattr(context, "application", None)),
+                needs_reload=needs_reload,
             ),
             reply_markup=self._recipe_list_keyboard(
                 page_recipes,
@@ -5304,7 +5392,8 @@ class TelegramRecipeBot:
                 "searchpage",
                 account_labels,
                 total_count=total_count,
-                product_difference_ids=product_difference_ids,
+                product_difference_ids=visible_difference_ids,
+                needs_reload=needs_reload,
             ),
         )
         self._schedule_recipe_warning_update(

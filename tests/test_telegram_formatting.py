@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import time
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -866,7 +867,11 @@ def _recipe_search_bot_and_context(recipes: list[Recipe], engine):  # noqa: ANN0
     context = SimpleNamespace(
         application=application,
         user_data={"group_id": "group"},
-        chat_data={"recipe_cache_group_id": "group", "recipe_cache": recipes},
+        chat_data={
+            "recipe_cache_group_id": "group",
+            "recipe_cache": recipes,
+            "recipe_cache_loaded_at": time.time(),
+        },
     )
     return bot, context, application
 
@@ -899,7 +904,7 @@ def test_recipe_warning_state_ignores_missing_copy_but_marks_duplicate_without_h
     assert accounts == {"tg11", "tg22"}
 
 
-def test_recipe_search_renders_immediately_then_updates_visible_page_once() -> None:
+def test_recipe_search_renders_immediately_then_scans_loaded_cookbook_once() -> None:
     recipes = _warning_test_recipes()
 
     class FakeEngine:
@@ -939,7 +944,7 @@ def test_recipe_search_renders_immediately_then_updates_visible_page_once() -> N
         assert all("Рецепт 8" not in button.text for row in keyboard.inline_keyboard for button in row)
         assert target.edits == []
         await engine.started.wait()
-        assert engine.calls == [[recipe.id for recipe in recipes[:8]]]
+        assert engine.calls == [[recipe.id for recipe in recipes]]
 
         engine.release.set()
         await asyncio.gather(*application.tasks)
@@ -949,9 +954,21 @@ def test_recipe_search_renders_immediately_then_updates_visible_page_once() -> N
         assert "Проверяю версии в фоне" not in final_text
         assert "⚠️" in final_text
         assert final_keyboard.inline_keyboard[0][0].text.endswith("⚠️")
-        marked, pending, _ = bot._recipe_warning_state(context, "group", recipes[:8])
+        marked, pending, _ = bot._recipe_warning_state(context, "group", recipes)
         assert marked == {"recipe-0"}
         assert pending == []
+
+        task_count = len(application.tasks)
+        query = SimpleNamespace(
+            message=SimpleNamespace(message_id=99),
+            edit_message_text=AsyncMock(),
+        )
+        await bot._edit_search_results(query, context, 1)
+        page_text = query.edit_message_text.await_args.args[0]
+        page_keyboard = query.edit_message_text.await_args.kwargs["reply_markup"]
+        assert "Проверяю версии в фоне" not in page_text
+        assert page_keyboard.inline_keyboard[0][0].text.startswith("Рецепт 8")
+        assert len(application.tasks) == task_count
 
     asyncio.run(scenario())
 
@@ -975,6 +992,7 @@ def test_recipe_warning_scan_failure_keeps_rendered_list_usable() -> None:
         assert len(target.edits) == 1
         assert "Найдено рецептов: 2" in target.edits[0][0]
         assert "Проверяю версии в фоне" not in target.edits[0][0]
+        assert "Обновить список" in target.edits[0][0]
 
     asyncio.run(scenario())
 
@@ -1011,6 +1029,57 @@ def test_recipe_warning_render_ignores_stale_results_after_navigation() -> None:
 
         assert message.sent[0][2].edits == []
         assert RECIPE_WARNING_RENDER_TASK_KEY not in context.chat_data
+        marked, pending, _ = bot._recipe_warning_state(context, "group", recipes)
+        assert marked == {"recipe-0"}
+        assert pending == []
+
+    asyncio.run(scenario())
+
+
+def test_recipe_warning_cache_lasts_ten_minutes_then_requests_explicit_reload() -> None:
+    recipes = _warning_test_recipes()
+
+    class ImmediateEngine:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def hydrate_live_recipe_variants_batch(self, requested):  # noqa: ANN001, ANN202
+            self.calls += 1
+            return {
+                recipe.id: [
+                    _recipe_variant("tg11", recipe.remote_ids["tg11"], [_ingredient("a", "Яйцо", "100")]),
+                    _recipe_variant("tg22", recipe.remote_ids["tg22"], [_ingredient("b", "Яйцо", "100")]),
+                ]
+                for recipe in requested
+            }
+
+    async def scenario() -> None:
+        engine = ImmediateEngine()
+        bot, context, application = _recipe_search_bot_and_context(recipes, engine)
+        message = _RecipeSearchMessage()
+        update = SimpleNamespace(effective_message=message)
+
+        await bot._handle_recipe_search(update, context, "рецепт")
+        await asyncio.gather(*application.tasks)
+        assert engine.calls == 1
+
+        context.chat_data["recipe_cache_loaded_at"] = time.time() - 599
+        await bot._handle_recipe_search(update, context, "рецепт")
+        fresh_text, _, _ = message.sent[-1]
+        assert "Проверяю версии в фоне" not in fresh_text
+        assert "Обновить список" not in fresh_text
+        assert engine.calls == 1
+
+        context.chat_data["recipe_cache_loaded_at"] = time.time() - 601
+        await bot._handle_recipe_search(update, context, "рецепт")
+        stale_text, stale_keyboard, _ = message.sent[-1]
+        assert "Данные о версиях старше 10 минут" in stale_text
+        assert any(
+            button.text == "Обновить список"
+            for row in stale_keyboard.inline_keyboard
+            for button in row
+        )
+        assert engine.calls == 1
 
     asyncio.run(scenario())
 
