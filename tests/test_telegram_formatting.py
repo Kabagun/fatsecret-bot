@@ -622,6 +622,51 @@ def test_open_duplicate_recipe_versions_uses_simple_account_buttons(tmp_path) ->
         storage.close()
 
 
+def test_selected_variant_sync_opens_its_confirmation_preview_directly(tmp_path) -> None:
+    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        source = _flow_variant(recipe_ref, "tg11", "111", grams="100")
+        selected = _flow_variant(recipe_ref, "tg22", "222", grams="200")
+        context.user_data.update(
+            {
+                "recipe_variants": [source, selected],
+                "recipe_versions_differ": True,
+                "current_recipe_id": recipe_ref.id,
+            }
+        )
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace()
+
+        asyncio.run(bot._open_recipe_variant(query, context, 1))
+
+        variant_keyboard = query.edit_message_text.await_args.kwargs["reply_markup"]
+        sync_button = next(
+            button
+            for row in variant_keyboard.inline_keyboard
+            for button in row
+            if button.text == "Синхронизировать"
+        )
+        assert sync_button.callback_data == "syncvariant:1"
+
+        query.edit_message_text.reset_mock()
+        asyncio.run(bot._sync_recipe_variant(query, context, 1))
+
+        preview = query.edit_message_text.await_args
+        assert "Оригинал из аккаунта: Второй" in preview.args[0]
+        assert "Из какого FatSecret аккаунта" not in preview.args[0]
+        assert context.user_data["recipe_sync_preview"] == {
+            "recipe_id": recipe_ref.id,
+            "group_id": recipe_ref.group_id,
+            "account_key": "tg22",
+            "remote_id": "222",
+            "content_digest": selected.fingerprint.digest,
+            "variant_index": 1,
+        }
+    finally:
+        storage.close()
+
+
 def test_sync_source_preview_requires_confirmation_and_passes_approval_fingerprint(tmp_path) -> None:
     storage, group, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
     try:

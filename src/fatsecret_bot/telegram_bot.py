@@ -3140,7 +3140,7 @@ class TelegramRecipeBot:
                             callback_data=f"recipe_export:{variant.recipe.id}:{index}",
                         )
                     ],
-                    [InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{variant.recipe.id}")],
+                    [InlineKeyboardButton("Синхронизировать", callback_data=f"syncvariant:{index}")],
                     [InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{variant.recipe.id}")],
                     [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{variant.recipe.id}")],
                     [InlineKeyboardButton("Выбрать другой аккаунт", callback_data=f"open:{variant.recipe.id}")],
