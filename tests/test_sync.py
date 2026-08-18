@@ -20,6 +20,7 @@ from fatsecret_bot.models import (
     Recipe,
     RecipeSummary,
 )
+from fatsecret_bot.recipe_compare import recipe_content_fingerprint
 from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import (
     INGREDIENT_NORMALIZE_CONCURRENCY,
@@ -2737,6 +2738,62 @@ def test_hydrate_live_recipe_variants_keeps_conflicting_account_versions(tmp_pat
         storage.close()
 
 
+def test_batch_variant_hydration_reuses_food_details_across_visible_recipes(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        remote_recipes = [
+            Recipe(
+                id=remote_id,
+                title=title,
+                ingredients=[
+                    Ingredient(
+                        id=f"ingredient-{remote_id}",
+                        recipe_id=remote_id,
+                        food_id="shared-food",
+                        title="Общий продукт",
+                        portion_id="0",
+                        amount=Decimal("1.5"),
+                        portion_description="serving",
+                    )
+                ],
+            )
+            for remote_id, title in (("111", "Первый"), ("222", "Второй"))
+        ]
+        client = FakeFoodUsageClient(
+            remote_recipes,
+            "tg11",
+            details={
+                "shared-food": FoodSearchResult(
+                    food_id="shared-food",
+                    title="Общий продукт",
+                    default_portion_id="gram-portion",
+                    default_portion_description="100g",
+                )
+            },
+        )
+        refs = [
+            Recipe(
+                id=f"live-{remote.id}",
+                title=remote.title,
+                group_id="group",
+                remote_ids={"tg11": remote.id},
+                remote_ids_by_account={"tg11": [remote.id]},
+            )
+            for remote in remote_recipes
+        ]
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+
+        hydrated = asyncio.run(engine.hydrate_live_recipe_variants_batch(refs))
+
+        assert set(hydrated) == {"live-111", "live-222"}
+        assert client.detail_calls == ["shared-food"]
+        assert all(variants[0].recipe.ingredients[0].grams == Decimal("150") for variants in hydrated.values())
+        assert client.closed is True
+    finally:
+        storage.close()
+
+
 def test_verify_remote_recipe_accepts_server_portion_and_metadata_canonicalization(tmp_path) -> None:
     expected = Recipe(
         id="local",
@@ -2938,6 +2995,97 @@ def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path
         assert second.deleted_recipe_ids == ["222"]
         assert results[1].message == "добавлено ингредиентов: 1"
         assert storage.list_recipes("group") == []
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    ("expected_remote_id", "expected_digest"),
+    [("changed-remote-id", None), ("111", "stale-content-digest")],
+)
+def test_sync_live_recipe_rejects_changed_approved_source_before_target_mutation(
+    tmp_path,
+    expected_remote_id: str,
+    expected_digest: str | None,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(
+            id="111",
+            title="Омлет",
+            group_id="group",
+            portions=Decimal("2"),
+            ingredients=[
+                Ingredient(
+                    id="source-egg",
+                    recipe_id="111",
+                    food_id="food-egg",
+                    title="Яйцо",
+                    portion_id="portion-egg",
+                    amount=Decimal("2"),
+                )
+            ],
+        )
+        target_recipe = Recipe(id="222", title="Омлет", group_id="group")
+        recipe_ref = Recipe(
+            id="live-omlet",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "111", "tg22": "222"},
+            remote_ids_by_account={"tg11": ["111"], "tg22": ["222"]},
+        )
+        source = FakeFatSecretClient(source_recipe, account_key="tg11")
+        target = FakeFatSecretClient(target_recipe, account_key="tg22")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": source, "tg22": target}  # type: ignore[method-assign]
+
+        with pytest.raises(FatSecretError, match="подтверди снова"):
+            asyncio.run(
+                engine.sync_live_recipe_from_source(
+                    recipe_ref,
+                    "tg11",
+                    expected_source_remote_id=expected_remote_id,
+                    expected_source_content_digest=expected_digest,
+                )
+            )
+
+        assert target.saved_meta == []
+        assert target.saved_ingredients == []
+        assert target.deleted_recipe_ids == []
+        assert set(target.recipes) == {"222"}
+    finally:
+        storage.close()
+
+
+def test_sync_live_recipe_accepts_the_exact_approved_source_fingerprint(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(id="111", title="Омлет", group_id="group")
+        target_recipe = Recipe(id="222", title="Омлет", group_id="group")
+        recipe_ref = Recipe(
+            id="live-omlet",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "111", "tg22": "222"},
+            remote_ids_by_account={"tg11": ["111"], "tg22": ["222"]},
+        )
+        source = FakeFatSecretClient(source_recipe, account_key="tg11")
+        target = FakeFatSecretClient(target_recipe, account_key="tg22")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": source, "tg22": target}  # type: ignore[method-assign]
+
+        synced, results = asyncio.run(
+            engine.sync_live_recipe_from_source(
+                recipe_ref,
+                "tg11",
+                expected_source_remote_id="111",
+                expected_source_content_digest=recipe_content_fingerprint(source_recipe).digest,
+            )
+        )
+
+        assert all(result.ok for result in results)
+        assert synced.remote_ids["tg11"] == "111"
+        assert source.saved_meta == []
     finally:
         storage.close()
 

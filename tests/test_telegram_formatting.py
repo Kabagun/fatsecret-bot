@@ -8,19 +8,25 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from fatsecret_bot.models import Ingredient, Recipe, RemoteRecipeVariant
-from fatsecret_bot.recipe_compare import recipe_fingerprint
+from fatsecret_bot.recipe_compare import recipe_content_fingerprint, recipe_fingerprint
 from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import AccountSyncResult, RecipeCreateResult
 from fatsecret_bot.telegram_bot import (
+    RECIPE_WARNING_RENDER_TASK_KEY,
     TelegramRecipeBot,
     _compare_recipe_products,
     _format_recipe,
     _format_recipe_conflict,
     _format_recipe_product_differences,
+    _parse_recipe_list_payload,
     _recipe_actions_keyboard,
+    _recipe_export_payload,
     _recipe_list_button_text,
     _recipe_list_message,
+    _recipe_versions_differ,
 )
 
 
@@ -150,7 +156,7 @@ def test_format_recipe_conflict_shows_only_differing_fields() -> None:
 
 def _recipe_variant(account_key: str, remote_id: str, ingredients: list[Ingredient]) -> RemoteRecipeVariant:
     recipe = Recipe(id="local", title="Омлет", ingredients=ingredients)
-    return RemoteRecipeVariant(account_key, remote_id, recipe, recipe_fingerprint(recipe))
+    return RemoteRecipeVariant(account_key, remote_id, recipe, recipe_content_fingerprint(recipe))
 
 
 def _ingredient(
@@ -312,7 +318,8 @@ def test_recipe_actions_keyboard_keeps_only_recipe_actions_and_list_return() -> 
     keyboard = _recipe_actions_keyboard("recipe-1", page=1, page_action="list", total_pages=3)
     rows = keyboard.inline_keyboard
 
-    assert [button.text for button in rows[0]] == ["Синхронизировать"]
+    assert [button.text for button in rows[0]] == ["Экспортировать"]
+    assert rows[0][0].callback_data == "recipe_export:recipe-1:-1"
     assert [button.text for button in rows[1]] == ["Переименовать"]
     assert rows[1][0].callback_data == "recipe_rename:recipe-1"
     assert [button.text for button in rows[2]] == ["Удалить в FatSecret"]
@@ -327,13 +334,391 @@ def test_recipe_actions_keyboard_keeps_only_recipe_actions_and_list_return() -> 
 
 
 def test_recipe_actions_keyboard_keeps_actions_without_navigation() -> None:
-    keyboard = _recipe_actions_keyboard("recipe-1", page=0, page_action="list", total_pages=1)
+    keyboard = _recipe_actions_keyboard(
+        "recipe-1",
+        page=0,
+        page_action="list",
+        total_pages=1,
+        can_sync=True,
+    )
     flat_texts = [button.text for row in keyboard.inline_keyboard for button in row]
 
     assert "Назад" not in flat_texts
     assert "Дальше" not in flat_texts
+    assert "Экспортировать" in flat_texts
     assert "Синхронизировать" in flat_texts
     assert "Удалить в FatSecret" in flat_texts
+
+
+def test_recipe_export_round_trips_through_real_import_parser_with_special_characters() -> None:
+    recipe = Recipe(
+        id="recipe-1",
+        title="Соус <летний> & сыр",
+        portions=Decimal("2.5"),
+        description="Не экспортируется",
+        prep_time=10,
+        cook_time=20,
+        ingredients=[
+            _ingredient("tomato", 'Томаты <черри> & "соль"', "125.5"),
+            _ingredient("cheese", "Сыр 50%", "40"),
+        ],
+        steps=["Смешать <аккуратно>", "Подать & съесть"],
+    )
+
+    payload = _recipe_export_payload(recipe)
+    portions, items, bad_lines, steps = _parse_recipe_list_payload(payload)
+
+    assert payload.startswith("Порций: 2.5\n")
+    assert "Не экспортируется" not in payload
+    assert portions == Decimal("2.5")
+    assert bad_lines == []
+    assert [(item.query, item.grams) for item in items] == [
+        ('Томаты <черри> & "соль"', Decimal("125.5")),
+        ("Сыр 50%", Decimal("40")),
+    ]
+    assert steps == ["Смешать <аккуратно>", "Подать & съесть"]
+
+
+def test_recipe_export_refuses_an_ingredient_without_a_resolvable_gram_weight() -> None:
+    recipe = Recipe(
+        id="recipe-1",
+        title="Небезопасный",
+        ingredients=[
+            Ingredient(
+                id="unknown",
+                recipe_id="recipe-1",
+                food_id="food",
+                title="Щепотка соли",
+                portion_id="portion",
+                amount=Decimal("1"),
+                portion_description="serving",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="Щепотка соли"):
+        _recipe_export_payload(recipe)
+
+
+def test_recipe_export_uses_in_memory_text_document_when_telegram_text_is_too_large(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Solo")
+        recipe = Recipe(
+            id="recipe-1",
+            title="Большой рецепт",
+            group_id=group.id,
+            ingredients=[
+                _ingredient(str(index), f"Очень длинный ингредиент {index} " + "я" * 180, "10")
+                for index in range(30)
+            ],
+        )
+        for ingredient in recipe.ingredients:
+            ingredient.recipe_id = recipe.id
+        variant = RemoteRecipeVariant("tg11", "remote-1", recipe, recipe_fingerprint(recipe))
+        message = SimpleNamespace(reply_text=AsyncMock(), reply_document=AsyncMock())
+        query = SimpleNamespace(
+            from_user=SimpleNamespace(id=11),
+            message=message,
+            edit_message_text=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            user_data={"recipe_variants": [variant]},
+            chat_data={},
+        )
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+
+        asyncio.run(bot._export_recipe(query, context, f"{recipe.id}:0"))
+
+        message.reply_text.assert_not_awaited()
+        message.reply_document.assert_awaited_once()
+        document = message.reply_document.await_args.kwargs["document"]
+        assert document.filename == "recipe-import.txt"
+    finally:
+        storage.close()
+
+
+def test_recipe_version_difference_requires_one_identical_version_per_connected_account() -> None:
+    same_a = _recipe_variant("tg11", "111", [_ingredient("a", "Яйцо", "100")])
+    same_b = _recipe_variant("tg22", "222", [_ingredient("b", "Яйцо", "100")])
+    duplicate_b = _recipe_variant("tg22", "223", [_ingredient("c", "Яйцо", "100")])
+    metadata_recipe = Recipe(
+        id="local",
+        title="Омлет",
+        portions=Decimal("2"),
+        ingredients=[_ingredient("d", "Яйцо", "100")],
+    )
+    metadata_b = RemoteRecipeVariant(
+        "tg22",
+        "222",
+        metadata_recipe,
+        recipe_content_fingerprint(metadata_recipe),
+    )
+    ingredient_b = _recipe_variant("tg22", "222", [_ingredient("e", "Яйцо", "200")])
+
+    assert _recipe_versions_differ([same_a, same_b], {"tg11", "tg22"}) is False
+    assert _recipe_versions_differ([same_a], {"tg11", "tg22"}) is True
+    assert _recipe_versions_differ([same_a, same_b, duplicate_b], {"tg11", "tg22"}) is True
+    assert _recipe_versions_differ([same_a, metadata_b], {"tg11", "tg22"}) is True
+    assert _recipe_versions_differ([same_a, ingredient_b], {"tg11", "tg22"}) is True
+
+
+def _two_account_recipe_flow(tmp_path):  # noqa: ANN001, ANN202
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.register_user(11, "One")
+    storage.register_user(22, "Two")
+    group = storage.create_group(11, "Семья")
+    storage.join_group_by_code(22, group.invite_code)
+    storage.create_fatsecret_account(
+        11,
+        "Первый",
+        "one@example.com",
+        "secret",
+        "BY",
+        "ru",
+        group_id=group.id,
+    )
+    storage.create_fatsecret_account(
+        22,
+        "Второй",
+        "two@example.com",
+        "secret",
+        "BY",
+        "ru",
+        group_id=group.id,
+    )
+    recipe_ref = Recipe(
+        id="recipe-live",
+        title="Омлет",
+        group_id=group.id,
+        remote_ids={"tg11": "111", "tg22": "222"},
+        remote_ids_by_account={"tg11": ["111"], "tg22": ["222"]},
+    )
+    context = SimpleNamespace(
+        user_data={"group_id": group.id},
+        chat_data={"recipe_cache_group_id": group.id, "recipe_cache": [recipe_ref]},
+    )
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=11),
+        message=SimpleNamespace(),
+        edit_message_text=AsyncMock(),
+    )
+    return storage, group, recipe_ref, context, query
+
+
+def _flow_variant(
+    recipe_ref: Recipe,
+    account_key: str,
+    remote_id: str,
+    *,
+    grams: str = "100",
+    portions: str = "1",
+) -> RemoteRecipeVariant:
+    recipe = Recipe(
+        id=recipe_ref.id,
+        title=recipe_ref.title,
+        group_id=recipe_ref.group_id,
+        portions=Decimal(portions),
+        ingredients=[_ingredient(f"ingredient-{account_key}-{remote_id}", "Яйцо", grams)],
+        remote_ids={account_key: remote_id},
+        remote_ids_by_account={account_key: [remote_id]},
+    )
+    return RemoteRecipeVariant(
+        account_key,
+        remote_id,
+        recipe,
+        recipe_content_fingerprint(recipe),
+    )
+
+
+def test_open_identical_recipe_versions_renders_one_shared_card_without_sync(tmp_path) -> None:
+    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        variants = [
+            _flow_variant(recipe_ref, "tg11", "111"),
+            _flow_variant(recipe_ref, "tg22", "222"),
+        ]
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=variants),
+        )
+
+        asyncio.run(bot._open_recipe(query, context, f"{recipe_ref.id}:0:list"))
+
+        rendered = query.edit_message_text.await_args
+        assert rendered.args[0].startswith("<b>Омлет</b>")
+        buttons = [
+            button.text
+            for row in rendered.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "Экспортировать" in buttons
+        assert "Синхронизировать" not in buttons
+        assert "Первый" not in rendered.args[0]
+        assert context.user_data["recipe_versions_differ"] is False
+    finally:
+        storage.close()
+
+
+def test_open_missing_or_duplicate_recipe_versions_uses_simple_account_buttons(tmp_path) -> None:
+    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        variants = [
+            _flow_variant(recipe_ref, "tg11", "111"),
+            _flow_variant(recipe_ref, "tg11", "112"),
+        ]
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=variants),
+        )
+
+        asyncio.run(bot._open_recipe(query, context, f"{recipe_ref.id}:0:list"))
+
+        rendered = query.edit_message_text.await_args
+        assert "Версии рецепта различаются" in rendered.args[0]
+        assert "Нет версии: Второй" in rendered.args[0]
+        buttons = [
+            button.text
+            for row in rendered.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "Первый (ID 111)" in buttons
+        assert "Первый (ID 112)" in buttons
+        assert all(not button.startswith("Источник:") for button in buttons)
+        assert context.user_data["recipe_versions_differ"] is True
+    finally:
+        storage.close()
+
+
+def test_sync_source_preview_requires_confirmation_and_passes_approval_fingerprint(tmp_path) -> None:
+    storage, group, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        source = _flow_variant(recipe_ref, "tg11", "111", grams="100")
+        target = _flow_variant(recipe_ref, "tg22", "222", grams="200")
+        context.user_data.update(
+            {
+                "recipe_variants": [source, target],
+                "recipe_versions_differ": True,
+                "current_recipe_id": recipe_ref.id,
+            }
+        )
+        synced = Recipe(
+            id=recipe_ref.id,
+            title=recipe_ref.title,
+            group_id=group.id,
+            remote_ids=dict(recipe_ref.remote_ids),
+            remote_ids_by_account={key: list(values) for key, values in recipe_ref.remote_ids_by_account.items()},
+        )
+        sync_live = AsyncMock(
+            return_value=(
+                synced,
+                [
+                    AccountSyncResult("tg11", "111", True, "source"),
+                    AccountSyncResult("tg22", "333", True, "updated"),
+                ],
+            )
+        )
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=[source, target]),
+            sync_live_recipe_from_source=sync_live,
+            load_remote_recipe_index=AsyncMock(return_value=[synced]),
+        )
+
+        asyncio.run(bot._show_sync_preview(query, context, 0))
+
+        sync_live.assert_not_awaited()
+        preview_render = query.edit_message_text.await_args
+        assert "Оригинал из аккаунта: Первый" in preview_render.args[0]
+        assert "Подтвердить синхронизацию" in [
+            button.text
+            for row in preview_render.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+
+        asyncio.run(bot._confirm_sync_preview(query, context))
+
+        sync_live.assert_awaited_once_with(
+            recipe_ref,
+            "tg11",
+            expected_source_remote_id="111",
+            expected_source_content_digest=source.fingerprint.digest,
+        )
+        assert "Синхронизация завершена" in query.edit_message_text.await_args.args[0]
+    finally:
+        storage.close()
+
+
+def test_sync_confirmation_rejects_a_changed_source_without_mutation(tmp_path) -> None:
+    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        source = _flow_variant(recipe_ref, "tg11", "111", grams="100")
+        target = _flow_variant(recipe_ref, "tg22", "222", grams="200")
+        context.user_data.update(
+            {
+                "recipe_variants": [source, target],
+                "recipe_versions_differ": True,
+            }
+        )
+        sync_live = AsyncMock()
+        changed_source = _flow_variant(recipe_ref, "tg11", "111", grams="150")
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=[changed_source, target]),
+            sync_live_recipe_from_source=sync_live,
+        )
+
+        asyncio.run(bot._show_sync_preview(query, context, 0))
+        asyncio.run(bot._confirm_sync_preview(query, context))
+
+        sync_live.assert_not_awaited()
+        assert "Выбранная версия изменилась" in query.edit_message_text.await_args.args[0]
+        assert "recipe_sync_preview" not in context.user_data
+    finally:
+        storage.close()
+
+
+def test_sync_confirmation_does_nothing_when_versions_are_already_identical(tmp_path) -> None:
+    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        source = _flow_variant(recipe_ref, "tg11", "111", grams="100")
+        target = _flow_variant(recipe_ref, "tg22", "222", grams="200")
+        identical_target = _flow_variant(recipe_ref, "tg22", "222", grams="100")
+        context.user_data.update(
+            {
+                "recipe_variants": [source, target],
+                "recipe_versions_differ": True,
+            }
+        )
+        sync_live = AsyncMock()
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=[source, identical_target]),
+            sync_live_recipe_from_source=sync_live,
+        )
+
+        asyncio.run(bot._show_sync_preview(query, context, 0))
+        asyncio.run(bot._confirm_sync_preview(query, context))
+
+        sync_live.assert_not_awaited()
+        rendered = query.edit_message_text.await_args
+        assert "синхронизация не нужна" in rendered.args[0].casefold()
+        buttons = [
+            button.text
+            for row in rendered.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "Синхронизировать" not in buttons
+        assert context.user_data["recipe_versions_differ"] is False
+    finally:
+        storage.close()
 
 
 def test_recipe_list_keyboard_keeps_recipe_buttons_navigation_and_actions_inline() -> None:
@@ -397,127 +782,229 @@ def test_recipe_list_keyboard_marks_only_selected_recipes() -> None:
     assert keyboard.inline_keyboard[1][0].text == "Суп · Каба, Света"
 
 
-def test_recipe_product_difference_cache_hydrates_only_supplied_page_and_invalidates() -> None:
-    recipes = [
+def _warning_test_recipes() -> list[Recipe]:
+    return [
         Recipe(
             id=f"recipe-{index}",
             title=f"Рецепт {index}",
             group_id="group",
             remote_ids={"tg11": f"a-{index}", "tg22": f"b-{index}"},
+            remote_ids_by_account={
+                "tg11": [f"a-{index}"],
+                "tg22": [f"b-{index}"],
+            },
         )
         for index in range(9)
     ]
 
-    class FakeEngine:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
 
-        async def hydrate_live_recipe_variants(self, recipe: Recipe) -> list[RemoteRecipeVariant]:
-            self.calls.append(recipe.id)
-            first = _recipe_variant("tg11", recipe.remote_ids["tg11"], [_ingredient("a", "Яйцо", "100")])
-            second_grams = "200" if recipe.id == "recipe-0" else "100"
-            second = _recipe_variant(
-                "tg22",
-                recipe.remote_ids["tg22"],
-                [_ingredient("b", "Яйцо", second_grams)],
-            )
-            return [first, second]
+class _FakeApplication:
+    def __init__(self) -> None:
+        self.tasks: list[asyncio.Task] = []
 
+    def create_task(self, coroutine, **kwargs):  # noqa: ANN001, ANN003
+        task = asyncio.create_task(coroutine, name=kwargs.get("name"))
+        self.tasks.append(task)
+        return task
+
+
+class _EditableRecipeListMessage:
+    def __init__(self) -> None:
+        self.edits: list[tuple[str, object]] = []
+
+    async def edit_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+        self.edits.append((text, kwargs.get("reply_markup")))
+
+
+class _RecipeSearchMessage:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, object, _EditableRecipeListMessage]] = []
+
+    async def reply_text(self, text: str, **kwargs) -> _EditableRecipeListMessage:  # noqa: ANN003
+        target = _EditableRecipeListMessage()
+        self.sent.append((text, kwargs.get("reply_markup"), target))
+        return target
+
+
+def _recipe_search_bot_and_context(recipes: list[Recipe], engine):  # noqa: ANN001, ANN202
     bot = object.__new__(TelegramRecipeBot)
-    bot.sync_engine = FakeEngine()
-    context = SimpleNamespace(chat_data={})
-
-    first_page = asyncio.run(bot._recipe_product_difference_ids(context, recipes[:8]))
-    cached_page = asyncio.run(bot._recipe_product_difference_ids(context, recipes[:8]))
-    second_page = asyncio.run(bot._recipe_product_difference_ids(context, recipes[8:]))
-
-    assert first_page == {"recipe-0"}
-    assert cached_page == {"recipe-0"}
-    assert second_page == set()
-    assert sorted(bot.sync_engine.calls) == sorted(recipe.id for recipe in recipes)
-
-    bot._set_recipe_cache(context, "group", recipes)
-    asyncio.run(bot._recipe_product_difference_ids(context, recipes[:1]))
-
-    assert bot.sync_engine.calls.count("recipe-0") == 2
-
-
-def test_recipe_product_difference_failure_does_not_break_other_recipe_markers() -> None:
-    failing = Recipe(
-        id="failing",
-        title="Ошибка",
-        remote_ids={"tg11": "111", "tg22": "222"},
+    bot.sync_engine = engine
+    bot.storage = SimpleNamespace(
+        list_fatsecret_accounts=lambda group_id: [
+            SimpleNamespace(key="tg11", label="Первый"),
+            SimpleNamespace(key="tg22", label="Второй"),
+        ]
     )
-    different = Recipe(
-        id="different",
-        title="Омлет",
-        remote_ids={"tg11": "333", "tg22": "444"},
-    )
-
-    class FakeEngine:
-        async def hydrate_live_recipe_variants(self, recipe: Recipe) -> list[RemoteRecipeVariant]:
-            if recipe.id == "failing":
-                raise RuntimeError("unavailable")
-            return [
-                _recipe_variant("tg11", "333", [_ingredient("a", "Яйцо", "100")]),
-                _recipe_variant("tg22", "444", [_ingredient("b", "Яйцо", "200")]),
-            ]
-
-    bot = object.__new__(TelegramRecipeBot)
-    bot.sync_engine = FakeEngine()
-    context = SimpleNamespace(chat_data={})
-
-    marked = asyncio.run(bot._recipe_product_difference_ids(context, [failing, different]))
-
-    assert marked == {"different"}
-
-
-def test_recipe_search_compares_only_first_visible_page() -> None:
-    recipes = [
-        Recipe(
-            id=f"recipe-{index}",
-            title=f"Рецепт {index}",
-            group_id="group",
-            remote_ids={"tg11": f"a-{index}", "tg22": f"b-{index}"},
-        )
-        for index in range(9)
-    ]
-
-    class FakeEngine:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-
-        async def hydrate_live_recipe_variants(self, recipe: Recipe) -> list[RemoteRecipeVariant]:
-            self.calls.append(recipe.id)
-            return [
-                _recipe_variant("tg11", recipe.remote_ids["tg11"], [_ingredient("a", "Соль", "5")]),
-                _recipe_variant("tg22", recipe.remote_ids["tg22"], [_ingredient("b", "Соль", "5")]),
-            ]
-
-    class FakeMessage:
-        def __init__(self) -> None:
-            self.sent: list[tuple[str, object]] = []
-
-        async def reply_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
-            self.sent.append((text, kwargs.get("reply_markup")))
-
-    bot = object.__new__(TelegramRecipeBot)
-    bot.sync_engine = FakeEngine()
-    bot.storage = SimpleNamespace(list_fatsecret_accounts=lambda group_id: [])
+    application = _FakeApplication()
     context = SimpleNamespace(
+        application=application,
         user_data={"group_id": "group"},
         chat_data={"recipe_cache_group_id": "group", "recipe_cache": recipes},
     )
-    message = FakeMessage()
-    update = SimpleNamespace(effective_message=message)
+    return bot, context, application
 
-    asyncio.run(bot._handle_recipe_search(update, context, "рецепт"))
 
-    assert bot.sync_engine.calls == [recipe.id for recipe in recipes[:8]]
-    assert len(message.sent) == 1
-    keyboard = message.sent[0][1]
-    assert keyboard.inline_keyboard[0][0].text.startswith("Рецепт 0")
-    assert all("Рецепт 8" not in button.text for row in keyboard.inline_keyboard for button in row)
+def test_recipe_warning_state_marks_structural_differences_without_hydration() -> None:
+    recipe = Recipe(
+        id="missing",
+        title="Нет копии",
+        group_id="group",
+        remote_ids={"tg11": "111"},
+        remote_ids_by_account={"tg11": ["111"]},
+    )
+    bot, context, _ = _recipe_search_bot_and_context([recipe], SimpleNamespace())
+
+    marked, pending, accounts = bot._recipe_warning_state(context, "group", [recipe])
+
+    assert marked == {"missing"}
+    assert pending == []
+    assert accounts == {"tg11", "tg22"}
+
+
+def test_recipe_search_renders_immediately_then_updates_visible_page_once() -> None:
+    recipes = _warning_test_recipes()
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def hydrate_live_recipe_variants_batch(
+            self,
+            requested: list[Recipe],
+        ) -> dict[str, list[RemoteRecipeVariant]]:
+            self.calls.append([recipe.id for recipe in requested])
+            self.started.set()
+            await self.release.wait()
+            result: dict[str, list[RemoteRecipeVariant]] = {}
+            for recipe in requested:
+                grams = "200" if recipe.id == "recipe-0" else "100"
+                result[recipe.id] = [
+                    _recipe_variant("tg11", recipe.remote_ids["tg11"], [_ingredient("a", "Яйцо", "100")]),
+                    _recipe_variant("tg22", recipe.remote_ids["tg22"], [_ingredient("b", "Яйцо", grams)]),
+                ]
+            return result
+
+    async def scenario() -> None:
+        engine = FakeEngine()
+        bot, context, application = _recipe_search_bot_and_context(recipes, engine)
+        message = _RecipeSearchMessage()
+        update = SimpleNamespace(effective_message=message)
+
+        await bot._handle_recipe_search(update, context, "рецепт")
+
+        assert len(message.sent) == 1
+        initial_text, keyboard, target = message.sent[0]
+        assert "Проверяю версии в фоне" in initial_text
+        assert keyboard.inline_keyboard[0][0].text.startswith("Рецепт 0")
+        assert all("Рецепт 8" not in button.text for row in keyboard.inline_keyboard for button in row)
+        assert target.edits == []
+        await engine.started.wait()
+        assert engine.calls == [[recipe.id for recipe in recipes[:8]]]
+
+        engine.release.set()
+        await asyncio.gather(*application.tasks)
+
+        assert len(target.edits) == 1
+        final_text, final_keyboard = target.edits[0]
+        assert "Проверяю версии в фоне" not in final_text
+        assert "⚠️" in final_text
+        assert final_keyboard.inline_keyboard[0][0].text.endswith("⚠️")
+        marked, pending, _ = bot._recipe_warning_state(context, "group", recipes[:8])
+        assert marked == {"recipe-0"}
+        assert pending == []
+
+    asyncio.run(scenario())
+
+
+def test_recipe_warning_scan_failure_keeps_rendered_list_usable() -> None:
+    recipes = _warning_test_recipes()[:2]
+
+    class FailingEngine:
+        async def hydrate_live_recipe_variants_batch(self, requested):  # noqa: ANN001, ANN202
+            raise RuntimeError("unavailable")
+
+    async def scenario() -> None:
+        bot, context, application = _recipe_search_bot_and_context(recipes, FailingEngine())
+        message = _RecipeSearchMessage()
+
+        await bot._handle_recipe_search(SimpleNamespace(effective_message=message), context, "рецепт")
+        await asyncio.gather(*application.tasks)
+
+        initial_text, _, target = message.sent[0]
+        assert "Проверяю версии в фоне" in initial_text
+        assert len(target.edits) == 1
+        assert "Найдено рецептов: 2" in target.edits[0][0]
+        assert "Проверяю версии в фоне" not in target.edits[0][0]
+
+    asyncio.run(scenario())
+
+
+def test_recipe_warning_render_ignores_stale_results_after_navigation() -> None:
+    recipes = _warning_test_recipes()[:1]
+
+    class BlockingEngine:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def hydrate_live_recipe_variants_batch(self, requested):  # noqa: ANN001, ANN202
+            self.started.set()
+            await self.release.wait()
+            recipe = requested[0]
+            return {
+                recipe.id: [
+                    _recipe_variant("tg11", "a", [_ingredient("a", "Яйцо", "100")]),
+                    _recipe_variant("tg22", "b", [_ingredient("b", "Яйцо", "200")]),
+                ]
+            }
+
+    async def scenario() -> None:
+        engine = BlockingEngine()
+        bot, context, application = _recipe_search_bot_and_context(recipes, engine)
+        message = _RecipeSearchMessage()
+        await bot._handle_recipe_search(SimpleNamespace(effective_message=message), context, "рецепт")
+        await engine.started.wait()
+
+        bot._cancel_recipe_warning_render(context)
+        engine.release.set()
+        await asyncio.gather(*application.tasks, return_exceptions=True)
+
+        assert message.sent[0][2].edits == []
+        assert RECIPE_WARNING_RENDER_TASK_KEY not in context.chat_data
+
+    asyncio.run(scenario())
+
+
+def test_recipe_warning_scan_deduplicates_identical_in_flight_requests() -> None:
+    recipes = _warning_test_recipes()[:2]
+
+    class BlockingEngine:
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def hydrate_live_recipe_variants_batch(self, requested):  # noqa: ANN001, ANN202
+            self.calls += 1
+            await self.release.wait()
+            return {recipe.id: [] for recipe in requested}
+
+    async def scenario() -> None:
+        engine = BlockingEngine()
+        bot, context, _ = _recipe_search_bot_and_context(recipes, engine)
+        connected = {"tg11", "tg22"}
+
+        first = bot._shared_recipe_warning_scan(context, "group", recipes, connected)
+        second = bot._shared_recipe_warning_scan(context, "group", recipes, connected)
+
+        assert first is second
+        await asyncio.sleep(0)
+        assert engine.calls == 1
+        engine.release.set()
+        await first
+
+    asyncio.run(scenario())
 
 
 def test_ensure_main_keyboard_does_not_send_extra_message() -> None:

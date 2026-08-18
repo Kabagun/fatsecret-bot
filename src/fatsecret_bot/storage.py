@@ -29,6 +29,15 @@ from .portions import grams_from_portion, is_bare_weight_portion
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
 STORAGE_SCHEMA_VERSION = 4
 DIARY_COPY_STALE_AFTER = dt.timedelta(minutes=30)
+MAX_GROUP_MEMBERS = 2
+
+
+class GroupMemberLimitError(ValueError):
+    """Raised when a new member tries to join a full recipe group."""
+
+    def __init__(self, limit: int = MAX_GROUP_MEMBERS) -> None:
+        self.limit = limit
+        super().__init__(f"Recipe group member limit reached: {limit}")
 
 
 def normalize_title(title: str) -> str:
@@ -867,17 +876,35 @@ class Storage:
         return group
 
     def join_group_by_code(self, telegram_id: int, invite_code: str) -> RecipeGroup | None:
-        """Join a group, move owned accounts there, and make it active for the user."""
+        """Join a group, move owned accounts there, and make it active for the user.
+
+        Existing members may always switch back to the group. A new member raises
+        :class:`GroupMemberLimitError` when the group already has the maximum size.
+        """
         normalized = invite_code.strip().upper().replace(" ", "")
-        row = self._conn.execute(
-            "SELECT id, name, invite_code FROM recipe_groups WHERE invite_code = ?",
-            (normalized,),
-        ).fetchone()
-        if row is None:
-            return None
-        source_group_id = self._active_group_id_for_user(telegram_id)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            source_group_id = self._active_group_id_for_user(telegram_id)
+            row = self._conn.execute(
+                "SELECT id, name, invite_code FROM recipe_groups WHERE invite_code = ?",
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                return None
+            existing_member = self._conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id = ? AND telegram_id = ?",
+                (row["id"], telegram_id),
+            ).fetchone()
+            if existing_member is None:
+                member_count = int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM group_members WHERE group_id = ?",
+                        (row["id"],),
+                    ).fetchone()[0]
+                )
+                if member_count >= MAX_GROUP_MEMBERS:
+                    raise GroupMemberLimitError()
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO group_members(group_id, telegram_id, joined_at)

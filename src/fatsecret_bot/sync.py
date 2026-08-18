@@ -93,6 +93,22 @@ class _RecipeSourceSnapshot:
     display: Recipe
 
 
+def _validate_expected_recipe_source(
+    source_remote_id: str,
+    source_recipe: Recipe,
+    expected_remote_id: str | None,
+    expected_content_digest: str | None,
+) -> None:
+    """Reject synchronization when the approved source version is no longer current."""
+    if expected_remote_id is not None and source_remote_id != expected_remote_id:
+        raise FatSecretError("Выбранная версия рецепта изменилась. Проверь источник и подтверди снова.")
+    if (
+        expected_content_digest is not None
+        and recipe_content_fingerprint(source_recipe).digest != expected_content_digest
+    ):
+        raise FatSecretError("Рецепт изменился после проверки. Открой обновлённую версию и подтверди снова.")
+
+
 @dataclass(frozen=True)
 class RecipeListItem:
     query: str
@@ -1907,9 +1923,19 @@ class RecipeSyncEngine:
         merged: dict[str, Recipe] = {}
         summaries_by_account: dict[str, list] = {}
         live_remote_ids_by_account = {account_key: set() for account_key in clients}
+        started_at = dt.datetime.now(dt.UTC)
         try:
-            for account_key, client in clients.items():
-                summaries = await client.cookbook()
+            cookbook_results = await asyncio.gather(
+                *(client.cookbook() for client in clients.values()),
+                return_exceptions=True,
+            )
+            first_error = next(
+                (result for result in cookbook_results if isinstance(result, BaseException)),
+                None,
+            )
+            if first_error is not None:
+                raise first_error
+            for (account_key, _client), summaries in zip(clients.items(), cookbook_results, strict=True):
                 summaries_by_account[account_key] = summaries
                 for summary in summaries:
                     live_remote_ids_by_account[account_key].add(summary.remote_id)
@@ -1941,42 +1967,100 @@ class RecipeSyncEngine:
                 live_remote_ids_by_account[account_key],
             )
         self.storage.reconcile_group_remote_recipes(group_id, live_remote_ids_by_account)
-        return [merged[key] for key in sorted(merged)]
+        recipes = [merged[key] for key in sorted(merged)]
+        logger.info(
+            "Loaded live recipe index group_id=%s accounts=%d summaries=%d recipes=%d duration=%.3fs",
+            group_id,
+            len(clients),
+            sum(len(items) for items in summaries_by_account.values()),
+            len(recipes),
+            (dt.datetime.now(dt.UTC) - started_at).total_seconds(),
+        )
+        return recipes
+
+    async def hydrate_live_recipe_variants_batch(
+        self,
+        recipe_refs: list[Recipe],
+    ) -> dict[str, list[RemoteRecipeVariant]]:
+        """Hydrate several recipe cards while reusing clients and food-detail reads."""
+        if not recipe_refs:
+            return {}
+        group_ids = {recipe.group_id for recipe in recipe_refs}
+        if len(group_ids) != 1:
+            raise FatSecretError("Нельзя одновременно проверить рецепты из разных групп.")
+        group_id = next(iter(group_ids))
+        clients = self._build_clients(group_id)
+        detail_tasks = {account_key: {} for account_key in clients}
+        semaphore = asyncio.Semaphore(2)
+        started_at = dt.datetime.now(dt.UTC)
+
+        async def hydrate_one(recipe_ref: Recipe) -> tuple[str, list[RemoteRecipeVariant]]:
+            variants: list[RemoteRecipeVariant] = []
+            async with semaphore:
+                for account_key in sorted(set(recipe_ref.remote_ids) | set(recipe_ref.remote_ids_by_account)):
+                    client = clients.get(account_key)
+                    if client is None:
+                        continue
+                    for remote_id in _remote_ids_for_account(recipe_ref, account_key):
+                        remote = await client.get_recipe(remote_id)
+                        transport = _copy_recipe_from_remote(recipe_ref.id, remote)
+                        normalized = await self._normalize_recipe_ingredients(
+                            client,
+                            remote.ingredients,
+                            detail_tasks=detail_tasks[account_key],
+                        )
+                        display = _copy_recipe_from_remote(recipe_ref.id, remote)
+                        display.ingredients = _copy_remote_ingredients(recipe_ref.id, normalized)
+                        display.title = display.title or recipe_ref.title
+                        display.group_id = recipe_ref.group_id
+                        display.remote_ids = {account_key: remote_id}
+                        display.remote_ids_by_account = {account_key: [remote_id]}
+                        strict_fingerprint = recipe_fingerprint(transport)
+                        self.storage.upsert_remote_recipe_snapshot(
+                            account_key,
+                            remote_id,
+                            transport,
+                            strict_fingerprint,
+                        )
+                        variants.append(
+                            RemoteRecipeVariant(
+                                account_key=account_key,
+                                remote_recipe_id=remote_id,
+                                recipe=display,
+                                fingerprint=recipe_content_fingerprint(transport),
+                            )
+                        )
+            return recipe_ref.id, variants
+
+        try:
+            hydrated = await asyncio.gather(
+                *(hydrate_one(recipe_ref) for recipe_ref in recipe_refs),
+                return_exceptions=True,
+            )
+        finally:
+            outstanding = [task for tasks in detail_tasks.values() for task in tasks.values() if not task.done()]
+            for task in outstanding:
+                task.cancel()
+            if outstanding:
+                await asyncio.gather(*outstanding, return_exceptions=True)
+            await self._close_clients(clients)
+        first_error = next((item for item in hydrated if isinstance(item, BaseException)), None)
+        if first_error is not None:
+            raise first_error
+        result = dict(hydrated)
+        logger.info(
+            "Hydrated live recipe variants group_id=%s recipes=%d variants=%d food_details=%d duration=%.3fs",
+            group_id,
+            len(recipe_refs),
+            sum(len(variants) for variants in result.values()),
+            sum(len(tasks) for tasks in detail_tasks.values()),
+            (dt.datetime.now(dt.UTC) - started_at).total_seconds(),
+        )
+        return result
 
     async def hydrate_live_recipe_variants(self, recipe_ref: Recipe) -> list[RemoteRecipeVariant]:
         """Load and persist every account-specific live version represented by a merged recipe card."""
-        clients = self._build_clients(recipe_ref.group_id)
-        variants: list[RemoteRecipeVariant] = []
-        try:
-            for account_key in sorted(set(recipe_ref.remote_ids) | set(recipe_ref.remote_ids_by_account)):
-                client = clients.get(account_key)
-                if client is None:
-                    continue
-                for remote_id in _remote_ids_for_account(recipe_ref, account_key):
-                    snapshot = await self._load_recipe_source_snapshot(client, remote_id, recipe_ref.id)
-                    display = snapshot.display
-                    display.title = display.title or recipe_ref.title
-                    display.group_id = recipe_ref.group_id
-                    display.remote_ids = {account_key: remote_id}
-                    display.remote_ids_by_account = {account_key: [remote_id]}
-                    strict_fingerprint = recipe_fingerprint(snapshot.transport)
-                    self.storage.upsert_remote_recipe_snapshot(
-                        account_key,
-                        remote_id,
-                        snapshot.transport,
-                        strict_fingerprint,
-                    )
-                    variants.append(
-                        RemoteRecipeVariant(
-                            account_key=account_key,
-                            remote_recipe_id=remote_id,
-                            recipe=display,
-                            fingerprint=recipe_content_fingerprint(snapshot.transport),
-                        )
-                    )
-        finally:
-            await self._close_clients(clients)
-        return variants
+        return (await self.hydrate_live_recipe_variants_batch([recipe_ref])).get(recipe_ref.id, [])
 
     async def hydrate_live_recipe(self, recipe_ref: Recipe) -> Recipe | None:
         """Load current recipe details from FatSecret for an in-memory recipe reference."""
@@ -3414,8 +3498,15 @@ class RecipeSyncEngine:
             raise FatSecretError("У рецепта нет привязки к FatSecret. Нажми «Обновить» и попробуй снова.")
         return await self.sync_recipe_from_source(recipe_id, next(iter(recipe.remote_ids)))
 
-    async def sync_recipe_from_source(self, recipe_id: str, source_account_key: str) -> list[AccountSyncResult]:
-        """Read a recipe from one FatSecret account and propagate it to every connected account."""
+    async def sync_recipe_from_source(
+        self,
+        recipe_id: str,
+        source_account_key: str,
+        *,
+        expected_source_remote_id: str | None = None,
+        expected_source_content_digest: str | None = None,
+    ) -> list[AccountSyncResult]:
+        """Propagate an approved source version to every connected account."""
         sync_run = uuid.uuid4().hex[:12]
         logger.info(
             "Recipe sync started run=%s local_recipe_id=%s source_account_key=%s mode=stored",
@@ -3441,6 +3532,12 @@ class RecipeSyncEngine:
             source_snapshot = await self._load_recipe_source_snapshot(source_client, source_remote_id, recipe.id)
             source_recipe = source_snapshot.transport
             display_recipe = source_snapshot.display
+            _validate_expected_recipe_source(
+                source_remote_id,
+                source_recipe,
+                expected_source_remote_id,
+                expected_source_content_digest,
+            )
             source_fingerprint = recipe_fingerprint(source_recipe)
             self.storage.upsert_remote_recipe_snapshot(
                 source_account_key,
@@ -3577,8 +3674,11 @@ class RecipeSyncEngine:
         self,
         recipe_ref: Recipe,
         source_account_key: str,
+        *,
+        expected_source_remote_id: str | None = None,
+        expected_source_content_digest: str | None = None,
     ) -> tuple[Recipe, list[AccountSyncResult]]:
-        """Read a live recipe from one FatSecret account and propagate it without persisting local recipe rows."""
+        """Propagate an approved live source without persisting local recipe rows."""
         sync_run = uuid.uuid4().hex[:12]
         logger.info(
             "Recipe sync started run=%s local_recipe_id=%s source_account_key=%s mode=live",
@@ -3600,6 +3700,12 @@ class RecipeSyncEngine:
             source_snapshot = await self._load_recipe_source_snapshot(source_client, source_remote_id, recipe_ref.id)
             transport_recipe = source_snapshot.transport
             recipe = source_snapshot.display
+            _validate_expected_recipe_source(
+                source_remote_id,
+                transport_recipe,
+                expected_source_remote_id,
+                expected_source_content_digest,
+            )
             self.storage.upsert_remote_recipe_snapshot(
                 source_account_key,
                 source_remote_id,

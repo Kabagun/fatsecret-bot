@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import html
+import io
 import logging
 import re
 import time
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -38,7 +39,8 @@ from .models import (
     RemoteRecipeVariant,
 )
 from .nutrition import custom_food_macro_error
-from .storage import Storage, normalize_title
+from .portions import grams_from_portion
+from .storage import GroupMemberLimitError, Storage, normalize_title
 from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,10 @@ RECIPE_RENDER_KEY = "recipe_render_key"
 RECIPE_SEARCH_IDS_KEY = "recipe_search_ids"
 RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY = "recipe_product_difference_cache"
 RECIPE_PRODUCT_DIFFERENCE_FOOTER = "⚠️ — в рецепте есть различия между аккаунтами."
+RECIPE_WARNING_CACHE_TTL_SECONDS = 60.0
+RECIPE_WARNING_RENDER_TOKEN_KEY = "recipe_warning_render_token"
+RECIPE_WARNING_RENDER_TASK_KEY = "recipe_warning_render_task"
+TELEGRAM_SAFE_TEXT_LIMIT = 4000
 MAIN_BUTTONS = {
     "Поиск рецептов",
     "Рецепты",
@@ -157,6 +163,35 @@ def _format_recipe(recipe: Recipe) -> str:
         f"<b>Ингредиенты</b>\n{ingredients}"
         f"{steps_text}"
     )
+
+
+def _recipe_export_payload(recipe: Recipe) -> str:
+    """Render the part of a recipe accepted by the existing list importer."""
+    ingredient_lines: list[str] = []
+    missing_weights: list[str] = []
+    for ingredient in recipe.ingredients:
+        grams = grams_from_portion(
+            ingredient.amount,
+            ingredient.portion_description,
+            explicit_grams=ingredient.grams,
+        )
+        if grams is None or grams <= 0:
+            missing_weights.append(ingredient.title.strip() or "Без названия")
+            continue
+        ingredient_lines.append(
+            f"{ingredient.title.strip() or 'Без названия'} {_format_decimal_plain(grams)}"
+        )
+    if missing_weights:
+        names = ", ".join(missing_weights)
+        raise ValueError(f"Не удалось определить массу в граммах: {names}.")
+    if not ingredient_lines:
+        raise ValueError("В рецепте нет ингредиентов для экспорта.")
+    lines = [f"Порций: {_format_decimal_plain(recipe.portions)}", *ingredient_lines]
+    steps = [step.strip() for step in recipe.steps if step.strip()]
+    if steps:
+        lines.extend(["", "Шаги:"])
+        lines.extend(f"{index}. {step}" for index, step in enumerate(steps, start=1))
+    return "\n".join(lines)
 
 
 def _format_recipe_conflict(
@@ -398,6 +433,39 @@ class _RecipeProductComparison:
         return any(products for _, products in self.different_products)
 
 
+@dataclass(frozen=True)
+class _RecipeWarningCacheEntry:
+    signature: tuple[tuple[str, tuple[str, ...]], ...]
+    has_differences: bool
+    checked_at: float
+
+
+@dataclass(frozen=True)
+class _RecipeWarningScanResult:
+    differences: dict[str, bool]
+    failed: bool = False
+
+
+def _recipe_remote_signature(
+    recipe: Recipe,
+    connected_account_keys: set[str],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return tuple(
+        (
+            account_key,
+            tuple(
+                dict.fromkeys(
+                    [
+                        *(recipe.remote_ids_by_account.get(account_key) or []),
+                        *([recipe.remote_ids[account_key]] if account_key in recipe.remote_ids else []),
+                    ]
+                )
+            ),
+        )
+        for account_key in sorted(connected_account_keys)
+    )
+
+
 def _visible_ingredient_key(ingredient: Ingredient) -> tuple[str, str]:
     return normalize_title(ingredient.title), normalize_title(_format_ingredient_amount(ingredient))
 
@@ -435,6 +503,21 @@ def _compare_recipe_products(variants: list[RemoteRecipeVariant]) -> _RecipeProd
                 differences.append(ingredient)
         different_products.append((variant, tuple(differences)))
     return _RecipeProductComparison(tuple(same_products), tuple(different_products))
+
+
+def _recipe_versions_differ(
+    variants: list[RemoteRecipeVariant],
+    connected_account_keys: set[str],
+) -> bool:
+    """Return whether connected accounts do not contain one identical recipe each."""
+    if not variants:
+        return True
+    counts = Counter(variant.account_key for variant in variants)
+    if any(counts.get(account_key, 0) != 1 for account_key in connected_account_keys):
+        return True
+    if any(account_key not in connected_account_keys for account_key in counts):
+        return True
+    return len({variant.fingerprint.digest for variant in variants}) > 1
 
 
 def _format_product_difference_amount(ingredient: Ingredient) -> str:
@@ -517,16 +600,31 @@ def _recipe_actions_keyboard(
     page: int = 0,
     page_action: str = "list",
     total_pages: int = 1,
+    *,
+    can_sync: bool = False,
+    export_variant_index: int = -1,
 ) -> InlineKeyboardMarkup:
     page_action = page_action if page_action in {"list", "searchpage"} else "list"
     page = max(0, page)
-    return InlineKeyboardMarkup(
+    buttons = [
         [
-            [InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")],
+            InlineKeyboardButton(
+                "Экспортировать",
+                callback_data=f"recipe_export:{recipe_id}:{export_variant_index}",
+            )
+        ]
+    ]
+    if can_sync:
+        buttons.append([InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")])
+    buttons.extend(
+        [
             [InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{recipe_id}")],
             [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}")],
             [InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")],
         ]
+    )
+    return InlineKeyboardMarkup(
+        buttons
     )
 
 
@@ -551,10 +649,17 @@ def _recipe_list_button_text(
     return f"{text[: 90 - len(marker)].rstrip()}{marker}"
 
 
-def _recipe_list_message(title: str, *, has_product_differences: bool = False) -> str:
+def _recipe_list_message(
+    title: str,
+    *,
+    has_product_differences: bool = False,
+    checking_versions: bool = False,
+) -> str:
     lines = [title, "Пришли текст в чат, чтобы искать по рецептам.", LIST_WIDTH_LINE]
     if has_product_differences:
         lines.append(RECIPE_PRODUCT_DIFFERENCE_FOOTER)
+    if checking_versions:
+        lines.append("⏳ Проверяю версии в фоне…")
     return "\n".join(lines)
 
 
@@ -907,6 +1012,7 @@ class TelegramRecipeBot:
         self.storage = storage
         self.sync_engine = sync_engine
         self._food_usage_refresh_task: asyncio.Task[None] | None = None
+        self._recipe_warning_scans: dict[tuple[object, ...], asyncio.Task[_RecipeWarningScanResult]] = {}
 
     def build(self) -> Application:
         app = (
@@ -965,12 +1071,17 @@ class TelegramRecipeBot:
         logger.info("Scheduled daily FatSecret food usage refresh background task")
 
     async def _post_shutdown(self, app: Application) -> None:
-        if self._food_usage_refresh_task is None:
-            return
-        self._food_usage_refresh_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._food_usage_refresh_task
-        self._food_usage_refresh_task = None
+        warning_scans = list(self._recipe_warning_scans.values())
+        for task in warning_scans:
+            task.cancel()
+        if warning_scans:
+            await asyncio.gather(*warning_scans, return_exceptions=True)
+        self._recipe_warning_scans.clear()
+        if self._food_usage_refresh_task is not None:
+            self._food_usage_refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._food_usage_refresh_task
+            self._food_usage_refresh_task = None
 
     async def _food_usage_refresh_loop(self) -> None:
         while True:
@@ -1006,13 +1117,22 @@ class TelegramRecipeBot:
         recipes = context.chat_data.get(RECIPE_CACHE_KEY)
         return recipes if isinstance(recipes, list) else None
 
-    def _set_recipe_cache(self, context: ContextTypes.DEFAULT_TYPE, group_id: str, recipes: list[Recipe]) -> None:
+    def _set_recipe_cache(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        group_id: str,
+        recipes: list[Recipe],
+        *,
+        invalidate_warnings: bool = True,
+    ) -> None:
         context.chat_data[RECIPE_CACHE_GROUP_KEY] = group_id
         context.chat_data[RECIPE_CACHE_KEY] = recipes
         context.chat_data[RECIPE_CACHE_LOADED_KEY] = time.time()
-        context.chat_data.pop(RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY, None)
+        if invalidate_warnings:
+            context.chat_data.pop(RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY, None)
 
     def _clear_recipe_cache(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self._cancel_recipe_warning_render(context)
         context.chat_data.pop(RECIPE_CACHE_GROUP_KEY, None)
         context.chat_data.pop(RECIPE_CACHE_KEY, None)
         context.chat_data.pop(RECIPE_CACHE_LOADED_KEY, None)
@@ -1021,37 +1141,221 @@ class TelegramRecipeBot:
     def _recipe_product_difference_cache(
         self,
         context: ContextTypes.DEFAULT_TYPE,
-    ) -> dict[str, bool]:
+    ) -> dict[str, _RecipeWarningCacheEntry]:
         cache = context.chat_data.get(RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY)
         if not isinstance(cache, dict):
             cache = {}
             context.chat_data[RECIPE_PRODUCT_DIFFERENCE_CACHE_KEY] = cache
         return cache
 
-    async def _recipe_product_difference_ids(
+    def _recipe_warning_state(
         self,
         context: ContextTypes.DEFAULT_TYPE,
+        group_id: str,
         recipes: list[Recipe],
-    ) -> set[str]:
+    ) -> tuple[set[str], list[Recipe], set[str]]:
+        connected_account_keys = {
+            account.key for account in self.storage.list_fatsecret_accounts(group_id)
+        }
         cache = self._recipe_product_difference_cache(context)
-        missing = [recipe for recipe in recipes if recipe.id not in cache]
-        semaphore = asyncio.Semaphore(2)
+        now = time.monotonic()
+        warning_ids: set[str] = set()
+        pending: list[Recipe] = []
+        for recipe in recipes:
+            signature = _recipe_remote_signature(recipe, connected_account_keys)
+            has_structural_difference = any(len(remote_ids) != 1 for _, remote_ids in signature)
+            if has_structural_difference:
+                cache[recipe.id] = _RecipeWarningCacheEntry(signature, True, now)
+                warning_ids.add(recipe.id)
+                continue
+            if len(connected_account_keys) < 2:
+                cache[recipe.id] = _RecipeWarningCacheEntry(signature, False, now)
+                continue
+            entry = cache.get(recipe.id)
+            if (
+                isinstance(entry, _RecipeWarningCacheEntry)
+                and entry.signature == signature
+                and now - entry.checked_at <= RECIPE_WARNING_CACHE_TTL_SECONDS
+            ):
+                if entry.has_differences:
+                    warning_ids.add(recipe.id)
+                continue
+            pending.append(recipe)
+        return warning_ids, pending, connected_account_keys
 
-        async def compare(recipe: Recipe) -> tuple[str, bool]:
-            account_keys = set(recipe.remote_ids) | set(recipe.remote_ids_by_account)
-            if len(account_keys) < 2:
-                return recipe.id, False
-            try:
-                async with semaphore:
-                    variants = await self.sync_engine.hydrate_live_recipe_variants(recipe)
-                return recipe.id, _compare_recipe_products(variants).has_differences
-            except Exception:  # noqa: BLE001 - one unavailable recipe must not break the list.
-                logger.exception("Failed to compare live recipe products recipe_id=%s", recipe.id)
-                return recipe.id, False
+    async def _run_recipe_warning_scan(
+        self,
+        group_id: str,
+        recipes: list[Recipe],
+        connected_account_keys: set[str],
+    ) -> _RecipeWarningScanResult:
+        started_at = time.monotonic()
+        try:
+            variants_by_recipe = await self.sync_engine.hydrate_live_recipe_variants_batch(recipes)
+            differences = {
+                recipe.id: _recipe_versions_differ(
+                    variants_by_recipe.get(recipe.id, []),
+                    connected_account_keys,
+                )
+                for recipe in recipes
+            }
+        except Exception:  # noqa: BLE001 - list rendering already succeeded and must remain usable.
+            logger.exception(
+                "Background recipe version scan failed group_id=%s recipes=%d",
+                group_id,
+                len(recipes),
+            )
+            return _RecipeWarningScanResult({}, failed=True)
+        logger.info(
+            "Background recipe version scan completed group_id=%s recipes=%d differences=%d duration=%.3fs",
+            group_id,
+            len(recipes),
+            sum(differences.values()),
+            time.monotonic() - started_at,
+        )
+        return _RecipeWarningScanResult(differences)
 
-        if missing:
-            cache.update(await asyncio.gather(*(compare(recipe) for recipe in missing)))
-        return {recipe.id for recipe in recipes if cache.get(recipe.id) is True}
+    def _shared_recipe_warning_scan(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        group_id: str,
+        recipes: list[Recipe],
+        connected_account_keys: set[str],
+    ) -> asyncio.Task[_RecipeWarningScanResult]:
+        scans = getattr(self, "_recipe_warning_scans", None)
+        if not isinstance(scans, dict):
+            scans = {}
+            self._recipe_warning_scans = scans
+        scan_key: tuple[object, ...] = (
+            group_id,
+            tuple(
+                (recipe.id, _recipe_remote_signature(recipe, connected_account_keys))
+                for recipe in recipes
+            ),
+        )
+        task = scans.get(scan_key)
+        if task is not None and not task.done():
+            return task
+        task = context.application.create_task(
+            self._run_recipe_warning_scan(group_id, recipes, connected_account_keys),
+            name=f"recipe-version-scan-{group_id}",
+        )
+        scans[scan_key] = task
+
+        def forget(completed: asyncio.Task[_RecipeWarningScanResult]) -> None:
+            if scans.get(scan_key) is completed:
+                scans.pop(scan_key, None)
+
+        task.add_done_callback(forget)
+        return task
+
+    def _schedule_recipe_warning_update(
+        self,
+        target,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        group_id: str,
+        recipes: list[Recipe],
+        pending: list[Recipe],
+        connected_account_keys: set[str],
+        page: int,
+        page_action: str,
+        total_count: int,
+        title: str,
+        account_labels: dict[str, str],
+    ) -> None:
+        application = getattr(context, "application", None)
+        if not pending or application is None:
+            return
+        previous = context.chat_data.get(RECIPE_WARNING_RENDER_TASK_KEY)
+        if isinstance(previous, asyncio.Task) and not previous.done():
+            previous.cancel()
+        render_token = time.monotonic_ns()
+        context.chat_data[RECIPE_WARNING_RENDER_TOKEN_KEY] = render_token
+        shared_scan = self._shared_recipe_warning_scan(
+            context,
+            group_id,
+            pending,
+            connected_account_keys,
+        )
+        task = application.create_task(
+            self._apply_recipe_warning_update(
+                target,
+                context,
+                shared_scan,
+                render_token=render_token,
+                group_id=group_id,
+                recipes=recipes,
+                pending=pending,
+                connected_account_keys=connected_account_keys,
+                page=page,
+                page_action=page_action,
+                total_count=total_count,
+                title=title,
+                account_labels=account_labels,
+            ),
+            name=f"recipe-version-render-{group_id}",
+        )
+        context.chat_data[RECIPE_WARNING_RENDER_TASK_KEY] = task
+
+    @staticmethod
+    def _cancel_recipe_warning_render(context: ContextTypes.DEFAULT_TYPE) -> None:
+        task = context.chat_data.pop(RECIPE_WARNING_RENDER_TASK_KEY, None)
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+        context.chat_data[RECIPE_WARNING_RENDER_TOKEN_KEY] = time.monotonic_ns()
+
+    async def _apply_recipe_warning_update(
+        self,
+        target,
+        context: ContextTypes.DEFAULT_TYPE,
+        shared_scan: asyncio.Task[_RecipeWarningScanResult],
+        *,
+        render_token: int,
+        group_id: str,
+        recipes: list[Recipe],
+        pending: list[Recipe],
+        connected_account_keys: set[str],
+        page: int,
+        page_action: str,
+        total_count: int,
+        title: str,
+        account_labels: dict[str, str],
+    ) -> None:
+        try:
+            result = await asyncio.shield(shared_scan)
+        except asyncio.CancelledError:
+            raise
+        if context.chat_data.get(RECIPE_WARNING_RENDER_TOKEN_KEY) != render_token:
+            return
+        if not result.failed:
+            cache = self._recipe_product_difference_cache(context)
+            checked_at = time.monotonic()
+            for recipe in pending:
+                cache[recipe.id] = _RecipeWarningCacheEntry(
+                    _recipe_remote_signature(recipe, connected_account_keys),
+                    bool(result.differences.get(recipe.id)),
+                    checked_at,
+                )
+        warning_ids, _, _ = self._recipe_warning_state(context, group_id, recipes)
+        text = _recipe_list_message(
+            title,
+            has_product_differences=bool(warning_ids),
+        )
+        reply_markup = self._recipe_list_keyboard(
+            recipes,
+            page,
+            page_action,
+            account_labels,
+            total_count=total_count,
+            product_difference_ids=warning_ids,
+        )
+        edit = getattr(target, "edit_message_text", None) or getattr(target, "edit_text")
+        try:
+            await edit(text, reply_markup=reply_markup)
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).casefold():
+                raise
 
     async def _refresh_recipe_cache_after_sync(
         self,
@@ -1110,19 +1414,21 @@ class TelegramRecipeBot:
         group_id: str,
         recipe: Recipe,
     ) -> None:
+        self._recipe_product_difference_cache(context).pop(recipe.id, None)
         recipes = list(self._recipe_cache(context, group_id) or [])
         for index, item in enumerate(recipes):
             if item.id == recipe.id:
                 recipes[index] = recipe
-                self._set_recipe_cache(context, group_id, recipes)
+                self._set_recipe_cache(context, group_id, recipes, invalidate_warnings=False)
                 return
         recipes.append(recipe)
         recipes.sort(key=lambda item: normalize_title(item.title))
-        self._set_recipe_cache(context, group_id, recipes)
+        self._set_recipe_cache(context, group_id, recipes, invalidate_warnings=False)
 
     def _remove_cached_recipe(self, context: ContextTypes.DEFAULT_TYPE, group_id: str, recipe_id: str) -> None:
+        self._recipe_product_difference_cache(context).pop(recipe_id, None)
         recipes = [recipe for recipe in self._recipe_cache(context, group_id) or [] if recipe.id != recipe_id]
-        self._set_recipe_cache(context, group_id, recipes)
+        self._set_recipe_cache(context, group_id, recipes, invalidate_warnings=False)
 
     def _cached_or_stored_recipe(
         self,
@@ -1661,6 +1967,7 @@ class TelegramRecipeBot:
         context: ContextTypes.DEFAULT_TYPE,
         page: int,
     ) -> None:
+        self._cancel_recipe_warning_render(context)
         group = self.storage.active_group_for_user(update.effective_user.id)
         if group is None:
             await update.effective_message.reply_text(
@@ -1684,20 +1991,39 @@ class TelegramRecipeBot:
         if total_count == 0:
             await status.edit_text("Рецептов пока нет. Создай рецепт в FatSecret и снова нажми «Поиск рецептов».")
             return
-        product_difference_ids = await self._recipe_product_difference_ids(context, recipes)
+        product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
+            context,
+            group.id,
+            recipes,
+        )
+        account_labels = self._account_labels_for_group(group.id)
         await status.edit_text(
             _recipe_list_message(
                 "Общий список рецептов:",
                 has_product_differences=bool(product_difference_ids),
+                checking_versions=bool(pending and getattr(context, "application", None)),
             ),
             reply_markup=self._recipe_list_keyboard(
                 recipes,
                 page,
                 "list",
-                self._account_labels_for_group(group.id),
+                account_labels,
                 total_count=total_count,
                 product_difference_ids=product_difference_ids,
             ),
+        )
+        self._schedule_recipe_warning_update(
+            status,
+            context,
+            group_id=group.id,
+            recipes=recipes,
+            pending=pending,
+            connected_account_keys=connected_account_keys,
+            page=page,
+            page_action="list",
+            total_count=total_count,
+            title="Общий список рецептов:",
+            account_labels=account_labels,
         )
 
     def _account_labels_for_group(self, group_id: str | None) -> dict[str, str]:
@@ -1779,6 +2105,7 @@ class TelegramRecipeBot:
             return
         await query.answer()
         action, _, value = query.data.partition(":")
+        self._cancel_recipe_warning_render(context)
 
         if action == "open":
             context.user_data.pop("mode", None)
@@ -1787,6 +2114,12 @@ class TelegramRecipeBot:
             await self._open_recipe_variant(query, context, int(value or "0"))
         elif action == "syncvariant":
             await self._sync_recipe_variant(query, context, int(value or "0"))
+        elif action == "syncpreview":
+            await self._show_sync_preview(query, context, int(value or "0"))
+        elif action == "syncconfirm":
+            await self._confirm_sync_preview(query, context)
+        elif action == "recipe_export":
+            await self._export_recipe(query, context, value)
         elif action == "recipe_rename":
             await self._start_recipe_rename(query, context, value)
         elif action == "recipe_rename_replace":
@@ -1835,6 +2168,8 @@ class TelegramRecipeBot:
                 else 0
             )
             switched = self.storage.set_active_group_for_user(update.effective_user.id, value)
+            if switched:
+                self._clear_recipe_cache(context)
             refreshed = await self._refresh_group_after_account_transfer(context, value) if switched else False
             transfer_note = f"\n\nПеренесено твоих FatSecret аккаунтов: {moved}." if switched and moved else ""
             refresh_note = "\nНе удалось сразу обновить рецепты; открой список еще раз." if switched and not refreshed else ""
@@ -1864,6 +2199,8 @@ class TelegramRecipeBot:
             )
             left = self.storage.leave_active_group(update.effective_user.id)
             destination = self.storage.active_group_for_user(update.effective_user.id)
+            if left:
+                self._clear_recipe_cache(context)
             refreshed = await self._refresh_group_after_account_transfer(
                 context,
                 destination.id if destination is not None else None,
@@ -1916,6 +2253,8 @@ class TelegramRecipeBot:
                     update.effective_user.id,
                 )
             )
+            if attached:
+                self._clear_recipe_cache(context)
             await query.edit_message_text(
                 "Аккаунт подключен к активной группе." if attached else "Не удалось подключить: аккаунт уже в другой группе или не принадлежит тебе.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
@@ -1931,6 +2270,8 @@ class TelegramRecipeBot:
                     update.effective_user.id,
                 )
             )
+            if detached:
+                self._clear_recipe_cache(context)
             await query.edit_message_text(
                 "Аккаунт отсоединен от группы. Credentials сохранены у владельца."
                 if detached
@@ -1960,6 +2301,8 @@ class TelegramRecipeBot:
                 value,
                 owner_telegram_id=update.effective_user.id,
             )
+            if removed:
+                self._clear_recipe_cache(context)
             await query.edit_message_text(
                 "Подключение FatSecret аккаунта удалено из бота."
                 if removed
@@ -2060,9 +2403,9 @@ class TelegramRecipeBot:
             context.user_data.pop("mode", None)
             await self._open_sync_menu(query, context, value)
         elif action == "syncfrom":
-            source_key, _, recipe_id = value.partition(":")
+            _source_key, _, recipe_id = value.partition(":")
             context.user_data.pop("mode", None)
-            await self._sync_recipe_message(query, context, recipe_id, source_key)
+            await self._open_sync_menu(query, context, recipe_id)
         elif action == "batchdel":
             await self._open_batch_delete(query, context, int(value or "0"))
         elif action == "bdtoggle":
@@ -2126,28 +2469,46 @@ class TelegramRecipeBot:
         if total_count == 0:
             await query.edit_message_text("Рецептов пока нет.")
             return
-        product_difference_ids = (
-            await self._recipe_product_difference_ids(context, recipes)
-            if context is not None
-            else set()
-        )
+        if context is not None:
+            product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
+                context,
+                group.id,
+                recipes,
+            )
+        else:
+            product_difference_ids, pending, connected_account_keys = set(), [], set()
+        account_labels = self._account_labels_for_group(group.id)
         await self._safe_edit_message_text(
             query,
             _recipe_list_message(
                 "Общий список рецептов:",
                 has_product_differences=bool(product_difference_ids),
+                checking_versions=bool(pending and getattr(context, "application", None)),
             ),
             reply_markup=self._recipe_list_keyboard(
                 recipes,
                 page,
                 "list",
-                self._account_labels_for_group(group.id),
+                account_labels,
                 total_count=total_count,
                 product_difference_ids=product_difference_ids,
             ),
         )
         if context is not None:
             self._mark_rendered(context, render_key)
+            self._schedule_recipe_warning_update(
+                query,
+                context,
+                group_id=group.id,
+                recipes=recipes,
+                pending=pending,
+                connected_account_keys=connected_account_keys,
+                page=page,
+                page_action="list",
+                total_count=total_count,
+                title="Общий список рецептов:",
+                account_labels=account_labels,
+            )
 
     async def _edit_search_results(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
         search_query = context.user_data.get("recipe_search_query")
@@ -2186,23 +2547,43 @@ class TelegramRecipeBot:
             return
         await self._ensure_main_keyboard(query.message, context)
         context.user_data["mode"] = "recipe_search"
-        product_difference_ids = await self._recipe_product_difference_ids(context, page_recipes)
+        product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
+            context,
+            str(group_id),
+            page_recipes,
+        )
+        account_labels = self._account_labels_for_group(group_id)
+        title = f"Найдено рецептов: {len(recipes)}"
         await self._safe_edit_message_text(
             query,
             _recipe_list_message(
-                f"Найдено рецептов: {len(recipes)}",
+                title,
                 has_product_differences=bool(product_difference_ids),
+                checking_versions=bool(pending and getattr(context, "application", None)),
             ),
             reply_markup=self._recipe_list_keyboard(
                 page_recipes,
                 page,
                 "searchpage",
-                self._account_labels_for_group(group_id),
+                account_labels,
                 total_count=total_count,
                 product_difference_ids=product_difference_ids,
             ),
         )
         self._mark_rendered(context, render_key)
+        self._schedule_recipe_warning_update(
+            query,
+            context,
+            group_id=str(group_id),
+            recipes=page_recipes,
+            pending=pending,
+            connected_account_keys=connected_account_keys,
+            page=page,
+            page_action="searchpage",
+            total_count=total_count,
+            title=title,
+            account_labels=account_labels,
+        )
 
     async def _refresh_from_callback(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = query.from_user
@@ -2532,20 +2913,31 @@ class TelegramRecipeBot:
         local_recipe = recipe_ref or self.storage.get_recipe(recipe_id)
         if not await self._require_recipe_in_active_group(query, local_recipe):
             return
-        variants = (
-            await self.sync_engine.hydrate_live_recipe_variants(recipe_ref)
-            if recipe_ref is not None
-            else []
-        )
-        recipe = (
-            variants[0].recipe
-            if variants
-            else await self.sync_engine.hydrate_recipe_from_remote(recipe_id)
-        )
-        product_comparison = _compare_recipe_products(variants)
+        variants = []
+        if recipe_ref is not None:
+            variants = await self.sync_engine.hydrate_live_recipe_variants(recipe_ref)
+            if not variants:
+                await query.edit_message_text(
+                    "Рецепт больше не найден в подключённых FatSecret аккаунтах. Обнови список."
+                )
+                return
+            recipe = variants[0].recipe
+        else:
+            recipe = await self.sync_engine.hydrate_recipe_from_remote(recipe_id)
         if recipe is None:
             await query.edit_message_text("Рецепт не найден.")
             return
+        total_pages, page_action = self._recipe_detail_page_count(query.from_user.id, context, page_action)
+        context.user_data["current_recipe_id"] = recipe.id
+        context.user_data["recipe_list_page"] = page
+        context.user_data["recipe_page_action"] = page_action
+        await self._ensure_main_keyboard(query.message, context)
+        accounts = self.storage.list_fatsecret_accounts(recipe.group_id)
+        connected_account_keys = {account.key for account in accounts}
+        versions_differ = bool(variants) and _recipe_versions_differ(variants, connected_account_keys)
+        context.user_data["recipe_variants"] = variants
+        context.user_data["recipe_versions_differ"] = versions_differ
+        context.user_data.pop("current_recipe_variant_index", None)
         if recipe_ref is not None and group is not None:
             recipe.remote_ids = dict(recipe_ref.remote_ids)
             recipe.remote_ids_by_account = {
@@ -2553,44 +2945,23 @@ class TelegramRecipeBot:
                 for account_key, remote_ids in recipe_ref.remote_ids_by_account.items()
             }
             self._replace_cached_recipe(context, group.id, recipe)
-            self._recipe_product_difference_cache(context)[recipe.id] = product_comparison.has_differences
-        total_pages, page_action = self._recipe_detail_page_count(query.from_user.id, context, page_action)
-        context.user_data["current_recipe_id"] = recipe.id
-        context.user_data["recipe_list_page"] = page
-        context.user_data["recipe_page_action"] = page_action
-        await self._ensure_main_keyboard(query.message, context)
-        fingerprints_differ = len({variant.fingerprint.digest for variant in variants}) > 1
-        if variants and (product_comparison.has_differences or fingerprints_differ):
-            account_labels = {
-                account.key: account.label
-                for account in self.storage.list_fatsecret_accounts(recipe.group_id)
-            }
-            context.user_data["recipe_variants"] = variants
-            buttons: list[list[InlineKeyboardButton]] = []
-            for index, variant in enumerate(variants):
-                label = account_labels.get(variant.account_key, variant.account_key)
-                buttons.append(
-                    [
-                        InlineKeyboardButton(f"Открыть: {label}"[:50], callback_data=f"variant:{index}"),
-                        InlineKeyboardButton(f"Источник: {label}"[:50], callback_data=f"syncvariant:{index}"),
-                    ]
-                )
-            buttons.append([InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{recipe.id}")])
-            buttons.append([InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")])
-            await query.edit_message_text(
-                (
-                    _format_recipe_product_differences(product_comparison, account_labels)
-                    if product_comparison.has_differences
-                    else _format_recipe_conflict(variants, account_labels)
-                ),
-                reply_markup=InlineKeyboardMarkup(buttons),
-                parse_mode=ParseMode.HTML,
+            self._recipe_product_difference_cache(context)[recipe.id] = _RecipeWarningCacheEntry(
+                _recipe_remote_signature(recipe, connected_account_keys),
+                versions_differ,
+                time.monotonic(),
             )
+        if versions_differ:
+            await self._show_recipe_variant_picker(query, context, recipe, variants, accounts)
             return
-        context.user_data.pop("recipe_variants", None)
         await query.edit_message_text(
             _format_recipe(recipe),
-            reply_markup=_recipe_actions_keyboard(recipe.id, page, page_action, total_pages),
+            reply_markup=_recipe_actions_keyboard(
+                recipe.id,
+                page,
+                page_action,
+                total_pages,
+                export_variant_index=0 if variants else -1,
+            ),
             parse_mode=ParseMode.HTML,
         )
 
@@ -2605,6 +2976,52 @@ class TelegramRecipeBot:
         variant = variants[index]
         return variant if isinstance(variant, RemoteRecipeVariant) else None
 
+    @staticmethod
+    def _variant_button_label(
+        variant: RemoteRecipeVariant,
+        variants: list[RemoteRecipeVariant],
+        account_labels: dict[str, str],
+    ) -> str:
+        label = account_labels.get(variant.account_key, variant.account_key)
+        if sum(item.account_key == variant.account_key for item in variants) > 1:
+            label = f"{label} (ID {variant.remote_recipe_id})"
+        return label
+
+    async def _show_recipe_variant_picker(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        recipe: Recipe,
+        variants: list[RemoteRecipeVariant],
+        accounts: list[FatSecretAccountConfig],
+        *,
+        heading: str = "Версии рецепта различаются",
+    ) -> None:
+        labels = {account.key: account.label for account in accounts}
+        counts = Counter(variant.account_key for variant in variants)
+        missing = [account.label for account in accounts if counts.get(account.key, 0) == 0]
+        lines = [f"<b>{html.escape(heading)}</b>", "", f"<b>{html.escape(recipe.title)}</b>"]
+        if missing:
+            lines.extend(["", "Нет версии: " + ", ".join(html.escape(label) for label in missing) + "."])
+        lines.extend(["", "Выбери аккаунт, версию которого нужно открыть."])
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    self._variant_button_label(variant, variants, labels)[:60],
+                    callback_data=f"variant:{index}",
+                )
+            ]
+            for index, variant in enumerate(variants)
+        ]
+        page = max(0, int(context.user_data.get("recipe_list_page") or 0))
+        page_action = str(context.user_data.get("recipe_page_action") or "list")
+        buttons.append([InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")])
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+
     async def _open_recipe_variant(
         self,
         query,
@@ -2615,23 +3032,77 @@ class TelegramRecipeBot:
         if variant is None:
             await query.edit_message_text("Версия устарела. Открой рецепт из списка заново.")
             return
-        label = next(
-            (
-                account.label
-                for account in self.storage.list_fatsecret_accounts(variant.recipe.group_id)
-                if account.key == variant.account_key
-            ),
-            variant.account_key,
-        )
+        variants = context.user_data.get("recipe_variants")
+        variants = variants if isinstance(variants, list) else [variant]
+        accounts = self.storage.list_fatsecret_accounts(variant.recipe.group_id)
+        labels = {account.key: account.label for account in accounts}
+        label = self._variant_button_label(variant, variants, labels)
+        context.user_data["current_recipe_variant_index"] = index
+        page = max(0, int(context.user_data.get("recipe_list_page") or 0))
+        page_action = str(context.user_data.get("recipe_page_action") or "list")
         await query.edit_message_text(
             f"<b>Версия: {html.escape(label)}</b>\n\n{_format_recipe(variant.recipe)}",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton(f"Синхронизировать из {label}"[:60], callback_data=f"syncvariant:{index}")],
+                    [
+                        InlineKeyboardButton(
+                            "Экспортировать",
+                            callback_data=f"recipe_export:{variant.recipe.id}:{index}",
+                        )
+                    ],
+                    [InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{variant.recipe.id}")],
                     [InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{variant.recipe.id}")],
-                    [InlineKeyboardButton("Показать обе версии", callback_data=f"open:{variant.recipe.id}")],
+                    [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{variant.recipe.id}")],
+                    [InlineKeyboardButton("Выбрать другой аккаунт", callback_data=f"open:{variant.recipe.id}")],
+                    [InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")],
                 ]
             ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _export_recipe(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        value: str,
+    ) -> None:
+        recipe_id, separator, raw_index = value.rpartition(":")
+        if not separator:
+            recipe_id, raw_index = value, "-1"
+        try:
+            variant_index = int(raw_index)
+        except ValueError:
+            variant_index = -1
+        group = self.storage.active_group_for_user(query.from_user.id)
+        recipe: Recipe | None = None
+        if variant_index >= 0:
+            variant = self._recipe_variant(context, variant_index)
+            if variant is not None and variant.recipe.id == recipe_id:
+                recipe = variant.recipe
+        if recipe is None and group is not None:
+            recipe = self._cached_or_stored_recipe(context, group.id, recipe_id)
+        if not await self._require_recipe_in_active_group(query, recipe):
+            return
+        try:
+            payload = _recipe_export_payload(recipe)
+        except ValueError as exc:
+            await query.message.reply_text(
+                f"Не удалось экспортировать рецепт: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        title = recipe.title.strip() or "Рецепт"
+        rendered = (
+            f"Название: <code>{html.escape(title)}</code>\n\n"
+            "После ввода названия вставь этот блок:\n"
+            f"<pre>{html.escape(payload)}</pre>"
+        )
+        if len(rendered) <= TELEGRAM_SAFE_TEXT_LIMIT:
+            await query.message.reply_text(rendered, parse_mode=ParseMode.HTML)
+            return
+        await query.message.reply_document(
+            document=InputFile(io.BytesIO(payload.encode("utf-8")), filename="recipe-import.txt"),
+            caption=f"Название: <code>{html.escape(title)}</code>\nИмпортный блок находится в файле.",
             parse_mode=ParseMode.HTML,
         )
 
@@ -2645,49 +3116,169 @@ class TelegramRecipeBot:
         if variant is None:
             await query.edit_message_text("Версия устарела. Открой рецепт из списка заново.")
             return
-        group = self.storage.active_group_for_user(query.from_user.id)
-        recipe_ref = self._cached_recipe(context, group.id, variant.recipe.id) if group is not None else None
-        if recipe_ref is None:
-            await query.edit_message_text("Карточка рецепта устарела. Обнови список.")
-            return
-        recipe_ref.remote_ids[variant.account_key] = variant.remote_recipe_id
-        remote_ids = recipe_ref.remote_ids_by_account.setdefault(variant.account_key, [])
-        if variant.remote_recipe_id in remote_ids:
-            remote_ids.remove(variant.remote_recipe_id)
-        remote_ids.insert(0, variant.remote_recipe_id)
-        await self._sync_recipe_message(query, context, recipe_ref.id, variant.account_key)
+        await self._show_sync_preview(query, context, index)
 
     async def _open_sync_menu(self, query, context: ContextTypes.DEFAULT_TYPE, recipe_id: str) -> None:
         group = self.storage.active_group_for_user(query.from_user.id)
-        recipe = self._cached_or_stored_recipe(context, group.id, recipe_id) if group is not None else None
+        recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
+        recipe = recipe_ref or self.storage.get_recipe(recipe_id)
         if not await self._require_recipe_in_active_group(query, recipe):
             return
-        accounts = {account.key: account.label for account in self.storage.list_fatsecret_accounts(recipe.group_id)}
-        source_keys = [key for key in recipe.remote_ids if key in accounts]
-        if not source_keys:
-            if not recipe.remote_ids:
-                self.storage.delete_recipe(recipe.id)
-                await query.edit_message_text(
-                    "Этот рецепт не был создан ни в одном FatSecret аккаунте, поэтому я удалил локальный черновик.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
-                )
-                return
+        if recipe_ref is None:
+            await query.edit_message_text("Карточка рецепта устарела. Нажми «Поиск рецептов» и открой её заново.")
+            return
+        variants = await self.sync_engine.hydrate_live_recipe_variants(recipe_ref)
+        accounts = self.storage.list_fatsecret_accounts(recipe.group_id)
+        connected_account_keys = {account.key for account in accounts}
+        if not variants:
+            await query.edit_message_text("Не удалось найти живую версию рецепта в подключённых аккаунтах.")
+            return
+        versions_differ = _recipe_versions_differ(variants, connected_account_keys)
+        context.user_data["recipe_variants"] = variants
+        context.user_data["recipe_versions_differ"] = versions_differ
+        if not versions_differ:
+            context.user_data.pop("recipe_sync_preview", None)
+            display = variants[0].recipe
+            display.remote_ids = dict(recipe_ref.remote_ids)
+            display.remote_ids_by_account = {
+                key: list(values) for key, values in recipe_ref.remote_ids_by_account.items()
+            }
+            self._replace_cached_recipe(context, recipe.group_id, display)
             await query.edit_message_text(
-                "Рецепт привязан только к FatSecret аккаунтам, которые сейчас не подключены к этой группе.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                "Версии уже совпадают — синхронизация не нужна.\n\n" + _format_recipe(display),
+                reply_markup=_recipe_actions_keyboard(
+                    display.id,
+                    max(0, int(context.user_data.get("recipe_list_page") or 0)),
+                    str(context.user_data.get("recipe_page_action") or "list"),
+                    export_variant_index=0,
+                ),
+                parse_mode=ParseMode.HTML,
             )
             return
-        if len(source_keys) == 1:
-            await self._sync_recipe_message(query, context, recipe_id, source_keys[0])
-            return
+        labels = {account.key: account.label for account in accounts}
         buttons = [
-            [InlineKeyboardButton(f"Из {accounts[key]}", callback_data=f"syncfrom:{key}:{recipe_id}")]
-            for key in source_keys
+            [
+                InlineKeyboardButton(
+                    self._variant_button_label(variant, variants, labels)[:60],
+                    callback_data=f"syncpreview:{index}",
+                )
+            ]
+            for index, variant in enumerate(variants)
         ]
         buttons.append([InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")])
         await query.edit_message_text(
-            "На каком FatSecret аккаунте сейчас правильная версия рецепта?",
+            "Из какого FatSecret аккаунта взять оригинал рецепта?",
             reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def _show_sync_preview(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        index: int,
+    ) -> None:
+        variant = self._recipe_variant(context, index)
+        if variant is None or not context.user_data.get("recipe_versions_differ"):
+            await query.edit_message_text("Версии изменились. Открой рецепт и проверь их заново.")
+            return
+        variants = context.user_data.get("recipe_variants")
+        variants = variants if isinstance(variants, list) else [variant]
+        labels = {
+            account.key: account.label
+            for account in self.storage.list_fatsecret_accounts(variant.recipe.group_id)
+        }
+        label = self._variant_button_label(variant, variants, labels)
+        context.user_data["recipe_sync_preview"] = {
+            "recipe_id": variant.recipe.id,
+            "group_id": variant.recipe.group_id,
+            "account_key": variant.account_key,
+            "remote_id": variant.remote_recipe_id,
+            "content_digest": variant.fingerprint.digest,
+            "variant_index": index,
+        }
+        await query.edit_message_text(
+            f"<b>Оригинал из аккаунта: {html.escape(label)}</b>\n\n"
+            f"{_format_recipe(variant.recipe)}\n\n"
+            "После подтверждения эта версия заменит отличающиеся версии в остальных подключённых аккаунтах. "
+            "Оригинал не изменится.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Подтвердить синхронизацию", callback_data="syncconfirm:0")],
+                    [InlineKeyboardButton("Выбрать другой источник", callback_data=f"sync:{variant.recipe.id}")],
+                    [InlineKeyboardButton("Назад к версии", callback_data=f"variant:{index}")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _confirm_sync_preview(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        preview = context.user_data.get("recipe_sync_preview")
+        if not isinstance(preview, dict):
+            await query.edit_message_text("Подтверждение устарело. Открой рецепт заново.")
+            return
+        recipe_id = str(preview.get("recipe_id") or "")
+        group = self.storage.active_group_for_user(query.from_user.id)
+        recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
+        if recipe_ref is None or group is None or recipe_ref.group_id != group.id:
+            await query.edit_message_text("Карточка рецепта устарела. Нажми «Поиск рецептов».")
+            return
+        fresh_variants = await self.sync_engine.hydrate_live_recipe_variants(recipe_ref)
+        accounts = self.storage.list_fatsecret_accounts(group.id)
+        connected_account_keys = {account.key for account in accounts}
+        context.user_data["recipe_variants"] = fresh_variants
+        if not _recipe_versions_differ(fresh_variants, connected_account_keys):
+            context.user_data["recipe_versions_differ"] = False
+            context.user_data.pop("recipe_sync_preview", None)
+            display = fresh_variants[0].recipe
+            display.remote_ids = dict(recipe_ref.remote_ids)
+            display.remote_ids_by_account = {
+                key: list(values) for key, values in recipe_ref.remote_ids_by_account.items()
+            }
+            self._replace_cached_recipe(context, group.id, display)
+            await query.edit_message_text(
+                "Версии уже совпадают — синхронизация не нужна.\n\n" + _format_recipe(display),
+                reply_markup=_recipe_actions_keyboard(
+                    display.id,
+                    max(0, int(context.user_data.get("recipe_list_page") or 0)),
+                    str(context.user_data.get("recipe_page_action") or "list"),
+                    export_variant_index=0,
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        selected = next(
+            (
+                variant
+                for variant in fresh_variants
+                if variant.account_key == preview.get("account_key")
+                and variant.remote_recipe_id == preview.get("remote_id")
+            ),
+            None,
+        )
+        if selected is None or selected.fingerprint.digest != preview.get("content_digest"):
+            context.user_data["recipe_versions_differ"] = True
+            context.user_data.pop("recipe_sync_preview", None)
+            await self._show_recipe_variant_picker(
+                query,
+                context,
+                recipe_ref,
+                fresh_variants,
+                accounts,
+                heading="Выбранная версия изменилась — проверь источник снова",
+            )
+            return
+        recipe_ref.remote_ids[selected.account_key] = selected.remote_recipe_id
+        remote_ids = recipe_ref.remote_ids_by_account.setdefault(selected.account_key, [])
+        if selected.remote_recipe_id in remote_ids:
+            remote_ids.remove(selected.remote_recipe_id)
+        remote_ids.insert(0, selected.remote_recipe_id)
+        await self._sync_recipe_message(
+            query,
+            context,
+            recipe_ref.id,
+            selected.account_key,
+            expected_source_remote_id=selected.remote_recipe_id,
+            expected_source_content_digest=selected.fingerprint.digest,
         )
 
     async def _sync_recipe_message(
@@ -2696,6 +3287,9 @@ class TelegramRecipeBot:
         context: ContextTypes.DEFAULT_TYPE,
         recipe_id: str,
         source_account_key: str,
+        *,
+        expected_source_remote_id: str | None = None,
+        expected_source_content_digest: str | None = None,
     ) -> None:
         group = self.storage.active_group_for_user(query.from_user.id)
         recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
@@ -2710,15 +3304,33 @@ class TelegramRecipeBot:
         await query.edit_message_text(f"Синхронизирую рецепт из FatSecret аккаунта «{source_label}»...")
         try:
             if recipe_ref is not None:
-                synced_recipe, results = await self.sync_engine.sync_live_recipe_from_source(recipe_ref, source_account_key)
+                synced_recipe, results = await self.sync_engine.sync_live_recipe_from_source(
+                    recipe_ref,
+                    source_account_key,
+                    expected_source_remote_id=expected_source_remote_id,
+                    expected_source_content_digest=expected_source_content_digest,
+                )
                 if not await self._refresh_recipe_cache_after_sync(context, recipe.group_id):
                     self._replace_cached_recipe(context, recipe.group_id, synced_recipe)
             else:
-                results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
+                results = await self.sync_engine.sync_recipe_from_source(
+                    recipe_id,
+                    source_account_key,
+                    expected_source_remote_id=expected_source_remote_id,
+                    expected_source_content_digest=expected_source_content_digest,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.exception("sync failed")
-            await query.edit_message_text(f"Ошибка синхронизации: {user_safe_error_message(exc)}")
+            await query.edit_message_text(
+                f"Ошибка синхронизации: {user_safe_error_message(exc)}",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Проверить версии заново", callback_data=f"open:{recipe_id}")]]
+                ),
+            )
             return
+        context.user_data.pop("recipe_sync_preview", None)
+        context.user_data["recipe_versions_differ"] = False
+        self._recipe_product_difference_cache(context).pop(recipe_id, None)
         lines = [
             f"{account_labels.get(result.account_key, result.account_key)}: {'OK' if result.ok else 'ERROR'}"
             f" {result.remote_recipe_id or ''} {result.message}"
@@ -2798,74 +3410,12 @@ class TelegramRecipeBot:
         if recipe is None or group is None or recipe.group_id != group.id:
             await update.effective_message.reply_text("Открой рецепт из списка и нажми «Синхронизировать».")
             return
-        accounts = {account.key: account.label for account in self.storage.list_fatsecret_accounts(recipe.group_id)}
-        source_keys = [key for key in recipe.remote_ids if key in accounts]
-        if not source_keys:
-            if not recipe.remote_ids:
-                self.storage.delete_recipe(recipe.id)
-                await update.effective_message.reply_text(
-                    "Этот рецепт не был создан ни в одном FatSecret аккаунте, поэтому я удалил локальный черновик.",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-                context.chat_data["reply_keyboard"] = "main"
-                return
-            await update.effective_message.reply_text(
-                "Рецепт привязан только к FatSecret аккаунтам, которые сейчас не подключены к этой группе.",
-                reply_markup=MAIN_KEYBOARD,
-            )
-            context.chat_data["reply_keyboard"] = "main"
-            return
-        if len(source_keys) > 1:
-            await update.effective_message.reply_text(
-                "На каком FatSecret аккаунте сейчас правильная версия рецепта?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton(f"Из {accounts[key]}", callback_data=f"syncfrom:{key}:{recipe_id}")]
-                        for key in source_keys
-                    ]
-                ),
-            )
-            return
-        await self._sync_recipe_from_message(update, context, recipe_id, source_keys[0])
-
-    async def _sync_recipe_from_message(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        recipe_id: str,
-        source_account_key: str,
-    ) -> None:
-        group = self.storage.active_group_for_user(update.effective_user.id)
-        recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
-        recipe = recipe_ref or self.storage.get_recipe(recipe_id)
-        if recipe is None or group is None or recipe.group_id != group.id:
-            await update.effective_message.reply_text("Рецепт не найден в активной группе.")
-            return
-        account_labels = {
-            account.key: account.label
-            for account in self.storage.list_fatsecret_accounts(recipe.group_id)
-        }
-        source_label = account_labels.get(source_account_key, source_account_key)
-        status = await update.effective_message.reply_text(
-            f"Синхронизирую рецепт из FatSecret аккаунта «{source_label}»..."
+        await update.effective_message.reply_text(
+            "Проверь актуальные версии перед синхронизацией.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Проверить версии", callback_data=f"sync:{recipe_id}")]]
+            ),
         )
-        try:
-            if recipe_ref is not None:
-                synced_recipe, results = await self.sync_engine.sync_live_recipe_from_source(recipe_ref, source_account_key)
-                if not await self._refresh_recipe_cache_after_sync(context, group.id):
-                    self._replace_cached_recipe(context, group.id, synced_recipe)
-            else:
-                results = await self.sync_engine.sync_recipe_from_source(recipe_id, source_account_key)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("sync failed")
-            await status.edit_text(f"Ошибка синхронизации: {user_safe_error_message(exc)}")
-            return
-        lines = [
-            f"{account_labels.get(result.account_key, result.account_key)}: {'OK' if result.ok else 'ERROR'}"
-            f" {result.remote_recipe_id or ''} {result.message}"
-            for result in results
-        ]
-        await status.edit_text("Синхронизация завершена:\n" + "\n".join(lines))
 
     async def _confirm_current_recipe_delete_from_message(
         self,
@@ -3292,6 +3842,7 @@ class TelegramRecipeBot:
             else 0
         )
         group = self.storage.create_group(user.id, text)
+        self._clear_recipe_cache(context)
         refreshed = await self._refresh_group_after_account_transfer(context, group.id)
         context.user_data.clear()
         transfer_note = f"\nПеренесено твоих FatSecret аккаунтов: {moved}." if moved else ""
@@ -3314,10 +3865,17 @@ class TelegramRecipeBot:
             if source_group is not None
             else 0
         )
-        group = self.storage.join_group_by_code(user.id, text)
+        try:
+            group = self.storage.join_group_by_code(user.id, text)
+        except GroupMemberLimitError as exc:
+            await update.effective_message.reply_text(
+                f"Группа заполнена: сейчас поддерживается максимум {exc.limit} участника."
+            )
+            return
         if group is None:
             await update.effective_message.reply_text("Не нашел группу с таким кодом. Проверь код и пришли еще раз.")
             return
+        self._clear_recipe_cache(context)
         refreshed = await self._refresh_group_after_account_transfer(context, group.id)
         context.user_data.clear()
         transfer_note = f" Перенесено твоих FatSecret аккаунтов: {moved}." if moved else ""
@@ -3436,6 +3994,7 @@ class TelegramRecipeBot:
             context.user_data.clear()
             await update.effective_message.reply_text("Не удалось сохранить FatSecret аккаунт.")
             return
+        self._clear_recipe_cache(context)
         context.user_data.clear()
         status = await update.effective_message.reply_text("FatSecret аккаунт подключен. Загружаю рецепты из этого аккаунта...")
         try:
@@ -4700,6 +5259,7 @@ class TelegramRecipeBot:
         )
 
     async def _handle_recipe_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        self._cancel_recipe_warning_render(context)
         group_id = context.user_data.get("group_id")
         if not group_id:
             group = await self._require_active_group(update)
@@ -4726,18 +5286,38 @@ class TelegramRecipeBot:
             )
             return
         page_recipes, page, total_count = self._recipe_page(recipes, 0)
-        product_difference_ids = await self._recipe_product_difference_ids(context, page_recipes)
-        await update.effective_message.reply_text(
+        product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
+            context,
+            str(group_id),
+            page_recipes,
+        )
+        account_labels = self._account_labels_for_group(group_id)
+        title = f"Найдено рецептов: {len(recipes)}"
+        sent = await update.effective_message.reply_text(
             _recipe_list_message(
-                f"Найдено рецептов: {len(recipes)}",
+                title,
                 has_product_differences=bool(product_difference_ids),
+                checking_versions=bool(pending and getattr(context, "application", None)),
             ),
             reply_markup=self._recipe_list_keyboard(
                 page_recipes,
                 page,
                 "searchpage",
-                self._account_labels_for_group(group_id),
+                account_labels,
                 total_count=total_count,
                 product_difference_ids=product_difference_ids,
             ),
+        )
+        self._schedule_recipe_warning_update(
+            sent,
+            context,
+            group_id=str(group_id),
+            recipes=page_recipes,
+            pending=pending,
+            connected_account_keys=connected_account_keys,
+            page=page,
+            page_action="searchpage",
+            total_count=total_count,
+            title=title,
+            account_labels=account_labels,
         )

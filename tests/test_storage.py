@@ -9,7 +9,7 @@ import pytest
 
 from fatsecret_bot.models import FatSecretSession, Ingredient, Recipe, RecipeSummary
 from fatsecret_bot.recipe_compare import recipe_fingerprint
-from fatsecret_bot.storage import Storage, normalize_title
+from fatsecret_bot.storage import GroupMemberLimitError, Storage, normalize_title
 
 
 def test_normalize_title_collapses_case_and_spaces() -> None:
@@ -152,6 +152,40 @@ def test_group_join_switch_and_group_scoped_accounts(tmp_path) -> None:
 
         assert storage.set_active_group_for_user(11, other_group.id) is True
         assert {account.key for account in storage.list_fatsecret_accounts(other_group.id)} == {"tg11"}
+    finally:
+        storage.close()
+
+
+def test_group_join_allows_solo_and_second_member_but_rejects_third_without_side_effects(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        for telegram_id, name in ((11, "One"), (22, "Two"), (33, "Three")):
+            storage.register_user(telegram_id, name)
+        group = storage.create_group(11, "Семья")
+        previous_group = storage.create_group(33, "Третья группа")
+        account_key = storage.create_fatsecret_account(
+            33,
+            "Three FS",
+            "three@example.com",
+            "secret",
+            "BY",
+            "ru",
+            group_id=previous_group.id,
+        )
+
+        assert [member.telegram_id for member in storage.group_members(group.id)] == [11]
+        assert storage.join_group_by_code(22, group.invite_code) == group
+
+        with pytest.raises(GroupMemberLimitError) as exc_info:
+            storage.join_group_by_code(33, group.invite_code)
+
+        assert exc_info.value.limit == 2
+        assert [member.telegram_id for member in storage.group_members(group.id)] == [11, 22]
+        assert storage.active_group_for_user(33) == previous_group
+        assert storage.fatsecret_account_group_id(account_key) == previous_group.id
+
+        assert storage.join_group_by_code(22, group.invite_code) == group
+        assert [member.telegram_id for member in storage.group_members(group.id)] == [11, 22]
     finally:
         storage.close()
 
