@@ -16,6 +16,7 @@ def main() -> None:
         token=config.telegram_token,
         default_market=config.default_market,
         default_language=config.default_language,
+        admin_user_id=config.telegram_admin_user_id,
         storage=storage,
         sync_engine=sync_engine,
     )

@@ -1553,6 +1553,7 @@ def test_accounts_and_groups_keyboards_support_multiple_owned_accounts_and_switc
         storage.set_active_group_for_user(11, first_group.id)
         bot = object.__new__(TelegramRecipeBot)
         bot.storage = storage
+        bot.admin_user_id = 11
 
         account_keyboard = TelegramRecipeBot._accounts_keyboard(bot, 11, first_group)
         account_callbacks = [
@@ -1570,5 +1571,113 @@ def test_accounts_and_groups_keyboards_support_multiple_owned_accounts_and_switc
         assert f"group_switch:{second_group.id}" in group_callbacks
         assert "group_create:0" in group_callbacks
         assert "group_join:0" in group_callbacks
+    finally:
+        storage.close()
+
+
+def test_groups_hide_multiple_memberships_from_ordinary_users(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        first_group = storage.create_group(11, "Первая")
+        second_group = storage.create_group(11, "Вторая")
+        storage.set_active_group_for_user(11, first_group.id)
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 99
+
+        keyboard = TelegramRecipeBot._groups_keyboard(bot, 11)
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        text = TelegramRecipeBot._groups_text(bot, 11)
+
+        assert f"group_switch:{second_group.id}" not in callbacks
+        assert "group_create:0" not in callbacks
+        assert "group_join:0" not in callbacks
+        assert "group_leave:0" in callbacks
+        assert "Доступные группы" not in text
+        assert second_group.name not in text
+    finally:
+        storage.close()
+
+
+def test_groups_offer_first_membership_to_ordinary_users(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 99
+
+        keyboard = TelegramRecipeBot._groups_keyboard(bot, 11)
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+
+        assert "group_create:0" in callbacks
+        assert "group_join:0" in callbacks
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("action", ["group_create:0", "group_join:0", "group_switch:missing"])
+def test_stale_multiple_group_callbacks_are_rejected_for_ordinary_users(tmp_path, action: str) -> None:
+    class FakeQuery:
+        def __init__(self) -> None:
+            self.data = action
+            self.message = None
+            self.messages: list[str] = []
+
+        async def answer(self) -> None:
+            return None
+
+        async def edit_message_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+            self.messages.append(text)
+
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        active = storage.create_group(11, "Первая")
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 99
+        query = FakeQuery()
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=11, full_name="One"),
+            effective_message=SimpleNamespace(),
+            callback_query=query,
+        )
+        context = SimpleNamespace(user_data={"mode": "old"}, chat_data={})
+
+        asyncio.run(bot.on_callback(update, context))
+
+        assert query.messages
+        assert "администратор" in query.messages[-1]
+        assert context.user_data == {}
+        assert storage.active_group_for_user(11) == active
+        assert len(storage.list_groups_for_user(11)) == 1
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("handler_name", ["_handle_group_create", "_handle_group_join"])
+def test_stale_multiple_group_text_modes_are_rejected_for_ordinary_users(tmp_path, handler_name: str) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        active = storage.create_group(11, "Первая")
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 99
+        reply_text = AsyncMock()
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=11, full_name="One"),
+            effective_message=SimpleNamespace(reply_text=reply_text),
+        )
+        context = SimpleNamespace(user_data={"mode": handler_name}, chat_data={})
+
+        asyncio.run(getattr(bot, handler_name)(update, context, "Новая"))
+
+        assert context.user_data == {}
+        assert storage.active_group_for_user(11) == active
+        assert len(storage.list_groups_for_user(11)) == 1
+        assert "администратор" in reply_text.await_args.args[0]
     finally:
         storage.close()

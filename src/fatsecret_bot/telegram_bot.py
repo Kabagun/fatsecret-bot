@@ -1003,12 +1003,14 @@ class TelegramRecipeBot:
         token: str,
         default_market: str,
         default_language: str,
+        admin_user_id: int | None,
         storage: Storage,
         sync_engine: RecipeSyncEngine,
     ) -> None:
         self.token = token
         self.default_market = default_market
         self.default_language = default_language
+        self.admin_user_id = admin_user_id
         self.storage = storage
         self.sync_engine = sync_engine
         self._food_usage_refresh_task: asyncio.Task[None] | None = None
@@ -1581,6 +1583,22 @@ class TelegramRecipeBot:
             return False
         return True
 
+    def _is_group_admin(self, telegram_id: int) -> bool:
+        """Return whether the Telegram user may manage multiple groups."""
+        return telegram_id == getattr(self, "admin_user_id", None)
+
+    def _can_add_group_membership(self, telegram_id: int) -> bool:
+        """Allow ordinary users a first group and the admin additional groups."""
+        return self._is_group_admin(telegram_id) or not self.storage.list_groups_for_user(telegram_id)
+
+    async def _reject_extra_group_membership(self, target, context, telegram_id: int) -> None:
+        context.user_data.clear()
+        await target.edit_message_text(
+            "Дополнительные группы доступны только администратору. "
+            "Чтобы подключиться к другой группе, сначала отключись от текущей.",
+            reply_markup=self._groups_keyboard(telegram_id),
+        )
+
     async def _ensure_main_keyboard(self, message, context: ContextTypes.DEFAULT_TYPE) -> None:
         if message is None:
             return
@@ -1622,7 +1640,7 @@ class TelegramRecipeBot:
             )
             lines.append(f"- {html.escape(member.display_name)}{account}")
         groups = self.storage.list_groups_for_user(telegram_id)
-        if len(groups) > 1:
+        if self._is_group_admin(telegram_id) and len(groups) > 1:
             lines.extend(["", "<b>Доступные группы</b>"])
             lines.extend(
                 f"- {'✓ ' if group.id == active.id else ''}{html.escape(group.name)}"
@@ -1632,21 +1650,24 @@ class TelegramRecipeBot:
 
     def _groups_keyboard(self, telegram_id: int) -> InlineKeyboardMarkup:
         active = self.storage.active_group_for_user(telegram_id)
+        is_admin = self._is_group_admin(telegram_id)
         if active is not None:
             buttons: list[list[InlineKeyboardButton]] = []
-            for group in self.storage.list_groups_for_user(telegram_id):
-                if group.id != active.id:
-                    buttons.append(
-                        [InlineKeyboardButton(f"Переключиться: {group.name}"[:60], callback_data=f"group_switch:{group.id}")]
-                    )
+            if is_admin:
+                for group in self.storage.list_groups_for_user(telegram_id):
+                    if group.id != active.id:
+                        buttons.append(
+                            [InlineKeyboardButton(f"Переключиться: {group.name}"[:60], callback_data=f"group_switch:{group.id}")]
+                        )
             if self.storage.active_group_created_by(telegram_id):
                 buttons.append([InlineKeyboardButton("Переименовать группу", callback_data="group_rename:0")])
-            buttons.append(
-                [
-                    InlineKeyboardButton("Создать группу", callback_data="group_create:0"),
-                    InlineKeyboardButton("Подключиться", callback_data="group_join:0"),
-                ]
-            )
+            if is_admin:
+                buttons.append(
+                    [
+                        InlineKeyboardButton("Создать группу", callback_data="group_create:0"),
+                        InlineKeyboardButton("Подключиться", callback_data="group_join:0"),
+                    ]
+                )
             buttons.append([InlineKeyboardButton("Отключиться от группы", callback_data="group_leave:0")])
             return InlineKeyboardMarkup(buttons)
         buttons: list[list[InlineKeyboardButton]] = [
@@ -2203,6 +2224,9 @@ class TelegramRecipeBot:
                 parse_mode=ParseMode.HTML,
             )
         elif action == "group_create":
+            if not self._can_add_group_membership(update.effective_user.id):
+                await self._reject_extra_group_membership(query, context, update.effective_user.id)
+                return
             context.user_data.clear()
             context.user_data["mode"] = "group_create"
             await query.edit_message_text(
@@ -2210,6 +2234,9 @@ class TelegramRecipeBot:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
             )
         elif action == "group_join":
+            if not self._can_add_group_membership(update.effective_user.id):
+                await self._reject_extra_group_membership(query, context, update.effective_user.id)
+                return
             context.user_data.clear()
             context.user_data["mode"] = "group_join"
             await query.edit_message_text(
@@ -2218,6 +2245,12 @@ class TelegramRecipeBot:
             )
         elif action == "group_switch":
             context.user_data.clear()
+            if not self._is_group_admin(update.effective_user.id):
+                await query.edit_message_text(
+                    "Переключение между группами доступно только администратору.",
+                    reply_markup=self._groups_keyboard(update.effective_user.id),
+                )
+                return
             source_group = self.storage.active_group_for_user(update.effective_user.id)
             moved = (
                 self.storage.owned_fatsecret_account_count(update.effective_user.id, source_group.id)
@@ -3903,6 +3936,14 @@ class TelegramRecipeBot:
         user = update.effective_user
         if user is None:
             return
+        if not self._can_add_group_membership(user.id):
+            context.user_data.clear()
+            await update.effective_message.reply_text(
+                "Дополнительные группы доступны только администратору. "
+                "Чтобы создать другую группу, сначала отключись от текущей.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
         source_group = self.storage.active_group_for_user(user.id)
         moved = (
             self.storage.owned_fatsecret_account_count(user.id, source_group.id)
@@ -3926,6 +3967,14 @@ class TelegramRecipeBot:
     async def _handle_group_join(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         user = update.effective_user
         if user is None:
+            return
+        if not self._can_add_group_membership(user.id):
+            context.user_data.clear()
+            await update.effective_message.reply_text(
+                "Дополнительные группы доступны только администратору. "
+                "Чтобы подключиться к другой группе, сначала отключись от текущей.",
+                reply_markup=MAIN_KEYBOARD,
+            )
             return
         source_group = self.storage.active_group_for_user(user.id)
         moved = (

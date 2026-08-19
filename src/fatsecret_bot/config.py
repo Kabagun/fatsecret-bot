@@ -12,6 +12,7 @@ from .models import FatSecretDeviceConfig
 @dataclass(frozen=True)
 class BotConfig:
     telegram_token: str
+    telegram_admin_user_id: int | None
     db_path: Path
     default_market: str
     default_language: str
@@ -34,6 +35,19 @@ def _required(name: str) -> str:
 
 def _positive_int(name: str, default: int) -> int:
     value = _getenv(name, str(default))
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid positive integer in {name}: {value}") from exc
+    if parsed < 1:
+        raise RuntimeError(f"Invalid positive integer in {name}: {value}")
+    return parsed
+
+
+def _optional_positive_int(name: str) -> int | None:
+    value = _getenv(name)
+    if not value:
+        return None
     try:
         parsed = int(value)
     except ValueError as exc:
@@ -69,6 +83,7 @@ def load_config(env_file: str | Path = ".env") -> BotConfig:
 
     return BotConfig(
         telegram_token=_required("TELEGRAM_BOT_TOKEN"),
+        telegram_admin_user_id=_optional_positive_int("TELEGRAM_ADMIN_USER_ID"),
         db_path=db_path,
         default_market=default_market,
         default_language=default_language,
