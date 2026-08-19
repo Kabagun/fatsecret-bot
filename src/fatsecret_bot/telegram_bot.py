@@ -95,6 +95,15 @@ RECIPE_STEP_PREFIX_RE = re.compile(r"^\s*(?:\d+[\).]\s*|[-*]\s*)?(?P<step>.+?)\s
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Поиск рецептов", "Создать из списка"],
+        ["Создать продукт"],
+        ["Группы", "Аккаунты"],
+    ],
+    resize_keyboard=True,
+)
+
+ADMIN_MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Поиск рецептов", "Создать из списка"],
         ["Создать продукт", "Меню / Дневник"],
         ["Группы", "Аккаунты"],
     ],
@@ -1583,13 +1592,17 @@ class TelegramRecipeBot:
             return False
         return True
 
-    def _is_group_admin(self, telegram_id: int) -> bool:
-        """Return whether the Telegram user may manage multiple groups."""
+    def _is_admin(self, telegram_id: int) -> bool:
+        """Return whether the Telegram user may use admin-only features."""
         return telegram_id == getattr(self, "admin_user_id", None)
+
+    def _main_keyboard(self, telegram_id: int) -> ReplyKeyboardMarkup:
+        """Return the main keyboard allowed for this Telegram user."""
+        return ADMIN_MAIN_KEYBOARD if self._is_admin(telegram_id) else MAIN_KEYBOARD
 
     def _can_add_group_membership(self, telegram_id: int) -> bool:
         """Allow ordinary users a first group and the admin additional groups."""
-        return self._is_group_admin(telegram_id) or not self.storage.list_groups_for_user(telegram_id)
+        return self._is_admin(telegram_id) or not self.storage.list_groups_for_user(telegram_id)
 
     async def _reject_extra_group_membership(self, target, context, telegram_id: int) -> None:
         context.user_data.clear()
@@ -1616,8 +1629,8 @@ class TelegramRecipeBot:
             )
             return
         await update.effective_message.reply_text(
-            "Готов. Здесь можно синхронизировать рецепты и через «Меню / Дневник» скопировать заполненный день в выбранные аккаунты и диапазон до 7 дней.",
-            reply_markup=MAIN_KEYBOARD,
+            "Готов. Здесь можно синхронизировать рецепты и продукты между FatSecret аккаунтами.",
+            reply_markup=self._main_keyboard(update.effective_user.id),
         )
         context.chat_data["reply_keyboard"] = "main"
 
@@ -1640,7 +1653,7 @@ class TelegramRecipeBot:
             )
             lines.append(f"- {html.escape(member.display_name)}{account}")
         groups = self.storage.list_groups_for_user(telegram_id)
-        if self._is_group_admin(telegram_id) and len(groups) > 1:
+        if self._is_admin(telegram_id) and len(groups) > 1:
             lines.extend(["", "<b>Доступные группы</b>"])
             lines.extend(
                 f"- {'✓ ' if group.id == active.id else ''}{html.escape(group.name)}"
@@ -1650,7 +1663,7 @@ class TelegramRecipeBot:
 
     def _groups_keyboard(self, telegram_id: int) -> InlineKeyboardMarkup:
         active = self.storage.active_group_for_user(telegram_id)
-        is_admin = self._is_group_admin(telegram_id)
+        is_admin = self._is_admin(telegram_id)
         if active is not None:
             buttons: list[list[InlineKeyboardButton]] = []
             if is_admin:
@@ -1811,6 +1824,13 @@ class TelegramRecipeBot:
         """Start copying one account's food diary to selected group accounts."""
         if not await self._require_user(update):
             return
+        if not self._is_admin(update.effective_user.id):
+            context.user_data.clear()
+            await update.effective_message.reply_text(
+                "Копирование меню / дневника временно доступно только администратору.",
+                reply_markup=self._main_keyboard(update.effective_user.id),
+            )
+            return
         group = await self._require_active_group(update)
         if group is None:
             return
@@ -1819,7 +1839,7 @@ class TelegramRecipeBot:
         if len(accounts) < 2:
             await update.effective_message.reply_text(
                 "Для копирования дневника подключи минимум два FatSecret аккаунта группы.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(update.effective_user.id),
             )
             return
         buttons = [
@@ -2185,6 +2205,13 @@ class TelegramRecipeBot:
         action, _, value = query.data.partition(":")
         self._cancel_recipe_warning_render(context)
 
+        if action.startswith("diary") and not self._is_admin(update.effective_user.id):
+            context.user_data.clear()
+            await query.edit_message_text(
+                "Копирование меню / дневника временно доступно только администратору."
+            )
+            return
+
         if action == "open":
             context.user_data.pop("mode", None)
             await self._open_recipe(query, context, value)
@@ -2245,7 +2272,7 @@ class TelegramRecipeBot:
             )
         elif action == "group_switch":
             context.user_data.clear()
-            if not self._is_group_admin(update.effective_user.id):
+            if not self._is_admin(update.effective_user.id):
                 await query.edit_message_text(
                     "Переключение между группами доступно только администратору.",
                     reply_markup=self._groups_keyboard(update.effective_user.id),
@@ -3591,12 +3618,15 @@ class TelegramRecipeBot:
         if recipes is None:
             await update.effective_message.reply_text(
                 "Список рецептов еще не загружен. Нажми «Поиск рецептов».",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(update.effective_user.id),
             )
             context.chat_data["reply_keyboard"] = "main"
             return
         if not recipes:
-            await update.effective_message.reply_text("Рецептов пока нет.", reply_markup=MAIN_KEYBOARD)
+            await update.effective_message.reply_text(
+                "Рецептов пока нет.",
+                reply_markup=self._main_keyboard(update.effective_user.id),
+            )
             context.chat_data["reply_keyboard"] = "main"
             return
         context.user_data.clear()
@@ -3765,11 +3795,21 @@ class TelegramRecipeBot:
             return
         mode = context.user_data.get("mode")
         text = update.effective_message.text.strip()
+        if (text == "Меню / Дневник" or str(mode).startswith("diary_")) and not self._is_admin(
+            update.effective_user.id
+        ):
+            context.user_data.clear()
+            await update.effective_message.reply_text(
+                "Копирование меню / дневника временно доступно только администратору.",
+                reply_markup=self._main_keyboard(update.effective_user.id),
+            )
+            context.chat_data["reply_keyboard"] = "main"
+            return
         if text == "В меню":
             context.user_data.clear()
             await update.effective_message.reply_text(
                 "Главное меню. Выбери действие на клавиатуре снизу.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(update.effective_user.id),
             )
             context.chat_data["reply_keyboard"] = "main"
             return
@@ -3800,7 +3840,7 @@ class TelegramRecipeBot:
             context.user_data["group_id"] = group.id
             await update.effective_message.reply_text(
                 "Пришли часть названия или ингредиента для поиска по рецептам.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(update.effective_user.id),
             )
             context.chat_data["reply_keyboard"] = "main"
             return
@@ -3811,7 +3851,10 @@ class TelegramRecipeBot:
             context.user_data.clear()
             context.user_data["mode"] = "recipe_list_title"
             context.user_data["group_id"] = group.id
-            await update.effective_message.reply_text("Пришли название рецепта.", reply_markup=MAIN_KEYBOARD)
+            await update.effective_message.reply_text(
+                "Пришли название рецепта.",
+                reply_markup=self._main_keyboard(update.effective_user.id),
+            )
             context.chat_data["reply_keyboard"] = "main"
             return
         if mode is None and text == "Создать продукт":
@@ -3824,7 +3867,7 @@ class TelegramRecipeBot:
             context.user_data["custom_food_origin"] = "standalone"
             await update.effective_message.reply_text(
                 "Пришли название продукта. Я создам его во всех FatSecret аккаунтах активной группы.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(update.effective_user.id),
             )
             context.chat_data["reply_keyboard"] = "main"
             return
@@ -3899,7 +3942,7 @@ class TelegramRecipeBot:
         else:
             await update.effective_message.reply_text(
                 "Выбери действие кнопками ниже.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(update.effective_user.id),
             )
 
     async def _cancel_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3930,7 +3973,10 @@ class TelegramRecipeBot:
                 parse_mode=ParseMode.HTML,
             )
             return
-        await update.effective_message.reply_text("Ок, отменил.", reply_markup=MAIN_KEYBOARD)
+        await update.effective_message.reply_text(
+            "Ок, отменил.",
+            reply_markup=self._main_keyboard(update.effective_user.id),
+        )
 
     async def _handle_group_create(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         user = update.effective_user
@@ -3941,7 +3987,7 @@ class TelegramRecipeBot:
             await update.effective_message.reply_text(
                 "Дополнительные группы доступны только администратору. "
                 "Чтобы создать другую группу, сначала отключись от текущей.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(user.id),
             )
             return
         source_group = self.storage.active_group_for_user(user.id)
@@ -3960,7 +4006,7 @@ class TelegramRecipeBot:
             f"Группа создана: {html.escape(group.name)}\n"
             f"Код для второго пользователя: <code>{group.invite_code}</code>"
             f"{transfer_note}{refresh_note}",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=self._main_keyboard(user.id),
             parse_mode=ParseMode.HTML,
         )
 
@@ -3973,7 +4019,7 @@ class TelegramRecipeBot:
             await update.effective_message.reply_text(
                 "Дополнительные группы доступны только администратору. "
                 "Чтобы подключиться к другой группе, сначала отключись от текущей.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(user.id),
             )
             return
         source_group = self.storage.active_group_for_user(user.id)
@@ -3999,7 +4045,7 @@ class TelegramRecipeBot:
         refresh_note = " Не удалось сразу обновить рецепты; открой список еще раз." if not refreshed else ""
         await update.effective_message.reply_text(
             f"Подключился к группе: {html.escape(group.name)}.{transfer_note}{refresh_note}",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=self._main_keyboard(user.id),
             parse_mode=ParseMode.HTML,
         )
 
@@ -4014,7 +4060,7 @@ class TelegramRecipeBot:
         context.user_data.clear()
         await update.effective_message.reply_text(
             f"Группа переименована: {html.escape(group.name)}.",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=self._main_keyboard(user.id),
             parse_mode=ParseMode.HTML,
         )
 
@@ -4146,7 +4192,7 @@ class TelegramRecipeBot:
             context.user_data.clear()
             await update.effective_message.reply_text(
                 "Этот FatSecret аккаунт больше не найден в активной группе.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(user.id),
             )
             return
         if not label:
@@ -4279,7 +4325,7 @@ class TelegramRecipeBot:
         if context.user_data.get("mode") != "custom_food_barcode":
             await update.effective_message.reply_text(
                 "Фото штрих-кода можно прислать на шаге создания продукта.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(update.effective_user.id),
             )
             return
         photos = update.effective_message.photo
@@ -5387,7 +5433,7 @@ class TelegramRecipeBot:
         if cached is None:
             await update.effective_message.reply_text(
                 "Список рецептов еще не загружен. Нажми «Поиск рецептов», потом пришли текст для поиска.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=self._main_keyboard(update.effective_user.id),
             )
             context.chat_data["reply_keyboard"] = "main"
             return

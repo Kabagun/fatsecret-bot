@@ -58,6 +58,130 @@ def test_require_user_registers_any_new_telegram_user(tmp_path) -> None:
         storage.close()
 
 
+def test_main_keyboard_shows_diary_only_to_admin() -> None:
+    bot = object.__new__(TelegramRecipeBot)
+    bot.admin_user_id = 11
+
+    ordinary_keyboard = TelegramRecipeBot._main_keyboard(bot, 22)
+    admin_keyboard = TelegramRecipeBot._main_keyboard(bot, 11)
+    ordinary_texts = [button.text for row in ordinary_keyboard.keyboard for button in row]
+    admin_texts = [button.text for row in admin_keyboard.keyboard for button in row]
+
+    assert "Меню / Дневник" not in ordinary_texts
+    assert "Меню / Дневник" in admin_texts
+
+
+def test_diary_command_is_rejected_for_ordinary_user(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 11
+        reply_text = AsyncMock()
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=22, full_name="Ordinary"),
+            effective_message=SimpleNamespace(reply_text=reply_text),
+        )
+        context = SimpleNamespace(user_data={"mode": "diary_target_range"}, chat_data={})
+
+        asyncio.run(bot.diary(update, context))
+
+        assert context.user_data == {}
+        assert "только администратору" in reply_text.await_args.args[0]
+        keyboard = reply_text.await_args.kwargs["reply_markup"]
+        assert "Меню / Дневник" not in [button.text for row in keyboard.keyboard for button in row]
+    finally:
+        storage.close()
+
+
+def test_diary_command_remains_available_to_admin(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "Admin")
+        group = storage.create_group(11, "QA")
+        storage.create_fatsecret_account(11, "One", "one@example.com", "secret", "BY", "ru", group_id=group.id)
+        storage.create_fatsecret_account(11, "Two", "two@example.com", "secret", "BY", "ru", group_id=group.id)
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 11
+        reply_text = AsyncMock()
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=11, full_name="Admin"),
+            effective_message=SimpleNamespace(reply_text=reply_text),
+        )
+        context = SimpleNamespace(user_data={}, chat_data={})
+
+        asyncio.run(bot.diary(update, context))
+
+        keyboard = reply_text.await_args.kwargs["reply_markup"]
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        assert sum(callback.startswith("diarysrc:") for callback in callbacks) == 2
+    finally:
+        storage.close()
+
+
+def test_stale_diary_callback_is_rejected_for_ordinary_user(tmp_path) -> None:
+    class FakeQuery:
+        data = "diaryrun:stale-run"
+        message = None
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def answer(self) -> None:
+            return None
+
+        async def edit_message_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+            self.messages.append(text)
+
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 11
+        query = FakeQuery()
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=22, full_name="Ordinary"),
+            effective_message=SimpleNamespace(),
+            callback_query=query,
+        )
+        context = SimpleNamespace(user_data={"mode": "diary_confirm"}, chat_data={})
+
+        asyncio.run(bot.on_callback(update, context))
+
+        assert context.user_data == {}
+        assert "только администратору" in query.messages[-1]
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "text"),
+    [(None, "Меню / Дневник"), ("diary_target_range", "20.08.2026")],
+)
+def test_typed_or_stale_diary_flow_is_rejected_for_ordinary_user(tmp_path, mode: str | None, text: str) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 11
+        reply_text = AsyncMock()
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=22, full_name="Ordinary"),
+            effective_message=SimpleNamespace(text=text, reply_text=reply_text),
+        )
+        context = SimpleNamespace(user_data={"mode": mode} if mode else {}, chat_data={})
+
+        asyncio.run(bot.on_text(update, context))
+
+        assert context.user_data == {}
+        assert "только администратору" in reply_text.await_args.args[0]
+        keyboard = reply_text.await_args.kwargs["reply_markup"]
+        assert "Меню / Дневник" not in [button.text for row in keyboard.keyboard for button in row]
+    finally:
+        storage.close()
+
+
 def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     recipe = Recipe(
         id="local",
