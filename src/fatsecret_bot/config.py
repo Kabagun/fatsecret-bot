@@ -12,7 +12,6 @@ from .models import FatSecretDeviceConfig
 @dataclass(frozen=True)
 class BotConfig:
     telegram_token: str
-    allowed_user_ids: set[int]
     db_path: Path
     default_market: str
     default_language: str
@@ -31,21 +30,6 @@ def _required(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
-
-
-def _allowed_user_ids(value: str) -> set[int]:
-    if not value.strip():
-        return set()
-    ids: set[int] = set()
-    for part in value.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            ids.add(int(part))
-        except ValueError as exc:
-            raise RuntimeError(f"Invalid Telegram user id in TELEGRAM_ALLOWED_USER_IDS: {part}") from exc
-    return ids
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -85,7 +69,6 @@ def load_config(env_file: str | Path = ".env") -> BotConfig:
 
     return BotConfig(
         telegram_token=_required("TELEGRAM_BOT_TOKEN"),
-        allowed_user_ids=_allowed_user_ids(_getenv("TELEGRAM_ALLOWED_USER_IDS")),
         db_path=db_path,
         default_market=default_market,
         default_language=default_language,

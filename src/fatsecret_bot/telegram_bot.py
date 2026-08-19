@@ -1001,14 +1001,12 @@ class TelegramRecipeBot:
     def __init__(
         self,
         token: str,
-        allowed_user_ids: set[int],
         default_market: str,
         default_language: str,
         storage: Storage,
         sync_engine: RecipeSyncEngine,
     ) -> None:
         self.token = token
-        self.allowed_user_ids = allowed_user_ids
         self.default_market = default_market
         self.default_language = default_language
         self.storage = storage
@@ -1060,10 +1058,6 @@ class TelegramRecipeBot:
         return target
 
     async def _post_init(self, app: Application) -> None:
-        if not self.allowed_user_ids:
-            logger.warning(
-                "TELEGRAM_ALLOWED_USER_IDS is empty; only users already registered in SQLite are authorized"
-            )
         if self._food_usage_refresh_task is not None and not self._food_usage_refresh_task.done():
             return
         self._food_usage_refresh_task = asyncio.create_task(
@@ -1105,13 +1099,6 @@ class TelegramRecipeBot:
             except Exception:
                 logger.exception("FatSecret food usage background refresh failed")
                 await asyncio.sleep(60)
-
-    def _is_authorized(self, telegram_id: int) -> bool:
-        if telegram_id in self.allowed_user_ids:
-            return True
-        if self.storage.is_registered_user(telegram_id):
-            return True
-        return False
 
     def _recipe_cache(self, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> list[Recipe] | None:
         if context.chat_data.get(RECIPE_CACHE_GROUP_KEY) != group_id:
@@ -1550,15 +1537,6 @@ class TelegramRecipeBot:
         user = update.effective_user
         message = update.effective_message
         if user is None or message is None:
-            return False
-        if not self._is_authorized(user.id):
-            logger.warning(
-                "Telegram access denied telegram_id=%s username=%r full_name=%r",
-                user.id,
-                user.username or "",
-                user.full_name or "",
-            )
-            await message.reply_text("Этот бот закрыт для двух заданных пользователей.")
             return False
         self.storage.register_user(user.id, user.full_name or str(user.id))
         return True

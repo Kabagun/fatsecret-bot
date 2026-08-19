@@ -14,7 +14,6 @@ def main() -> None:
     sync_engine = RecipeSyncEngine(storage, config.device, timezone=config.timezone)
     bot = TelegramRecipeBot(
         token=config.telegram_token,
-        allowed_user_ids=config.allowed_user_ids,
         default_market=config.default_market,
         default_language=config.default_language,
         storage=storage,
