@@ -24,13 +24,19 @@ def _ingredient_key(
     *,
     include_food_id: bool,
 ) -> tuple[str, str, str, str, str, str | None]:
+    grams = _decimal_text(ingredient.grams)
+    amount = _decimal_text(ingredient.amount) or "0"
+    portion_description = _text(ingredient.portion_description).casefold()
+    if not include_food_id and grams is not None:
+        amount = ""
+        portion_description = ""
     return (
         ingredient.food_id if include_food_id else "",
         _text(ingredient.title).casefold(),
         (ingredient.portion_id or "0") if include_food_id else "",
-        _decimal_text(ingredient.amount) or "0",
-        _text(ingredient.portion_description).casefold(),
-        _decimal_text(ingredient.grams),
+        amount,
+        portion_description,
+        grams,
     )
 
 

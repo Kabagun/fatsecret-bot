@@ -20,7 +20,7 @@ from fatsecret_bot.models import (
     Recipe,
     RecipeSummary,
 )
-from fatsecret_bot.recipe_compare import recipe_content_fingerprint
+from fatsecret_bot.recipe_compare import recipe_fingerprint
 from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import (
     INGREDIENT_NORMALIZE_CONCURRENCY,
@@ -582,7 +582,22 @@ class FakeCreateClient:
     async def cookbook(self) -> list[RecipeSummary]:
         return [RecipeSummary(remote_id=remote_id, title=recipe.title) for remote_id, recipe in self.recipes.items()]
 
+    async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
+        raise FatSecretNotCustomFoodError(f"{self.account.label}: food {remote_id} is not a user-created product")
+
     async def close(self) -> None:
+        return None
+
+
+class FakeNormalizedPortionCreateClient(FakeCreateClient):
+    def __init__(self, account_key: str, detail: FoodSearchResult) -> None:
+        super().__init__(account_key)
+        self.detail = detail
+
+    async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
+        return self.detail
+
+    async def ensure_logged_in(self) -> None:
         return None
 
 
@@ -633,6 +648,15 @@ def _device() -> FatSecretDeviceConfig:
         build_model="test",
         build_resolution="1080x1920",
         device_identifier="test-device",
+    )
+
+
+def _resolved_recipe_item(ingredient: Ingredient) -> ResolvedRecipeListItem:
+    return ResolvedRecipeListItem(
+        requested_query=ingredient.title,
+        grams=ingredient.grams or ingredient.amount,
+        ingredient=ingredient,
+        source="FatSecret",
     )
 
 
@@ -2658,6 +2682,667 @@ def test_create_recipe_from_list_prepares_real_gram_portion_before_add(tmp_path)
         storage.close()
 
 
+def test_edit_recipe_from_list_rejects_changed_source_before_remote_writes(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        approved = Recipe(
+            id="source-1",
+            title="Омлет",
+            portions=Decimal("2"),
+            ingredients=[
+                Ingredient(
+                    "ingredient-egg",
+                    "source-1",
+                    "food-egg",
+                    "Яйцо",
+                    "51772",
+                    Decimal("100"),
+                    "г",
+                    grams=Decimal("100"),
+                )
+            ],
+        )
+        changed = copy.deepcopy(approved)
+        changed.portions = Decimal("3")
+        source = FakeCreateClient("tg11")
+        source.recipes[approved.id] = changed
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": source}  # type: ignore[method-assign]
+
+        with pytest.raises(FatSecretError, match="Рецепт изменился после проверки"):
+            asyncio.run(
+                engine.edit_recipe_from_list(
+                    "group",
+                    "tg11",
+                    approved.id,
+                    recipe_fingerprint(approved).digest,
+                    [_resolved_recipe_item(approved.ingredients[0])],
+                    updated_by=11,
+                    portions=approved.portions,
+                    steps=[],
+                )
+            )
+
+        assert source.create_calls == 0
+        assert source.saved_ingredients == []
+        assert source.saved_meta == []
+        assert source.deleted_recipe_ids == []
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_rejects_missing_source_before_remote_writes(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source = FakeCreateClient("tg11")
+        source.recipes["other"] = Recipe(id="other", title="Другой")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": source}  # type: ignore[method-assign]
+
+        with pytest.raises(FatSecretError, match="больше не найден"):
+            asyncio.run(
+                engine.edit_recipe_from_list(
+                    "group",
+                    "tg11",
+                    "missing",
+                    "approved-digest",
+                    [],
+                    updated_by=11,
+                    portions=Decimal("1"),
+                    steps=[],
+                )
+            )
+
+        assert source.create_calls == 0
+        assert source.saved_meta == []
+        assert source.deleted_recipe_ids == []
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_preserves_metadata_and_replaces_all_account_versions(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(
+            id="source-1",
+            title="Семейный омлет",
+            description="Описание из FatSecret",
+            portions=Decimal("2"),
+            prep_time=12,
+            cook_time=34,
+            steps=["Старый шаг"],
+            ingredients=[
+                Ingredient(
+                    "ingredient-egg",
+                    "source-1",
+                    "food-egg",
+                    "Яйцо",
+                    "51772",
+                    Decimal("100"),
+                    "г",
+                    remote_ingredient_id="remote-egg",
+                    grams=Decimal("100"),
+                )
+            ],
+        )
+        target_recipe = copy.deepcopy(source_recipe)
+        target_recipe.id = "target-1"
+        target_recipe.portions = Decimal("9")
+        target_recipe.ingredients[0].recipe_id = target_recipe.id
+        duplicate_recipe = copy.deepcopy(target_recipe)
+        duplicate_recipe.id = "target-duplicate"
+        duplicate_recipe.ingredients[0].recipe_id = duplicate_recipe.id
+        source = FakeCreateClient("tg11")
+        target = FakeCreateClient("tg22")
+        missing = FakeCreateClient("tg33")
+        source.recipes[source_recipe.id] = source_recipe
+        target.recipes[target_recipe.id] = target_recipe
+        target.recipes[duplicate_recipe.id] = duplicate_recipe
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": source,
+            "tg22": target,
+            "tg33": missing,
+        }
+        added = Ingredient(
+            "ingredient-cheese",
+            "source-1",
+            "food-cheese",
+            "Сыр",
+            "51772",
+            Decimal("40"),
+            "г",
+            grams=Decimal("40"),
+        )
+        items = [_resolved_recipe_item(source_recipe.ingredients[0]), _resolved_recipe_item(added)]
+
+        result = asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                items,
+                updated_by=11,
+                portions=Decimal("4"),
+                steps=["Взбить", "Запечь"],
+            )
+        )
+
+        assert source.deleted_recipe_ids == ["source-1"]
+        assert target.deleted_recipe_ids == ["target-1", "target-duplicate"]
+        assert missing.deleted_recipe_ids == []
+        assert [client.create_calls for client in (source, target, missing)] == [1, 1, 1]
+        for client in (source, target, missing):
+            assert len(client.recipes) == 1
+            remote = next(iter(client.recipes.values()))
+            assert remote.title == source_recipe.title
+            assert remote.description == source_recipe.description
+            assert remote.prep_time == source_recipe.prep_time
+            assert remote.cook_time == source_recipe.cook_time
+            assert remote.portions == Decimal("4")
+            assert remote.steps == ["Взбить", "Запечь"]
+            assert [ingredient.title for ingredient in remote.ingredients] == ["Яйцо", "Сыр"]
+        stored = storage.get_recipe(result.recipe_id)
+        assert stored is not None
+        assert stored.description == source_recipe.description
+        assert stored.prep_time == source_recipe.prep_time
+        assert stored.cook_time == source_recipe.cook_time
+        assert [ingredient.id for ingredient in stored.ingredients] == [
+            "ingredient-egg",
+            "ingredient-cheese",
+        ]
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_is_noop_only_when_every_account_has_one_identical_version(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(
+            id="source-1",
+            title="Омлет",
+            description="Без изменений",
+            portions=Decimal("2"),
+            prep_time=3,
+            cook_time=7,
+            steps=["Смешать"],
+            ingredients=[
+                Ingredient(
+                    "ingredient-egg",
+                    "source-1",
+                    "source-food-egg",
+                    "Яйцо",
+                    "source-portion",
+                    Decimal("2"),
+                    "штуки",
+                )
+            ],
+        )
+        target_recipe = copy.deepcopy(source_recipe)
+        target_recipe.id = "target-1"
+        target_recipe.ingredients[0].recipe_id = target_recipe.id
+        target_recipe.ingredients[0].food_id = "target-food-egg"
+        target_recipe.ingredients[0].portion_id = "target-portion"
+        source = FakeCreateClient("tg11")
+        target = FakeCreateClient("tg22")
+        source.recipes[source_recipe.id] = source_recipe
+        target.recipes[target_recipe.id] = target_recipe
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": source,
+            "tg22": target,
+        }
+
+        result = asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                [_resolved_recipe_item(source_recipe.ingredients[0])],
+                updated_by=11,
+                portions=source_recipe.portions,
+                steps=source_recipe.steps,
+            )
+        )
+
+        assert [item.message for item in result.results] == ["без изменений", "без изменений"]
+        assert [source.create_calls, target.create_calls] == [0, 0]
+        assert source.saved_meta == target.saved_meta == []
+        assert source.deleted_recipe_ids == target.deleted_recipe_ids == []
+        assert storage._conn.execute("SELECT COUNT(*) FROM recipe_list_runs").fetchone()[0] == 0
+    finally:
+        storage.close()
+
+
+def test_hydrated_raw_source_fingerprint_accepts_unchanged_normalized_edit_without_mutation(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        raw_source = Recipe(
+            id="source-1",
+            title="Омлет",
+            portions=Decimal("2"),
+            ingredients=[
+                Ingredient(
+                    "ingredient-egg",
+                    "source-1",
+                    "food-egg",
+                    "Яйцо",
+                    "unit-portion",
+                    Decimal("2"),
+                    "штуки",
+                    remote_ingredient_id="remote-egg",
+                )
+            ],
+        )
+        detail = FoodSearchResult(
+            food_id="food-egg",
+            title="Яйцо",
+            default_portion_id="unit-portion",
+            default_portion_description="штуки",
+            grams_per_portion=Decimal("60"),
+            raw={
+                "_gram_portion_id": "gram-portion",
+                "_gram_portion_description": "г",
+            },
+        )
+        client = FakeNormalizedPortionCreateClient("tg11", detail)
+        client.recipes[raw_source.id] = raw_source
+        recipe_ref = Recipe(
+            id="live-omlet",
+            title=raw_source.title,
+            group_id="group",
+            remote_ids={"tg11": raw_source.id},
+            remote_ids_by_account={"tg11": [raw_source.id]},
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+
+        variant = asyncio.run(engine.hydrate_live_recipe_variants(recipe_ref))[0]
+
+        assert variant.strict_fingerprint == recipe_fingerprint(
+            Recipe(
+                id=recipe_ref.id,
+                title=raw_source.title,
+                portions=raw_source.portions,
+                ingredients=[replace(raw_source.ingredients[0], recipe_id=recipe_ref.id)],
+            )
+        )
+        assert variant.recipe.ingredients[0].portion_id == "gram-portion"
+        assert variant.recipe.ingredients[0].amount == Decimal("120")
+        assert variant.recipe.ingredients[0].grams == Decimal("120")
+        assert variant.strict_fingerprint is not None
+
+        result = asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                raw_source.id,
+                variant.strict_fingerprint.digest,
+                [_resolved_recipe_item(variant.recipe.ingredients[0])],
+                updated_by=11,
+                portions=variant.recipe.portions,
+                steps=variant.recipe.steps,
+            )
+        )
+
+        assert [item.message for item in result.results] == ["без изменений"]
+        assert client.create_calls == 0
+        assert client.deleted_recipe_ids == []
+        assert list(client.recipes) == [raw_source.id]
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_rejects_changed_source_food_identity_before_remote_writes(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(
+            id="source-1",
+            title="Омлет",
+            portions=Decimal("2"),
+            ingredients=[
+                Ingredient(
+                    "ingredient-egg",
+                    "source-1",
+                    "food-egg",
+                    "Яйцо",
+                    "portion-egg",
+                    Decimal("2"),
+                    "штуки",
+                )
+            ],
+        )
+        approved_digest = recipe_fingerprint(source_recipe).digest
+        client = FakeCreateClient("tg11")
+        client.recipes[source_recipe.id] = copy.deepcopy(source_recipe)
+        client.recipes[source_recipe.id].ingredients[0].food_id = "substituted-food"
+        client.recipes[source_recipe.id].ingredients[0].portion_id = "substituted-portion"
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+
+        with pytest.raises(FatSecretError, match="изменился после проверки"):
+            asyncio.run(
+                engine.edit_recipe_from_list(
+                    "group",
+                    "tg11",
+                    source_recipe.id,
+                    approved_digest,
+                    [_resolved_recipe_item(source_recipe.ingredients[0])],
+                    updated_by=11,
+                    portions=source_recipe.portions,
+                    steps=[],
+                )
+            )
+
+        assert client.create_calls == 0
+        assert client.deleted_recipe_ids == []
+        assert list(client.recipes) == [source_recipe.id]
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_syncs_every_account_when_only_target_diverges(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        ingredient = Ingredient(
+            "ingredient-egg",
+            "source-1",
+            "food-egg",
+            "Яйцо",
+            "51772",
+            Decimal("100"),
+            "г",
+            grams=Decimal("100"),
+        )
+        source_recipe = Recipe(
+            id="source-1",
+            title="Омлет",
+            description="Исходное описание",
+            portions=Decimal("2"),
+            steps=["Смешать"],
+            ingredients=[ingredient],
+        )
+        target_recipe = copy.deepcopy(source_recipe)
+        target_recipe.id = "target-1"
+        target_recipe.portions = Decimal("5")
+        target_recipe.ingredients[0].recipe_id = target_recipe.id
+        source = FakeCreateClient("tg11")
+        target = FakeCreateClient("tg22")
+        source.recipes[source_recipe.id] = source_recipe
+        target.recipes[target_recipe.id] = target_recipe
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": source,
+            "tg22": target,
+        }
+
+        asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                [_resolved_recipe_item(ingredient)],
+                updated_by=11,
+                portions=source_recipe.portions,
+                steps=source_recipe.steps,
+            )
+        )
+
+        assert [source.create_calls, target.create_calls] == [1, 1]
+        assert source.deleted_recipe_ids == [source_recipe.id]
+        assert target.deleted_recipe_ids == [target_recipe.id]
+        assert all(next(iter(client.recipes.values())).portions == Decimal("2") for client in (source, target))
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_scopes_idempotency_to_source_and_replacement_identity(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        client = FakeCreateClient("tg11")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        ingredient = Ingredient(
+            "ingredient-egg",
+            "",
+            "food-egg",
+            "Яйцо",
+            "51772",
+            Decimal("100"),
+            "г",
+            grams=Decimal("100"),
+        )
+        item = _resolved_recipe_item(ingredient)
+        asyncio.run(
+            engine.create_recipe_from_list(
+                "group",
+                "Омлет",
+                [item],
+                updated_by=11,
+                portions=Decimal("2"),
+                steps=["Смешать"],
+            )
+        )
+        source_recipe = copy.deepcopy(client.recipes["remote-tg11"])
+        source_recipe.id = "source-edit"
+        for source_ingredient in source_recipe.ingredients:
+            source_ingredient.recipe_id = source_recipe.id
+        duplicate = copy.deepcopy(source_recipe)
+        duplicate.id = "source-duplicate"
+        for duplicate_ingredient in duplicate.ingredients:
+            duplicate_ingredient.recipe_id = duplicate.id
+        client.recipes = {source_recipe.id: source_recipe, duplicate.id: duplicate}
+
+        result = asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                [item],
+                updated_by=11,
+                portions=Decimal("2"),
+                steps=["Смешать"],
+            )
+        )
+
+        assert client.create_calls == 2
+        assert client.deleted_recipe_ids == ["source-edit", "source-duplicate"]
+        assert storage._conn.execute("SELECT COUNT(*) FROM recipe_list_runs").fetchone()[0] == 2
+        stored = storage.get_recipe(result.recipe_id)
+        assert stored is not None
+        assert [stored_ingredient.id for stored_ingredient in stored.ingredients] == ["ingredient-egg"]
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_resumes_exact_journal_after_validated_source_was_replaced(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        ingredient = Ingredient(
+            "ingredient-egg",
+            "source-1",
+            "food-egg",
+            "Яйцо",
+            "51772",
+            Decimal("100"),
+            "г",
+            grams=Decimal("100"),
+        )
+        source_recipe = Recipe(
+            id="source-1",
+            title="Омлет",
+            description="Проверенный источник",
+            portions=Decimal("2"),
+            steps=["Смешать"],
+            ingredients=[ingredient],
+        )
+        client = FakeCreateClient("tg11")
+        client.recipes[source_recipe.id] = source_recipe
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        original_finalize = storage.finalize_recipe_list_run
+        finalize_calls = 0
+
+        def fail_once(run_id, recipe, remote_ids):
+            nonlocal finalize_calls
+            finalize_calls += 1
+            if finalize_calls == 1:
+                raise RuntimeError("injected finalization failure")
+            return original_finalize(run_id, recipe, remote_ids)
+
+        storage.finalize_recipe_list_run = fail_once  # type: ignore[method-assign]
+        request = (
+            "group",
+            "tg11",
+            source_recipe.id,
+            recipe_fingerprint(source_recipe).digest,
+            [_resolved_recipe_item(ingredient)],
+        )
+
+        with pytest.raises(FatSecretError, match="remote ID сохранены"):
+            asyncio.run(
+                engine.edit_recipe_from_list(
+                    *request,
+                    updated_by=11,
+                    portions=Decimal("3"),
+                    steps=["Взбить", "Запечь"],
+                )
+            )
+
+        assert source_recipe.id not in client.recipes
+        assert client.create_calls == 1
+        assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "recovery_pending"
+
+        resumed = asyncio.run(
+            engine.edit_recipe_from_list(
+                *request,
+                updated_by=11,
+                portions=Decimal("3"),
+                steps=["Взбить", "Запечь"],
+            )
+        )
+
+        assert client.create_calls == 1
+        assert client.deleted_recipe_ids == [source_recipe.id]
+        assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "completed"
+        stored = storage.get_recipe(resumed.recipe_id)
+        assert stored is not None
+        assert stored.portions == Decimal("3")
+        assert stored.steps == ["Взбить", "Запечь"]
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_rejects_unmapped_personal_food_before_recipe_writes(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        personal_ingredient = Ingredient(
+            "personal-ingredient",
+            "source-1",
+            "source-personal-food",
+            "Личный продукт",
+            "0",
+            Decimal("1"),
+            "100г",
+            grams=Decimal("100"),
+        )
+        source_recipe = Recipe(
+            id="source-1",
+            title="Личный рецепт",
+            ingredients=[personal_ingredient],
+        )
+        definition = CustomFoodDefinition(
+            source_recipe_id=personal_ingredient.food_id,
+            title=personal_ingredient.title,
+            manufacturer_name="Домашний",
+            serving_type="Per100g",
+            serving_size="",
+            metric_serving_size="100g",
+            nutrients={"calories": Decimal("100")},
+        )
+        source = FakeCustomFoodSourceClient(source_recipe, definition, account_key="tg11")
+        target = FakeCreateClient("tg22")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": source,
+            "tg22": target,
+        }
+
+        with pytest.raises(FatSecretError, match="не готовы привязки всех аккаунтов"):
+            asyncio.run(
+                engine.edit_recipe_from_list(
+                    "group",
+                    "tg11",
+                    source_recipe.id,
+                    recipe_fingerprint(source_recipe).digest,
+                    [_resolved_recipe_item(personal_ingredient)],
+                    updated_by=11,
+                    portions=Decimal("1"),
+                    steps=[],
+                )
+            )
+
+        assert list(source.recipes) == [source_recipe.id]
+        assert source.deleted_recipe_ids == []
+        assert target.create_calls == 0
+        assert target.deleted_recipe_ids == []
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_rejects_partial_custom_food_mapping_before_remote_writes(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(id="source-1", title="Личный рецепт")
+        source = FakeCreateClient("tg11")
+        target = FakeCreateClient("tg22")
+        source.recipes[source_recipe.id] = source_recipe
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": source,
+            "tg22": target,
+        }
+        personal = ResolvedRecipeListItem(
+            requested_query="Личный продукт",
+            grams=Decimal("100"),
+            ingredient=Ingredient(
+                "personal-ingredient",
+                source_recipe.id,
+                "source-personal-food",
+                "Личный продукт",
+                "0",
+                Decimal("1"),
+                "100г",
+                grams=Decimal("100"),
+            ),
+            source="FatSecret",
+            custom_food_ids={"tg11": "source-personal-food"},
+        )
+
+        with pytest.raises(FatSecretError, match="не готовы привязки аккаунтов: tg22"):
+            asyncio.run(
+                engine.edit_recipe_from_list(
+                    "group",
+                    "tg11",
+                    source_recipe.id,
+                    recipe_fingerprint(source_recipe).digest,
+                    [personal],
+                    updated_by=11,
+                    portions=Decimal("1"),
+                    steps=[],
+                )
+            )
+
+        assert source.create_calls == target.create_calls == 0
+        assert source.deleted_recipe_ids == target.deleted_recipe_ids == []
+    finally:
+        storage.close()
+
+
 def test_load_remote_recipe_index_merges_live_cookbooks_by_title(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -2790,6 +3475,83 @@ def test_batch_variant_hydration_reuses_food_details_across_visible_recipes(tmp_
         assert client.detail_calls == ["shared-food"]
         assert all(variants[0].recipe.ingredients[0].grams == Decimal("150") for variants in hydrated.values())
         assert client.closed is True
+    finally:
+        storage.close()
+
+
+def test_variant_semantic_fingerprint_matches_equivalent_normalized_portions(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        unit_recipe = Recipe(
+            id="111",
+            title="Омлет",
+            ingredients=[
+                Ingredient(
+                    "unit-egg",
+                    "111",
+                    "egg-source",
+                    "Яйцо",
+                    "unit-portion",
+                    Decimal("2"),
+                    "штуки",
+                )
+            ],
+        )
+        gram_recipe = Recipe(
+            id="222",
+            title="Омлет",
+            ingredients=[
+                Ingredient(
+                    "gram-egg",
+                    "222",
+                    "egg-target",
+                    "Яйцо",
+                    "gram-portion",
+                    Decimal("120"),
+                    "г",
+                    grams=Decimal("120"),
+                )
+            ],
+        )
+        unit_client = FakeFoodUsageClient(
+            [unit_recipe],
+            "tg11",
+            details={
+                "egg-source": FoodSearchResult(
+                    food_id="egg-source",
+                    title="Яйцо",
+                    default_portion_id="unit-portion",
+                    default_portion_description="штуки",
+                    grams_per_portion=Decimal("60"),
+                    raw={
+                        "_gram_portion_id": "gram-source",
+                        "_gram_portion_description": "г",
+                    },
+                )
+            },
+        )
+        gram_client = FakeFoodUsageClient([gram_recipe], "tg22")
+        recipe_ref = Recipe(
+            id="live-omlet",
+            title="Омлет",
+            group_id="group",
+            remote_ids={"tg11": "111", "tg22": "222"},
+            remote_ids_by_account={"tg11": ["111"], "tg22": ["222"]},
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": unit_client,
+            "tg22": gram_client,
+        }
+
+        variants = asyncio.run(engine.hydrate_live_recipe_variants(recipe_ref))
+
+        assert [variant.recipe.ingredients[0].grams for variant in variants] == [
+            Decimal("120"),
+            Decimal("120"),
+        ]
+        assert len({variant.fingerprint.digest for variant in variants}) == 1
+        assert len({variant.strict_fingerprint.digest for variant in variants if variant.strict_fingerprint}) == 2
     finally:
         storage.close()
 
@@ -3000,13 +3762,18 @@ def test_sync_live_recipe_from_source_does_not_create_local_recipe_rows(tmp_path
 
 
 @pytest.mark.parametrize(
-    ("expected_remote_id", "expected_digest"),
-    [("changed-remote-id", None), ("111", "stale-content-digest")],
+    ("expected_remote_id", "expected_digest", "expected_strict_digest"),
+    [
+        ("changed-remote-id", None, None),
+        ("111", "stale-content-digest", None),
+        ("111", None, "stale-strict-digest"),
+    ],
 )
 def test_sync_live_recipe_rejects_changed_approved_source_before_target_mutation(
     tmp_path,
     expected_remote_id: str,
     expected_digest: str | None,
+    expected_strict_digest: str | None,
 ) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -3046,6 +3813,7 @@ def test_sync_live_recipe_rejects_changed_approved_source_before_target_mutation
                     "tg11",
                     expected_source_remote_id=expected_remote_id,
                     expected_source_content_digest=expected_digest,
+                    expected_source_strict_digest=expected_strict_digest,
                 )
             )
 
@@ -3079,7 +3847,8 @@ def test_sync_live_recipe_accepts_the_exact_approved_source_fingerprint(tmp_path
                 recipe_ref,
                 "tg11",
                 expected_source_remote_id="111",
-                expected_source_content_digest=recipe_content_fingerprint(source_recipe).digest,
+                expected_source_content_digest="normalized-display-digest",
+                expected_source_strict_digest=recipe_fingerprint(source_recipe).digest,
             )
         )
 

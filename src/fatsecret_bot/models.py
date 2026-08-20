@@ -101,6 +101,7 @@ class RemoteRecipeVariant:
     remote_recipe_id: str
     recipe: Recipe
     fingerprint: RecipeFingerprint
+    strict_fingerprint: RecipeFingerprint | None = None
 
 
 @dataclass(frozen=True)

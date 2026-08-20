@@ -74,3 +74,41 @@ def test_cross_account_content_fingerprint_ignores_cloned_custom_food_id() -> No
 
     assert recipe_fingerprint(first).digest != recipe_fingerprint(second).digest
     assert recipe_content_fingerprint(first).digest == recipe_content_fingerprint(second).digest
+
+
+def test_cross_account_content_fingerprint_uses_resolved_grams_not_portion_representation() -> None:
+    first = Recipe(
+        id="a",
+        title="Омлет",
+        ingredients=[
+            Ingredient(
+                "a",
+                "a",
+                "egg-a",
+                "Яйцо",
+                "unit-portion",
+                Decimal("2"),
+                "штуки",
+                grams=Decimal("120"),
+            )
+        ],
+    )
+    second = Recipe(
+        id="b",
+        title="Омлет",
+        ingredients=[
+            Ingredient(
+                "b",
+                "b",
+                "egg-b",
+                "Яйцо",
+                "gram-portion",
+                Decimal("120"),
+                "г",
+                grams=Decimal("120"),
+            )
+        ],
+    )
+
+    assert recipe_fingerprint(first).digest != recipe_fingerprint(second).digest
+    assert recipe_content_fingerprint(first).digest == recipe_content_fingerprint(second).digest

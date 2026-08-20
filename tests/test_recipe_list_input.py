@@ -98,8 +98,8 @@ def test_custom_food_optional_steps_have_explicit_skip_buttons() -> None:
         for button in row
     ]
 
-    assert ("Без штрих-кода", "food_skip_barcode:0") in barcode_buttons
-    assert ("Без бренда", "food_skip_brand:0") in brand_buttons
+    assert ("⏭️ Без штрих-кода", "food_skip_barcode:0") in barcode_buttons
+    assert ("⏭️ Без бренда", "food_skip_brand:0") in brand_buttons
 
 
 def test_custom_food_brand_suggestions_use_index_callbacks_and_keep_fallbacks() -> None:
@@ -116,7 +116,7 @@ def test_custom_food_brand_suggestions_use_index_callbacks_and_keep_fallbacks() 
     assert ("Санта", "food_brand_pick:token:0") in buttons
     assert ("Санта Бремор", "food_brand_pick:token:1") in buttons
     assert ("Использовать введённое: санта", "food_brand_custom:token") in buttons
-    assert ("Без бренда", "food_skip_brand:0") in buttons
+    assert ("⏭️ Без бренда", "food_skip_brand:0") in buttons
 
 
 def test_parse_recipe_list_lines_uses_last_number_as_grams() -> None:
@@ -178,7 +178,7 @@ def test_list_validation_errors_always_offer_visible_cancel() -> None:
 
     buttons = [button for row in keyboard.inline_keyboard for button in row]
     assert [(button.text, button.callback_data) for button in buttons] == [
-        ("Отмена", "recipe_list_cancel:0")
+        ("✖️ Отменить", "recipe_list_cancel:0")
     ]
 
 
@@ -349,7 +349,7 @@ def test_recipe_list_draft_shows_unresolved_items_and_blocks_create() -> None:
 
     assert "<b>Нужно заполнить или удалить</b>" in text
     assert "- ? Приправа для фарша Green | масса: 3г" in text
-    assert "Найти: Приправа для фарша Green" in flat_buttons
-    assert "Создать" in flat_buttons
-    assert "Удалить" in flat_buttons
-    assert "Создать рецепт" not in flat_buttons
+    assert any(button.startswith("🔎 Подобрать: Приправа") for button in flat_buttons)
+    assert "➕ Создать продукт" in flat_buttons
+    assert "🗑️ Убрать ингредиент" in flat_buttons
+    assert "✅ Создать рецепт" not in flat_buttons

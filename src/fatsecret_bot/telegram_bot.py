@@ -8,7 +8,7 @@ import io
 import logging
 import re
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -40,6 +40,7 @@ from .models import (
 )
 from .nutrition import custom_food_macro_error
 from .portions import grams_from_portion
+from .recipe_compare import recipe_fingerprint
 from .storage import GroupMemberLimitError, Storage, normalize_title
 from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
 
@@ -62,15 +63,23 @@ RECIPE_WARNING_CACHE_CHECKED_KEY = "recipe_warning_cache_checked_at"
 RECIPE_WARNING_RENDER_TOKEN_KEY = "recipe_warning_render_token"
 RECIPE_WARNING_RENDER_TASK_KEY = "recipe_warning_render_task"
 TELEGRAM_SAFE_TEXT_LIMIT = 4000
-MAIN_BUTTONS = {
-    "Поиск рецептов",
-    "Рецепты",
-    "Создать из списка",
-    "Создать продукт",
-    "Меню / Дневник",
-    "Группы",
-    "Аккаунты",
+MAIN_ACTION_BY_LABEL = {
+    "🍽️ Все рецепты": "recipes",
+    "Поиск рецептов": "recipes",
+    "Рецепты": "recipes",
+    "➕ Новый рецепт": "recipe_create",
+    "Создать из списка": "recipe_create",
+    "🥕 Новый продукт": "food_create",
+    "Создать продукт": "food_create",
+    "👥 Моя группа": "groups",
+    "👥 Группы": "groups",
+    "Группы": "groups",
+    "🔗 Аккаунты FatSecret": "accounts",
+    "Аккаунты": "accounts",
+    "📅 Копировать дневник": "diary",
+    "Меню / Дневник": "diary",
 }
+MAIN_BUTTONS = set(MAIN_ACTION_BY_LABEL)
 LIST_WIDTH_LINE = "--------------------------------"
 PORTION_DESCRIPTION_RE = re.compile(
     r"^\s*(?P<size>\d+(?:[\.,]\d+)?)\s*(?P<unit>г|гр|g|gram|грам|мл|ml)\b",
@@ -94,18 +103,18 @@ RECIPE_STEP_PREFIX_RE = re.compile(r"^\s*(?:\d+[\).]\s*|[-*]\s*)?(?P<step>.+?)\s
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["Поиск рецептов", "Создать из списка"],
-        ["Создать продукт"],
-        ["Группы", "Аккаунты"],
+        ["🍽️ Все рецепты", "➕ Новый рецепт"],
+        ["🥕 Новый продукт"],
+        ["👥 Моя группа", "🔗 Аккаунты FatSecret"],
     ],
     resize_keyboard=True,
 )
 
 ADMIN_MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["Поиск рецептов", "Создать из списка"],
-        ["Создать продукт", "Меню / Дневник"],
-        ["Группы", "Аккаунты"],
+        ["🍽️ Все рецепты", "➕ Новый рецепт"],
+        ["🥕 Новый продукт", "📅 Копировать дневник"],
+        ["👥 Группы", "🔗 Аккаунты FatSecret"],
     ],
     resize_keyboard=True,
 )
@@ -340,8 +349,8 @@ def _format_custom_food_created(
 def _custom_food_barcode_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Без штрих-кода", callback_data="food_skip_barcode:0")],
-            [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+            [InlineKeyboardButton("⏭️ Без штрих-кода", callback_data="food_skip_barcode:0")],
+            [InlineKeyboardButton("✖️ Отменить", callback_data="food_cancel:0")],
         ]
     )
 
@@ -349,8 +358,8 @@ def _custom_food_barcode_keyboard() -> InlineKeyboardMarkup:
 def _custom_food_brand_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Без бренда", callback_data="food_skip_brand:0")],
-            [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+            [InlineKeyboardButton("⏭️ Без бренда", callback_data="food_skip_brand:0")],
+            [InlineKeyboardButton("✖️ Отменить", callback_data="food_cancel:0")],
         ]
     )
 
@@ -373,8 +382,8 @@ def _custom_food_brand_suggestions_keyboard(
                     callback_data=f"food_brand_custom:{choice_token}",
                 )
             ],
-            [InlineKeyboardButton("Без бренда", callback_data="food_skip_brand:0")],
-            [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+            [InlineKeyboardButton("⏭️ Без бренда", callback_data="food_skip_brand:0")],
+            [InlineKeyboardButton("✖️ Отменить", callback_data="food_cancel:0")],
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -383,9 +392,9 @@ def _custom_food_brand_suggestions_keyboard(
 def _custom_food_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Создать продукт", callback_data="food_create:0")],
-            [InlineKeyboardButton("Изменить название", callback_data="food_change_title:0")],
-            [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+            [InlineKeyboardButton("✅ Создать продукт", callback_data="food_create:0")],
+            [InlineKeyboardButton("🏷️ Изменить название", callback_data="food_change_title:0")],
+            [InlineKeyboardButton("✖️ Отменить", callback_data="food_cancel:0")],
         ]
     )
 
@@ -528,6 +537,11 @@ def _recipe_versions_differ(
     return len({variant.fingerprint.digest for variant in variants}) > 1
 
 
+def _recipe_variant_strict_digest(variant: RemoteRecipeVariant) -> str:
+    """Return the raw account-specific digest coupled to one hydrated display variant."""
+    return (variant.strict_fingerprint or recipe_fingerprint(variant.recipe)).digest
+
+
 def _format_product_difference_amount(ingredient: Ingredient) -> str:
     return re.sub(r"(?<=\d)(г|мл)$", r" \1", _format_ingredient_amount(ingredient))
 
@@ -617,18 +631,26 @@ def _recipe_actions_keyboard(
     buttons = [
         [
             InlineKeyboardButton(
-                "Экспортировать",
+                "✏️ Изменить рецепт",
+                callback_data=f"recipe_edit:{recipe_id}:{export_variant_index}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📤 Экспортировать рецепт",
                 callback_data=f"recipe_export:{recipe_id}:{export_variant_index}",
             )
         ]
     ]
     if can_sync:
-        buttons.append([InlineKeyboardButton("Синхронизировать", callback_data=f"sync:{recipe_id}")])
+        buttons.append(
+            [InlineKeyboardButton("🔄 Применить эту версию везде", callback_data=f"sync:{recipe_id}")]
+        )
     buttons.extend(
         [
-            [InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{recipe_id}")],
-            [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{recipe_id}")],
-            [InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")],
+            [InlineKeyboardButton("🏷️ Изменить название", callback_data=f"recipe_rename:{recipe_id}")],
+            [InlineKeyboardButton("🗑️ Удалить рецепт", callback_data=f"delete:{recipe_id}")],
+            [InlineKeyboardButton("⬅️ Все рецепты", callback_data=f"{page_action}:{page}")],
         ]
     )
     return InlineKeyboardMarkup(
@@ -664,13 +686,17 @@ def _recipe_list_message(
     checking_versions: bool = False,
     needs_reload: bool = False,
 ) -> str:
-    lines = [title, "Пришли текст в чат, чтобы искать по рецептам.", LIST_WIDTH_LINE]
+    lines = [
+        title,
+        "Нажми на рецепт, чтобы открыть его. Для поиска просто пришли текст в чат.",
+        LIST_WIDTH_LINE,
+    ]
     if has_product_differences:
         lines.append(RECIPE_PRODUCT_DIFFERENCE_FOOTER)
     if checking_versions:
         lines.append("⏳ Проверяю версии в фоне…")
     if needs_reload:
-        lines.append("🔄 Данные о версиях старше 10 минут. Нажми «Обновить список».")
+        lines.append("🔄 Данные о версиях старше 10 минут. Нажми «🔄 Обновить список».")
     return "\n".join(lines)
 
 
@@ -927,12 +953,15 @@ def _recipe_list_draft_keyboard(
     items: list[ResolvedRecipeListItem],
     steps: list[str] | None = None,
     unresolved: list[RecipeListItem] | None = None,
+    *,
+    editing: bool = False,
+    edit_token: str = "",
 ) -> InlineKeyboardMarkup:
     unresolved = unresolved or []
     buttons = [
         [
             InlineKeyboardButton(
-                f"Заменить: {item.ingredient.title[:42]}",
+                f"✏️ Заменить: {item.ingredient.title[:38]}",
                 callback_data=f"recipe_list_replace:{index}",
             )
         ]
@@ -942,27 +971,38 @@ def _recipe_list_draft_keyboard(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    f"Найти: {item.query[:24]}",
+                    f"🔎 Подобрать: {item.query[:18]}",
                     callback_data=f"recipe_list_resolve:{index}",
                 ),
-                InlineKeyboardButton("Создать", callback_data=f"recipe_list_create_food:{index}"),
-                InlineKeyboardButton("Удалить", callback_data=f"recipe_list_drop:{index}"),
+                InlineKeyboardButton("➕ Создать продукт", callback_data=f"recipe_list_create_food:{index}"),
+                InlineKeyboardButton("🗑️ Убрать ингредиент", callback_data=f"recipe_list_drop:{index}"),
             ]
         )
-    buttons.append([InlineKeyboardButton("Изменить имя", callback_data="recipe_list_rename:0")])
+    if not editing:
+        buttons.append([InlineKeyboardButton("🏷️ Изменить название", callback_data="recipe_list_rename:0")])
     buttons.append(
-        [InlineKeyboardButton("Изменить шаги" if steps else "Шаги", callback_data="recipe_list_steps:0")]
+        [InlineKeyboardButton("📝 Добавить/изменить шаги", callback_data="recipe_list_steps:0")]
     )
     if items and not unresolved:
-        buttons.append([InlineKeyboardButton("Создать рецепт", callback_data="recipe_list_confirm:0")])
-    buttons.append([InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")])
+        label = "✅ Сохранить изменения" if editing else "✅ Создать рецепт"
+        callback = f"recipe_edit_confirm:{edit_token}" if editing else "recipe_list_confirm:0"
+        buttons.append([InlineKeyboardButton(label, callback_data=callback)])
+    cancel_callback = f"recipe_edit_cancel:{edit_token}" if editing else "recipe_list_cancel:0"
+    buttons.append([InlineKeyboardButton("✖️ Отменить", callback_data=cancel_callback)])
     return InlineKeyboardMarkup(buttons)
 
 
 def _recipe_list_input_error_keyboard() -> InlineKeyboardMarkup:
     """Return a visible escape hatch while list input remains invalid."""
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")]]
+        [[InlineKeyboardButton("✖️ Отменить", callback_data="recipe_list_cancel:0")]]
+    )
+
+
+def _recipe_edit_input_error_keyboard(edit_token: str) -> InlineKeyboardMarkup:
+    """Keep an invalid edit safely inside the edit flow."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✖️ Отменить редактирование", callback_data=f"recipe_edit_cancel:{edit_token}")]]
     )
 
 
@@ -982,10 +1022,10 @@ def _recipe_list_candidate_keyboard(
     ]
     nav: list[InlineKeyboardButton] = []
     if page > 0 or has_next:
-        nav.append(InlineKeyboardButton("Назад", callback_data=f"recipe_list_cpage:{page - 1}" if page > 0 else "noop:0"))
-        nav.append(InlineKeyboardButton("Дальше", callback_data=f"recipe_list_cpage:{page + 1}" if has_next else "noop:0"))
+        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"recipe_list_cpage:{page - 1}" if page > 0 else "noop:0"))
+        nav.append(InlineKeyboardButton("Дальше ➡️", callback_data=f"recipe_list_cpage:{page + 1}" if has_next else "noop:0"))
         buttons.append(nav)
-    buttons.append([InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")])
+    buttons.append([InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1629,7 +1669,7 @@ class TelegramRecipeBot:
             )
             return
         await update.effective_message.reply_text(
-            "Готов. Здесь можно синхронизировать рецепты и продукты между FatSecret аккаунтами.",
+            "Гото. Начни с «🍽️ Все рецепты»: там можно открыть, изменить, экспортировать и синхронизировать рецепты. Для поиска просто пришли текст.",
             reply_markup=self._main_keyboard(update.effective_user.id),
         )
         context.chat_data["reply_keyboard"] = "main"
@@ -1670,23 +1710,23 @@ class TelegramRecipeBot:
                 for group in self.storage.list_groups_for_user(telegram_id):
                     if group.id != active.id:
                         buttons.append(
-                            [InlineKeyboardButton(f"Переключиться: {group.name}"[:60], callback_data=f"group_switch:{group.id}")]
+                            [InlineKeyboardButton(f"👥 Перейти в: {group.name}"[:60], callback_data=f"group_switch:{group.id}")]
                         )
             if self.storage.active_group_created_by(telegram_id):
-                buttons.append([InlineKeyboardButton("Переименовать группу", callback_data="group_rename:0")])
+                buttons.append([InlineKeyboardButton("🏷️ Изменить название группы", callback_data="group_rename:0")])
             if is_admin:
                 buttons.append(
                     [
-                        InlineKeyboardButton("Создать группу", callback_data="group_create:0"),
-                        InlineKeyboardButton("Подключиться", callback_data="group_join:0"),
+                        InlineKeyboardButton("➕ Создать группу", callback_data="group_create:0"),
+                        InlineKeyboardButton("🔗 Вступить по коду", callback_data="group_join:0"),
                     ]
                 )
-            buttons.append([InlineKeyboardButton("Отключиться от группы", callback_data="group_leave:0")])
+            buttons.append([InlineKeyboardButton("🚪 Выйти из группы", callback_data="group_leave:0")])
             return InlineKeyboardMarkup(buttons)
         buttons: list[list[InlineKeyboardButton]] = [
             [
-                InlineKeyboardButton("Создать группу", callback_data="group_create:0"),
-                InlineKeyboardButton("Подключиться", callback_data="group_join:0"),
+                InlineKeyboardButton("➕ Создать группу", callback_data="group_create:0"),
+                InlineKeyboardButton("🔗 Вступить по коду", callback_data="group_join:0"),
             ]
         ]
         return InlineKeyboardMarkup(buttons)
@@ -1724,14 +1764,14 @@ class TelegramRecipeBot:
         accounts = self.storage.list_fatsecret_accounts(group.id)
         owned = {account.key: account for account in self.storage.list_fatsecret_accounts_for_owner(telegram_id)}
         buttons: list[list[InlineKeyboardButton]] = [
-            [InlineKeyboardButton("Добавить FatSecret аккаунт", callback_data="account_add:0")]
+            [InlineKeyboardButton("➕ Подключить FatSecret", callback_data="account_add:0")]
         ]
         for account in accounts:
             if account.key in owned:
                 buttons.append(
                     [
                         InlineKeyboardButton(
-                            f"Поменять ник: {account.label[:32]}",
+                            f"🏷️ Изменить имя: {account.label[:30]}",
                             callback_data=f"account_label:{account.key}",
                         )
                     ]
@@ -1739,7 +1779,7 @@ class TelegramRecipeBot:
                 buttons.append(
                     [
                         InlineKeyboardButton(
-                            f"Отсоединить: {account.label[:38]}",
+                            f"↪️ Убрать из группы: {account.label[:28]}",
                             callback_data=f"account_detach:{account.key}",
                         )
                     ]
@@ -1747,19 +1787,19 @@ class TelegramRecipeBot:
                 buttons.append(
                     [
                         InlineKeyboardButton(
-                            f"Удалить подключение: {account.label[:32]}",
+                            f"🗑️ Удалить из бота: {account.label[:28]}",
                             callback_data=f"account_delete:{account.key}",
                         )
                     ]
                 )
             elif self.storage.active_group_created_by(telegram_id):
                 buttons.append(
-                    [InlineKeyboardButton(f"Отсоединить: {account.label[:38]}", callback_data=f"account_detach:{account.key}")]
+                    [InlineKeyboardButton(f"↪️ Убрать из группы: {account.label[:28]}", callback_data=f"account_detach:{account.key}")]
                 )
         for account in owned.values():
             if self.storage.fatsecret_account_group_id(account.key) is None:
                 buttons.append(
-                    [InlineKeyboardButton(f"Подключить к группе: {account.label}"[:60], callback_data=f"account_attach:{account.key}")]
+                    [InlineKeyboardButton(f"🔗 Добавить в группу: {account.label}"[:60], callback_data=f"account_attach:{account.key}")]
                 )
         return InlineKeyboardMarkup(buttons)
 
@@ -1846,7 +1886,7 @@ class TelegramRecipeBot:
             [InlineKeyboardButton(account.label[:50], callback_data=f"diarysrc:{account.key}")]
             for account in accounts
         ]
-        buttons.append([InlineKeyboardButton("Отмена", callback_data="diarycancel:0")])
+        buttons.append([InlineKeyboardButton("✖️ Отменить", callback_data="diarycancel:0")])
         await update.effective_message.reply_text(
             "<b>Копирование меню / дневника</b>\n\nВыбери FatSecret аккаунт, где уже заполнен исходный день.",
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -1898,8 +1938,8 @@ class TelegramRecipeBot:
         ]
         buttons.extend(
             [
-                [InlineKeyboardButton("Дальше", callback_data="diarytargets_done:0")],
-                [InlineKeyboardButton("Отмена", callback_data="diarycancel:0")],
+                [InlineKeyboardButton("Дальше ➡️", callback_data="diarytargets_done:0")],
+                [InlineKeyboardButton("✖️ Отменить", callback_data="diarycancel:0")],
             ]
         )
         error = "Нужно выбрать хотя бы один целевой аккаунт.\n\n" if context.user_data.pop("diary_targets_error", False) else ""
@@ -1926,7 +1966,7 @@ class TelegramRecipeBot:
         await query.edit_message_text(
             f"Источник: <b>{html.escape(label)}</b>.\n\n"
             "Пришли дату заполненного дня: <code>ДД.ММ.ГГГГ</code>, <code>сегодня</code> или <code>вчера</code>.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="diarycancel:0")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Отменить", callback_data="diarycancel:0")]]),
             parse_mode=ParseMode.HTML,
         )
 
@@ -1949,7 +1989,9 @@ class TelegramRecipeBot:
         source_date_text = str(context.user_data.get("diary_source_date") or "")
         if not group_id or not source_account_key or not source_date_text:
             context.user_data.clear()
-            await update.effective_message.reply_text("Контекст копирования потерян. Нажми «Меню / Дневник» заново.")
+            await update.effective_message.reply_text(
+                "Контекст копирования потерян. Нажми «📅 Копировать дневник» заново."
+            )
             return
         status = await update.effective_message.reply_text("Загружаю исходный дневник и готовлю проверку...")
         try:
@@ -1972,8 +2014,8 @@ class TelegramRecipeBot:
             self._format_diary_preview(preview, group_id),
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Скопировать", callback_data=f"diaryrun:{preview.run_id}")],
-                    [InlineKeyboardButton("Отмена", callback_data="diarycancel:0")],
+                    [InlineKeyboardButton("📅 Скопировать дневник", callback_data=f"diaryrun:{preview.run_id}")],
+                    [InlineKeyboardButton("✖️ Отменить", callback_data="diarycancel:0")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
@@ -2079,7 +2121,9 @@ class TelegramRecipeBot:
         context.user_data["recipe_list_page"] = page
         context.user_data["group_id"] = group.id
         if total_count == 0:
-            await status.edit_text("Рецептов пока нет. Создай рецепт в FatSecret и снова нажми «Поиск рецептов».")
+            await status.edit_text(
+                "Рецептов пока нет. Создай рецепт в FatSecret и снова нажми «🍽️ Все рецепты»."
+            )
             return
         needs_reload = self._recipe_cache_needs_reload(context, group.id)
         product_difference_ids, pending, connected_account_keys = self._recipe_warning_state(
@@ -2157,18 +2201,18 @@ class TelegramRecipeBot:
         nav: list[InlineKeyboardButton] = []
         if total_pages > 1:
             nav.append(
-                InlineKeyboardButton("Назад", callback_data=f"{page_action}:{page - 1}" if page > 0 else "noop:0")
+                InlineKeyboardButton("⬅️ Назад", callback_data=f"{page_action}:{page - 1}" if page > 0 else "noop:0")
             )
             nav.append(
                 InlineKeyboardButton(
-                    "Дальше",
+                    "Дальше ➡️",
                     callback_data=f"{page_action}:{page + 1}" if page + 1 < total_pages else "noop:0",
                 )
             )
             buttons.append(nav)
         if needs_reload:
-            buttons.append([InlineKeyboardButton("Обновить список", callback_data="refresh:0")])
-        buttons.append([InlineKeyboardButton("Удалить несколько", callback_data=f"batchdel:{page}")])
+            buttons.append([InlineKeyboardButton("🔄 Обновить список", callback_data="refresh:0")])
+        buttons.append([InlineKeyboardButton("🗑️ Удалить несколько", callback_data=f"batchdel:{page}")])
         return InlineKeyboardMarkup(buttons)
 
     def _filter_recipes(self, query: str, recipes: list[Recipe]) -> list[Recipe]:
@@ -2212,6 +2256,17 @@ class TelegramRecipeBot:
             )
             return
 
+        if self._recipe_edit_is_active(context) and action in {
+            "recipe_list_create",
+            "recipe_list_confirm",
+            "recipe_list_replace_existing",
+            "recipe_list_copy",
+        }:
+            await query.edit_message_text(
+                "Эта кнопка относится к старому черновику. Текущий рецепт не изменён."
+            )
+            return
+
         if action == "open":
             context.user_data.pop("mode", None)
             await self._open_recipe(query, context, value)
@@ -2225,6 +2280,12 @@ class TelegramRecipeBot:
             await self._confirm_sync_preview(query, context)
         elif action == "recipe_export":
             await self._export_recipe(query, context, value)
+        elif action == "recipe_edit":
+            await self._start_recipe_edit(query, context, value)
+        elif action == "recipe_edit_confirm":
+            await self._confirm_recipe_edit(query, context, update.effective_user.id, value)
+        elif action == "recipe_edit_cancel":
+            await self._cancel_recipe_edit(query, context, value)
         elif action == "recipe_rename":
             await self._start_recipe_rename(query, context, value)
         elif action == "recipe_rename_replace":
@@ -2258,7 +2319,7 @@ class TelegramRecipeBot:
             context.user_data["mode"] = "group_create"
             await query.edit_message_text(
                 "Пришли название новой группы.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Отменить", callback_data="groups:0")]]),
             )
         elif action == "group_join":
             if not self._can_add_group_membership(update.effective_user.id):
@@ -2268,7 +2329,7 @@ class TelegramRecipeBot:
             context.user_data["mode"] = "group_join"
             await query.edit_message_text(
                 "Пришли код группы.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Отменить", callback_data="groups:0")]]),
             )
         elif action == "group_switch":
             context.user_data.clear()
@@ -2304,7 +2365,7 @@ class TelegramRecipeBot:
             context.user_data["mode"] = "group_rename"
             await query.edit_message_text(
                 "Пришли новое название группы.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="groups:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Отменить", callback_data="groups:0")]]),
             )
         elif action == "group_leave":
             context.user_data.clear()
@@ -2347,7 +2408,7 @@ class TelegramRecipeBot:
             if account is None:
                 await query.edit_message_text(
                     "Этот FatSecret аккаунт не из твоей активной группы.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")]]),
                 )
                 return
             context.user_data["mode"] = "account_label"
@@ -2355,7 +2416,7 @@ class TelegramRecipeBot:
             await query.edit_message_text(
                 f"Пришли новый короткий ник для «{html.escape(account.label)}».",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Назад к аккаунтам", callback_data="accounts:0")]]
+                    [[InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")]]
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -2374,7 +2435,7 @@ class TelegramRecipeBot:
                 self._clear_recipe_cache(context)
             await query.edit_message_text(
                 "Аккаунт подключен к активной группе." if attached else "Не удалось подключить: аккаунт уже в другой группе или не принадлежит тебе.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")]]),
             )
         elif action == "account_detach":
             context.user_data.clear()
@@ -2393,7 +2454,7 @@ class TelegramRecipeBot:
                 "Аккаунт отсоединен от группы. Credentials сохранены у владельца."
                 if detached
                 else "Не удалось отсоединить аккаунт.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")]]),
             )
         elif action in {"account_delete", "account_logout", "account_remove"}:
             context.user_data.clear()
@@ -2406,8 +2467,8 @@ class TelegramRecipeBot:
                 "Сам FatSecret аккаунт и его рецепты не удалятся.",
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("Да, удалить", callback_data=f"account_delete_confirm:{account.key}")],
-                        [InlineKeyboardButton("Назад к аккаунтам", callback_data="accounts:0")],
+                        [InlineKeyboardButton("🗑️ Удалить аккаунт из бота", callback_data=f"account_delete_confirm:{account.key}")],
+                        [InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")],
                     ]
                 ),
                 parse_mode=ParseMode.HTML,
@@ -2424,7 +2485,7 @@ class TelegramRecipeBot:
                 "Подключение FatSecret аккаунта удалено из бота."
                 if removed
                 else "Аккаунт уже удален или принадлежит другому пользователю.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")]]),
             )
         elif action == "diarysrc":
             await self._select_diary_source(query, context, update.effective_user.id, value)
@@ -2467,7 +2528,9 @@ class TelegramRecipeBot:
             context.user_data["mode"] = "recipe_list_title"
             await query.edit_message_text(
                 "Пришли название рецепта.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("✖️ Отменить", callback_data="list:0")]]
+                ),
             )
         elif action == "recipe_list_confirm":
             await self._create_recipe_list_from_draft(query, context, update.effective_user.id)
@@ -2494,6 +2557,11 @@ class TelegramRecipeBot:
         elif action == "recipe_list_back":
             await self._edit_recipe_list_draft(query, context)
         elif action == "recipe_list_cancel":
+            if self._recipe_edit_is_active(context):
+                await query.edit_message_text(
+                    "Эта кнопка устарела. Текущий черновик изменений не отменён."
+                )
+                return
             context.user_data.clear()
             await self._edit_recipe_list(query, 0, context)
         elif action == "food_skip_barcode":
@@ -2543,7 +2611,9 @@ class TelegramRecipeBot:
         else:
             await query.edit_message_text(
                 "Это действие устарело. Открой список рецептов заново.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]
+                ),
             )
 
     async def _start_account_add(self, query, context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> None:
@@ -2571,7 +2641,7 @@ class TelegramRecipeBot:
         all_recipes = self._recipe_cache(context, group.id) if context is not None else None
         if all_recipes is None:
             await query.edit_message_text(
-                "Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список."
+                "Список рецептов устарел. Нажми «🍽️ Все рецепты», чтобы загрузить актуальный список."
             )
             return
         recipes, page, total_count = self._recipe_page(all_recipes, page)
@@ -2646,7 +2716,9 @@ class TelegramRecipeBot:
             return
         cached = self._recipe_cache(context, str(group_id))
         if cached is None:
-            await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
+            await query.edit_message_text(
+                "Список рецептов устарел. Нажми «🍽️ Все рецепты», чтобы загрузить актуальный список."
+            )
             return
         search_ids = context.user_data.get(RECIPE_SEARCH_IDS_KEY)
         recipes = (
@@ -2788,7 +2860,14 @@ class TelegramRecipeBot:
         await query.edit_message_text(
             f"Текущее имя: <b>{html.escape(recipe.title)}</b>\nПришли новое имя рецепта.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Отмена", callback_data=self._recipe_rename_back_callback(context, recipe.id))]]
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✖️ Отменить",
+                            callback_data=self._recipe_rename_back_callback(context, recipe.id),
+                        )
+                    ]
+                ]
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -2823,7 +2902,14 @@ class TelegramRecipeBot:
             await update.effective_message.reply_text(
                 "Название не изменилось.",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Открыть рецепт", callback_data=self._recipe_rename_back_callback(context, reference.id))]]
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🍽️ Открыть рецепт",
+                                callback_data=self._recipe_rename_back_callback(context, reference.id),
+                            )
+                        ]
+                    ]
                 ),
             )
             return
@@ -2854,11 +2940,11 @@ class TelegramRecipeBot:
             f"Для отдельной копии использую имя: <b>{html.escape(copy_title)}</b>",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Обновить существующий", callback_data="recipe_rename_replace:0")],
-                    [InlineKeyboardButton(f"Создать «{copy_title}»"[:60], callback_data="recipe_rename_copy:0")],
+                    [InlineKeyboardButton("🔄 Заменить существующий рецепт", callback_data="recipe_rename_replace:0")],
+                    [InlineKeyboardButton(f"➕ Создать «{copy_title}»"[:60], callback_data="recipe_rename_copy:0")],
                     [
                         InlineKeyboardButton(
-                            "Отмена",
+                            "✖️ Отменить",
                             callback_data=self._recipe_rename_back_callback(context, reference.id),
                         )
                     ],
@@ -2891,7 +2977,7 @@ class TelegramRecipeBot:
                 target,
                 f"Не удалось проверить актуальные названия рецептов: {user_safe_error_message(exc)}",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Повторить", callback_data="recipe_rename_retry:0")]]
+                    [[InlineKeyboardButton("🔄 Повторить", callback_data="recipe_rename_retry:0")]]
                 ),
             )
             return
@@ -2901,7 +2987,7 @@ class TelegramRecipeBot:
             await self._edit_recipe_rename_status(
                 target,
                 "Выбранный рецепт изменился или был удалён. Обнови список и выбери его заново.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
             )
             return
 
@@ -2928,7 +3014,7 @@ class TelegramRecipeBot:
                 target,
                 f"Ошибка переименования: {user_safe_error_message(exc)}",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Повторить", callback_data="recipe_rename_retry:0")]]
+                    [[InlineKeyboardButton("🔄 Повторить", callback_data="recipe_rename_retry:0")]]
                 ),
             )
             return
@@ -2944,7 +3030,7 @@ class TelegramRecipeBot:
                 "Переименование выполнено не во всех аккаунтах. Другой рецепт не удалялся.\n\n"
                 + "\n".join(lines),
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Повторить", callback_data="recipe_rename_retry:0")]]
+                    [[InlineKeyboardButton("🔄 Повторить", callback_data="recipe_rename_retry:0")]]
                 ),
             )
             return
@@ -2964,7 +3050,7 @@ class TelegramRecipeBot:
                     f"Рецепт переименован в «{html.escape(final_title)}», но прежний одноимённый рецепт "
                     f"пока не удалён: {html.escape(user_safe_error_message(exc))}",
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("Повторить очистку", callback_data="recipe_rename_retry:0")]]
+                        [[InlineKeyboardButton("🔄 Повторить очистку", callback_data="recipe_rename_retry:0")]]
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -2981,7 +3067,7 @@ class TelegramRecipeBot:
                     f"Рецепт переименован в «{html.escape(final_title)}», но старый одноимённый рецепт "
                     "удалён не во всех аккаунтах.\n\n" + "\n".join(lines),
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("Повторить очистку", callback_data="recipe_rename_retry:0")]]
+                        [[InlineKeyboardButton("🔄 Повторить очистку", callback_data="recipe_rename_retry:0")]]
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -3027,8 +3113,8 @@ class TelegramRecipeBot:
             f"Рецепт переименован: <b>{html.escape(final_title)}</b>.{suffix}{local_warning}",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Открыть рецепт", callback_data=f"open:{renamed_id}")],
-                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                    [InlineKeyboardButton("🍽️ Открыть рецепт", callback_data=f"open:{renamed_id}")],
+                    [InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
@@ -3143,7 +3229,7 @@ class TelegramRecipeBot:
         ]
         page = max(0, int(context.user_data.get("recipe_list_page") or 0))
         page_action = str(context.user_data.get("recipe_page_action") or "list")
-        buttons.append([InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")])
+        buttons.append([InlineKeyboardButton("⬅️ Все рецепты", callback_data=f"{page_action}:{page}")])
         await query.edit_message_text(
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -3174,15 +3260,21 @@ class TelegramRecipeBot:
                 [
                     [
                         InlineKeyboardButton(
-                            "Экспортировать",
+                            "✏️ Изменить рецепт",
+                            callback_data=f"recipe_edit:{variant.recipe.id}:{index}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📤 Экспортировать рецепт",
                             callback_data=f"recipe_export:{variant.recipe.id}:{index}",
                         )
                     ],
-                    [InlineKeyboardButton("Синхронизировать", callback_data=f"syncvariant:{index}")],
-                    [InlineKeyboardButton("Переименовать", callback_data=f"recipe_rename:{variant.recipe.id}")],
-                    [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete:{variant.recipe.id}")],
-                    [InlineKeyboardButton("Выбрать другой аккаунт", callback_data=f"open:{variant.recipe.id}")],
-                    [InlineKeyboardButton("К списку", callback_data=f"{page_action}:{page}")],
+                    [InlineKeyboardButton("🔄 Применить эту версию везде", callback_data=f"syncvariant:{index}")],
+                    [InlineKeyboardButton("🏷️ Изменить название", callback_data=f"recipe_rename:{variant.recipe.id}")],
+                    [InlineKeyboardButton("🗑️ Удалить рецепт", callback_data=f"delete:{variant.recipe.id}")],
+                    [InlineKeyboardButton("👤 Выбрать другую версию", callback_data=f"open:{variant.recipe.id}")],
+                    [InlineKeyboardButton("⬅️ Все рецепты", callback_data=f"{page_action}:{page}")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
@@ -3234,6 +3326,426 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
+    @staticmethod
+    def _recipe_edit_is_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
+        return bool(
+            context.user_data.get("recipe_edit_source_account_key")
+            and context.user_data.get("recipe_edit_source_remote_id")
+            and context.user_data.get("recipe_edit_source_digest")
+            and context.user_data.get("recipe_edit_token")
+        )
+
+    @staticmethod
+    def _clear_recipe_edit_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+        for key in tuple(context.user_data):
+            if key.startswith("recipe_edit_"):
+                context.user_data.pop(key, None)
+        for key in (
+            "recipe_list_title",
+            "recipe_list_draft",
+            "recipe_list_unresolved",
+            "recipe_list_portions",
+            "recipe_list_steps",
+            "recipe_list_replace_index",
+            "recipe_list_replace_kind",
+            "recipe_list_replace_query",
+            "recipe_list_replace_page",
+            "recipe_list_candidates",
+            "recipe_list_candidates_cache",
+            "recipe_list_candidates_exhausted",
+            "recipe_list_duplicate_id",
+            "recipe_list_duplicate_ref",
+            "recipe_list_replace_existing_id",
+            "recipe_list_replace_existing_ref",
+            "recipe_list_copy_base_title",
+            "recipe_variants",
+            "current_recipe_variant_index",
+            "recipe_versions_differ",
+            "recipe_sync_preview",
+        ):
+            context.user_data.pop(key, None)
+        context.user_data.pop("group_id", None)
+        context.user_data.pop("mode", None)
+
+    async def _start_recipe_edit(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        value: str,
+    ) -> None:
+        recipe_id, separator, raw_index = value.rpartition(":")
+        if not separator:
+            recipe_id, raw_index = value, "-1"
+        try:
+            variant_index = int(raw_index)
+        except ValueError:
+            variant_index = -1
+
+        group = self.storage.active_group_for_user(query.from_user.id)
+        variant = self._recipe_variant(context, variant_index) if variant_index >= 0 else None
+        if variant is not None and variant.recipe.id != recipe_id:
+            variant = None
+        if variant is None and group is not None:
+            recipe_ref = self._cached_or_stored_recipe(context, group.id, recipe_id)
+            if recipe_ref is not None:
+                variants = await self.sync_engine.hydrate_live_recipe_variants(recipe_ref)
+                if variants:
+                    context.user_data["recipe_variants"] = variants
+                    variant = variants[0]
+                    variant_index = 0
+        recipe = variant.recipe if variant is not None else None
+        if not await self._require_recipe_in_active_group(query, recipe):
+            return
+        try:
+            payload = _recipe_export_payload(recipe)
+        except ValueError as exc:
+            await query.edit_message_text(
+                "Нельзя безопасно изменить этот рецепт: "
+                f"{html.escape(str(exc))}",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data=f"variant:{variant_index}")]]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        self._clear_recipe_edit_state(context)
+        edit_token = f"{time.monotonic_ns():x}"[-12:]
+        context.user_data.update(
+            {
+                "mode": "recipe_edit_payload",
+                "group_id": group.id,
+                "recipe_list_title": recipe.title,
+                "recipe_edit_recipe_id": recipe.id,
+                "recipe_edit_source_account_key": variant.account_key,
+                "recipe_edit_source_remote_id": variant.remote_recipe_id,
+                "recipe_edit_source_digest": (
+                    variant.strict_fingerprint or recipe_fingerprint(recipe)
+                ).digest,
+                "recipe_edit_source_recipe": recipe,
+                "recipe_edit_variant_index": variant_index,
+                "recipe_edit_token": edit_token,
+            }
+        )
+        title = recipe.title.strip() or "Рецепт"
+        heading = (
+            f"✏️ <b>{html.escape(title)}</b>\n\n"
+            "Название на этом шаге не изменяется.\n"
+            "Скопируй блок, измени нужные строки и пришли его одним сообщением. "
+            "До подтверждения FatSecret не изменится."
+        )
+        cancel_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✖️ Отменить редактирование", callback_data=f"recipe_edit_cancel:{edit_token}")]]
+        )
+        rendered = f"{heading}\n\n<pre>{html.escape(payload)}</pre>"
+        if len(rendered) <= TELEGRAM_SAFE_TEXT_LIMIT:
+            await query.edit_message_text(rendered, reply_markup=cancel_markup, parse_mode=ParseMode.HTML)
+            return
+        await query.edit_message_text(
+            heading + "\n\nБлок не поместился в Telegram, поэтому он прикреплён файлом.",
+            reply_markup=cancel_markup,
+            parse_mode=ParseMode.HTML,
+        )
+        await query.message.reply_document(
+            document=InputFile(io.BytesIO(payload.encode("utf-8")), filename="recipe-edit.txt"),
+            caption="Измени блок и пришли его одним текстовым сообщением.",
+        )
+
+    def _resolved_recipe_edit_source_item(
+        self,
+        group_id: str,
+        source_account_key: str,
+        source: Ingredient,
+        requested: RecipeListItem,
+    ) -> ResolvedRecipeListItem:
+        account_keys = [account.key for account in self.storage.list_fatsecret_accounts(group_id)]
+        mappings = {source_account_key: source.food_id}
+        is_personal_food = False
+        for account_key in account_keys:
+            if account_key == source_account_key:
+                continue
+            mapped = self.storage.custom_food_mapping(
+                source_account_key,
+                source.food_id,
+                account_key,
+            )
+            if mapped:
+                mappings[account_key] = mapped
+                is_personal_food = True
+        source_grams = source.grams or grams_from_portion(
+            source.amount,
+            source.portion_description,
+        )
+        amount = (
+            source.amount * requested.grams / source_grams
+            if source_grams is not None and source_grams > 0
+            else requested.grams / Decimal("100")
+        )
+        ingredient = Ingredient(
+            id=source.id,
+            recipe_id=source.recipe_id,
+            food_id=source.food_id,
+            title=source.title,
+            portion_id=source.portion_id or "0",
+            amount=amount,
+            portion_description=source.portion_description or "100г",
+            grams=requested.grams,
+        )
+        return ResolvedRecipeListItem(
+            requested_query=requested.query,
+            grams=requested.grams,
+            ingredient=ingredient,
+            source="recipe-edit",
+            custom_food_ids=mappings if is_personal_food else {},
+        )
+
+    async def _handle_recipe_edit_payload(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        group_id = str(context.user_data.get("group_id") or "")
+        source_account_key = str(context.user_data.get("recipe_edit_source_account_key") or "")
+        edit_token = str(context.user_data.get("recipe_edit_token") or "")
+        source_recipe = context.user_data.get("recipe_edit_source_recipe")
+        if not group_id or not source_account_key or not edit_token or not isinstance(source_recipe, Recipe):
+            self._clear_recipe_edit_state(context)
+            await update.effective_message.reply_text("Рецепт для изменения потерян. Открой его заново.")
+            return
+        portions, requested_items, bad_lines, steps = _parse_recipe_list_payload(text)
+        if bad_lines:
+            lines = "\n".join(f"- {html.escape(line)}" for line in bad_lines)
+            await update.effective_message.reply_text(
+                "Эти строки не удалось разобрать:\n"
+                f"{lines}\n\nВ каждой строке нужны название и масса в граммах.",
+                reply_markup=_recipe_edit_input_error_keyboard(edit_token),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not requested_items:
+            await update.effective_message.reply_text(
+                "В рецепте должен остать хотя бы один ингредиент.",
+                reply_markup=_recipe_edit_input_error_keyboard(edit_token),
+            )
+            return
+        if portions is None:
+            await update.effective_message.reply_text(
+                "Добавь первой строкой количество порций, например: <code>Порций: 4</code>",
+                reply_markup=_recipe_edit_input_error_keyboard(edit_token),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        source_by_title: dict[str, deque[Ingredient]] = {}
+        for ingredient in source_recipe.ingredients:
+            source_by_title.setdefault(normalize_title(ingredient.title), deque()).append(ingredient)
+        ordered: list[ResolvedRecipeListItem | RecipeListItem] = []
+        new_items: list[RecipeListItem] = []
+        for requested in requested_items:
+            matches = source_by_title.get(normalize_title(requested.query))
+            if matches:
+                ordered.append(
+                    self._resolved_recipe_edit_source_item(
+                        group_id,
+                        source_account_key,
+                        matches.popleft(),
+                        requested,
+                    )
+                )
+            else:
+                ordered.append(requested)
+                new_items.append(requested)
+
+        status = await update.effective_message.reply_text("Проверяю изменённые ингредиенты…")
+        try:
+            new_draft = (
+                await self.sync_engine.resolve_recipe_list_items(group_id, new_items)
+                if new_items
+                else None
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recipe edit ingredient resolve failed")
+            await status.edit_text(
+                f"Не удалось подобрать новые ингредиенты: {user_safe_error_message(exc)}",
+                reply_markup=_recipe_edit_input_error_keyboard(edit_token),
+            )
+            return
+
+        resolved_queues: dict[tuple[str, Decimal], deque[ResolvedRecipeListItem]] = {}
+        unresolved_counts: Counter[tuple[str, Decimal]] = Counter()
+        if new_draft is not None:
+            for item in new_draft.items:
+                resolved_queues.setdefault(
+                    (normalize_title(item.requested_query), item.grams), deque()
+                ).append(item)
+            unresolved_counts.update(
+                (normalize_title(item.query), item.grams) for item in new_draft.unresolved
+            )
+        resolved_items: list[ResolvedRecipeListItem] = []
+        unresolved_items: list[RecipeListItem] = []
+        for item in ordered:
+            if isinstance(item, ResolvedRecipeListItem):
+                resolved_items.append(item)
+                continue
+            key = (normalize_title(item.query), item.grams)
+            candidates = resolved_queues.get(key)
+            if candidates:
+                resolved_items.append(candidates.popleft())
+            elif unresolved_counts[key] > 0:
+                unresolved_counts[key] -= 1
+                unresolved_items.append(item)
+            else:
+                unresolved_items.append(item)
+
+        context.user_data["recipe_list_draft"] = resolved_items
+        context.user_data["recipe_list_unresolved"] = unresolved_items
+        context.user_data["recipe_list_portions"] = portions
+        context.user_data["recipe_list_steps"] = steps
+        context.user_data["mode"] = "recipe_edit_confirm"
+        await status.edit_text(
+            _format_recipe_list_draft(source_recipe.title, resolved_items, steps, unresolved_items, portions),
+            reply_markup=_recipe_list_draft_keyboard(
+                resolved_items,
+                steps,
+                unresolved_items,
+                editing=True,
+                edit_token=edit_token,
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _confirm_recipe_edit(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        telegram_id: int,
+        edit_token: str,
+    ) -> None:
+        expected_edit_token = str(context.user_data.get("recipe_edit_token") or "")
+        if (
+            context.user_data.get("mode") != "recipe_edit_confirm"
+            or not edit_token
+            or edit_token != expected_edit_token
+        ):
+            await query.edit_message_text(
+                "Это подтверждение устарело. Используй последний черновик рецепта."
+            )
+            return
+        group_id = str(context.user_data.get("group_id") or "")
+        source_account_key = str(context.user_data.get("recipe_edit_source_account_key") or "")
+        source_remote_id = str(context.user_data.get("recipe_edit_source_remote_id") or "")
+        expected_digest = str(context.user_data.get("recipe_edit_source_digest") or "")
+        items = context.user_data.get("recipe_list_draft")
+        unresolved = context.user_data.get("recipe_list_unresolved")
+        portions = context.user_data.get("recipe_list_portions")
+        steps = context.user_data.get("recipe_list_steps")
+        if (
+            not group_id
+            or not source_account_key
+            or not source_remote_id
+            or not expected_digest
+            or not isinstance(items, list)
+            or not isinstance(portions, Decimal)
+        ):
+            await query.edit_message_text("Черновик изменений устарел. Открой рецепт заново.")
+            return
+        unresolved = unresolved if isinstance(unresolved, list) else []
+        steps = steps if isinstance(steps, list) else []
+        if unresolved:
+            await query.edit_message_text(
+                "Сначала подбери или убери неизвестные ингредиенты.",
+                reply_markup=_recipe_list_draft_keyboard(
+                    items,
+                    steps,
+                    unresolved,
+                    editing=True,
+                    edit_token=edit_token,
+                ),
+            )
+            return
+        if not items:
+            await query.edit_message_text(
+                "В рецепте должен остать хотя бы один ингредиент.",
+                reply_markup=_recipe_list_draft_keyboard(
+                    items,
+                    steps,
+                    unresolved,
+                    editing=True,
+                    edit_token=edit_token,
+                ),
+            )
+            return
+        await query.edit_message_text("Проверяю исходную версию и сохраняю рецепт во всех аккаунтах…")
+        try:
+            edited = await self.sync_engine.edit_recipe_from_list(
+                group_id,
+                source_account_key,
+                source_remote_id,
+                expected_digest,
+                items,
+                telegram_id,
+                portions=portions,
+                steps=steps,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recipe edit failed")
+            await query.edit_message_text(
+                f"Не удалось сохранить изменения: {user_safe_error_message(exc)}",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")],
+                        [InlineKeyboardButton("✖️ Отменить редактирование", callback_data=f"recipe_edit_cancel:{edit_token}")],
+                    ]
+                ),
+            )
+            return
+        try:
+            refreshed = await self.sync_engine.load_remote_recipe_index(group_id)
+            self._set_recipe_cache(context, group_id, refreshed)
+        except Exception:  # noqa: BLE001 - the verified edit already succeeded.
+            logger.exception("recipe cache refresh after edit failed")
+            self._clear_recipe_cache(context)
+        account_labels = self._account_labels_for_group(group_id)
+        lines = [
+            f"{account_labels.get(result.account_key, result.account_key)}: "
+            f"{'OK' if result.ok else 'ERROR'} {result.message}".rstrip()
+            for result in edited.results
+        ]
+        recipe_id = edited.recipe_id
+        self._clear_recipe_edit_state(context)
+        await query.edit_message_text(
+            "Изменения сохранены во всех подключённых FatSecret аккаунтах."
+            + ("\n\n" + "\n".join(lines) if lines else ""),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🍽️ Открыть рецепт", callback_data=f"open:{recipe_id}")],
+                    [InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")],
+                ]
+            ),
+        )
+
+    async def _cancel_recipe_edit(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+        edit_token: str,
+    ) -> None:
+        expected_edit_token = str(context.user_data.get("recipe_edit_token") or "")
+        if not edit_token or edit_token != expected_edit_token:
+            await query.edit_message_text(
+                "Эта кнопка устарела. Текущий черновик не отменён."
+            )
+            return
+        recipe_id = str(context.user_data.get("recipe_edit_recipe_id") or "")
+        page = max(0, int(context.user_data.get("recipe_list_page") or 0))
+        page_action = str(context.user_data.get("recipe_page_action") or "list")
+        self._clear_recipe_edit_state(context)
+        if recipe_id:
+            await self._open_recipe(query, context, f"{recipe_id}:{page}:{page_action}")
+            return
+        await self._edit_recipe_list(query, page, context)
+
     async def _sync_recipe_variant(
         self,
         query,
@@ -3253,7 +3765,9 @@ class TelegramRecipeBot:
         if not await self._require_recipe_in_active_group(query, recipe):
             return
         if recipe_ref is None:
-            await query.edit_message_text("Карточка рецепта устарела. Нажми «Поиск рецептов» и открой её заново.")
+            await query.edit_message_text(
+                "Карточка рецепта устарела. Нажми «🍽️ Все рецепты» и открой её заново."
+            )
             return
         variants = await self.sync_engine.hydrate_live_recipe_variants(recipe_ref)
         accounts = self.storage.list_fatsecret_accounts(recipe.group_id)
@@ -3293,7 +3807,7 @@ class TelegramRecipeBot:
             ]
             for index, variant in enumerate(variants)
         ]
-        buttons.append([InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")])
+        buttons.append([InlineKeyboardButton("⬅️ Назад к рецепту", callback_data=f"open:{recipe_id}")])
         await query.edit_message_text(
             "Из какого FatSecret аккаунта взять оригинал рецепта?",
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -3322,6 +3836,7 @@ class TelegramRecipeBot:
             "account_key": variant.account_key,
             "remote_id": variant.remote_recipe_id,
             "content_digest": variant.fingerprint.digest,
+            "strict_digest": _recipe_variant_strict_digest(variant),
             "variant_index": index,
         }
         await query.edit_message_text(
@@ -3331,9 +3846,9 @@ class TelegramRecipeBot:
             "Оригинал не изменится.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Подтвердить синхронизацию", callback_data="syncconfirm:0")],
-                    [InlineKeyboardButton("Выбрать другой источник", callback_data=f"sync:{variant.recipe.id}")],
-                    [InlineKeyboardButton("Назад к версии", callback_data=f"variant:{index}")],
+                    [InlineKeyboardButton("✅ Применить эту версию везде", callback_data="syncconfirm:0")],
+                    [InlineKeyboardButton("👤 Выбрать другую версию", callback_data=f"sync:{variant.recipe.id}")],
+                    [InlineKeyboardButton("⬅️ Назад к версии", callback_data=f"variant:{index}")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
@@ -3348,7 +3863,7 @@ class TelegramRecipeBot:
         group = self.storage.active_group_for_user(query.from_user.id)
         recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
         if recipe_ref is None or group is None or recipe_ref.group_id != group.id:
-            await query.edit_message_text("Карточка рецепта устарела. Нажми «Поиск рецептов».")
+            await query.edit_message_text("Карточка рецепта устарела. Нажми «🍽️ Все рецепты».")
             return
         fresh_variants = await self.sync_engine.hydrate_live_recipe_variants(recipe_ref)
         accounts = self.storage.list_fatsecret_accounts(group.id)
@@ -3383,7 +3898,11 @@ class TelegramRecipeBot:
             ),
             None,
         )
-        if selected is None or selected.fingerprint.digest != preview.get("content_digest"):
+        if (
+            selected is None
+            or selected.fingerprint.digest != preview.get("content_digest")
+            or _recipe_variant_strict_digest(selected) != preview.get("strict_digest")
+        ):
             context.user_data["recipe_versions_differ"] = True
             context.user_data.pop("recipe_sync_preview", None)
             await self._show_recipe_variant_picker(
@@ -3407,6 +3926,7 @@ class TelegramRecipeBot:
             selected.account_key,
             expected_source_remote_id=selected.remote_recipe_id,
             expected_source_content_digest=selected.fingerprint.digest,
+            expected_source_strict_digest=_recipe_variant_strict_digest(selected),
         )
 
     async def _sync_recipe_message(
@@ -3418,6 +3938,7 @@ class TelegramRecipeBot:
         *,
         expected_source_remote_id: str | None = None,
         expected_source_content_digest: str | None = None,
+        expected_source_strict_digest: str | None = None,
     ) -> None:
         group = self.storage.active_group_for_user(query.from_user.id)
         recipe_ref = self._cached_recipe(context, group.id, recipe_id) if group is not None else None
@@ -3437,6 +3958,7 @@ class TelegramRecipeBot:
                     source_account_key,
                     expected_source_remote_id=expected_source_remote_id,
                     expected_source_content_digest=expected_source_content_digest,
+                    expected_source_strict_digest=expected_source_strict_digest,
                 )
                 if not await self._refresh_recipe_cache_after_sync(context, recipe.group_id):
                     self._replace_cached_recipe(context, recipe.group_id, synced_recipe)
@@ -3446,13 +3968,14 @@ class TelegramRecipeBot:
                     source_account_key,
                     expected_source_remote_id=expected_source_remote_id,
                     expected_source_content_digest=expected_source_content_digest,
+                    expected_source_strict_digest=expected_source_strict_digest,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("sync failed")
             await query.edit_message_text(
                 f"Ошибка синхронизации: {user_safe_error_message(exc)}",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Проверить версии заново", callback_data=f"open:{recipe_id}")]]
+                    [[InlineKeyboardButton("🔄 Проверить версии заново", callback_data=f"open:{recipe_id}")]]
                 ),
             )
             return
@@ -3468,8 +3991,8 @@ class TelegramRecipeBot:
             "Синхронизация завершена:\n" + "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Открыть рецепт", callback_data=f"open:{recipe_id}")],
-                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                    [InlineKeyboardButton("🍽️ Открыть рецепт", callback_data=f"open:{recipe_id}")],
+                    [InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")],
                 ]
             ),
         )
@@ -3484,8 +4007,8 @@ class TelegramRecipeBot:
             "После успешного удаления бот уберет рецепт из своего списка.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete_confirm:{recipe_id}")],
-                    [InlineKeyboardButton("Назад к рецепту", callback_data=f"open:{recipe_id}")],
+                    [InlineKeyboardButton("🗑️ Удалить рецепт", callback_data=f"delete_confirm:{recipe_id}")],
+                    [InlineKeyboardButton("⬅️ Назад к рецепту", callback_data=f"open:{recipe_id}")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
@@ -3522,7 +4045,7 @@ class TelegramRecipeBot:
             "Удаление завершено:\n" + "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                    [InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")],
                 ]
             ),
         )
@@ -3541,7 +4064,7 @@ class TelegramRecipeBot:
         await update.effective_message.reply_text(
             "Проверь актуальные версии перед синхронизацией.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Проверить версии", callback_data=f"sync:{recipe_id}")]]
+                [[InlineKeyboardButton("🔄 Проверить версии", callback_data=f"sync:{recipe_id}")]]
             ),
         )
 
@@ -3561,8 +4084,8 @@ class TelegramRecipeBot:
             "После успешного удаления бот уберет рецепт из своего списка.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Удалить в FatSecret", callback_data=f"delete_confirm:{recipe_id}")],
-                    [InlineKeyboardButton("Отмена", callback_data=f"open:{recipe_id}")],
+                    [InlineKeyboardButton("🗑️ Удалить рецепт", callback_data=f"delete_confirm:{recipe_id}")],
+                    [InlineKeyboardButton("✖️ Отменить", callback_data=f"open:{recipe_id}")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
@@ -3586,7 +4109,9 @@ class TelegramRecipeBot:
             return
         recipes = self._cached_recipe_list(context, group.id)
         if recipes is None:
-            await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
+            await query.edit_message_text(
+                "Список рецептов устарел. Нажми «🍽️ Все рецепты», чтобы загрузить актуальный список."
+            )
             return
         if not recipes:
             await query.edit_message_text("Рецептов пока нет.")
@@ -3617,7 +4142,7 @@ class TelegramRecipeBot:
         recipes = self._cached_recipe_list(context, group.id)
         if recipes is None:
             await update.effective_message.reply_text(
-                "Список рецептов еще не загружен. Нажми «Поиск рецептов».",
+                "Список рецептов ещё не загружен. Нажми «🍽️ Все рецепты».",
                 reply_markup=self._main_keyboard(update.effective_user.id),
             )
             context.chat_data["reply_keyboard"] = "main"
@@ -3679,14 +4204,14 @@ class TelegramRecipeBot:
         ]
         nav: list[InlineKeyboardButton] = []
         if total_pages > 1:
-            nav.append(InlineKeyboardButton("Назад", callback_data=f"batchdel:{page - 1}" if page > 0 else "noop:0"))
+            nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"batchdel:{page - 1}" if page > 0 else "noop:0"))
             nav.append(
-                InlineKeyboardButton("Дальше", callback_data=f"batchdel:{page + 1}" if page + 1 < total_pages else "noop:0")
+                InlineKeyboardButton("Дальше ➡️", callback_data=f"batchdel:{page + 1}" if page + 1 < total_pages else "noop:0")
             )
             buttons.append(nav)
         if selected:
-            buttons.append([InlineKeyboardButton(f"Удалить выбранные: {len(selected)}", callback_data=f"bdconfirm:{page}")])
-        buttons.append([InlineKeyboardButton("Отмена", callback_data="bdcancel:0")])
+            buttons.append([InlineKeyboardButton(f"🗑️ Удалить рецепты: {len(selected)}", callback_data=f"bdconfirm:{page}")])
+        buttons.append([InlineKeyboardButton("✖️ Отменить", callback_data="bdcancel:0")])
         return InlineKeyboardMarkup(buttons)
 
     async def _confirm_batch_delete(self, query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
@@ -3697,13 +4222,15 @@ class TelegramRecipeBot:
             return
         recipes = self._cached_recipe_list(context, str(group_id))
         if recipes is None:
-            await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
+            await query.edit_message_text(
+                "Список рецептов устарел. Нажми «🍽️ Все рецепты», чтобы загрузить актуальный список."
+            )
             return
         selected_recipes = [recipe for recipe in recipes if recipe.id in selected]
         if not selected_recipes:
             await query.edit_message_text(
                 "Ничего не выбрано.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад к выбору", callback_data=f"batchdel:{page}")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад к выбору", callback_data=f"batchdel:{page}")]]),
             )
             return
         preview = "\n".join(f"- {html.escape(recipe.title)}" for recipe in selected_recipes[:10])
@@ -3715,8 +4242,8 @@ class TelegramRecipeBot:
             "Удаление пройдет по всем привязанным аккаунтам.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Да, удалить в FatSecret", callback_data="bdexecute:0")],
-                    [InlineKeyboardButton("Назад к выбору", callback_data=f"batchdel:{page}")],
+                    [InlineKeyboardButton(f"🗑️ Удалить {len(selected)} рецептов", callback_data="bdexecute:0")],
+                    [InlineKeyboardButton("⬅️ Назад к выбору", callback_data=f"batchdel:{page}")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
@@ -3730,7 +4257,9 @@ class TelegramRecipeBot:
             return
         recipes = self._cached_recipe_list(context, str(group_id))
         if recipes is None:
-            await query.edit_message_text("Список рецептов устарел. Нажми «Поиск рецептов», чтобы загрузить актуальный список.")
+            await query.edit_message_text(
+                "Список рецептов устарел. Нажми «🍽️ Все рецепты», чтобы загрузить актуальный список."
+            )
             return
         selected_recipes = [recipe for recipe in recipes if recipe.id in selected_set]
         selected = [recipe.id for recipe in selected_recipes]
@@ -3785,7 +4314,7 @@ class TelegramRecipeBot:
             text,
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                    [InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")],
                 ]
             ),
         )
@@ -3795,7 +4324,8 @@ class TelegramRecipeBot:
             return
         mode = context.user_data.get("mode")
         text = update.effective_message.text.strip()
-        if (text == "Меню / Дневник" or str(mode).startswith("diary_")) and not self._is_admin(
+        main_action = MAIN_ACTION_BY_LABEL.get(text)
+        if (main_action == "diary" or str(mode).startswith("diary_")) and not self._is_admin(
             update.effective_user.id
         ):
             context.user_data.clear()
@@ -3813,7 +4343,12 @@ class TelegramRecipeBot:
             )
             context.chat_data["reply_keyboard"] = "main"
             return
-        if mode is not None and text.casefold() in {"отмена", "назад"}:
+        if mode is not None and text.casefold() in {
+            "отмена",
+            "назад",
+            "✖️ отменить",
+            "⬅️ назад",
+        }:
             await self._cancel_mode(update, context)
             return
         if text in RECIPE_KEYBOARD_BUTTONS:
@@ -3822,7 +4357,7 @@ class TelegramRecipeBot:
         if text in MAIN_BUTTONS:
             context.user_data.clear()
             mode = None
-        if mode is None and text in {"Поиск рецептов", "Рецепты"}:
+        if mode is None and main_action == "recipes":
             await self._send_recipe_list(update, context, page=0)
             return
         if mode is None and text == "Синхронизировать":
@@ -3844,7 +4379,7 @@ class TelegramRecipeBot:
             )
             context.chat_data["reply_keyboard"] = "main"
             return
-        if mode is None and text == "Создать из списка":
+        if mode is None and main_action == "recipe_create":
             group = await self._require_active_group(update)
             if group is None:
                 return
@@ -3857,7 +4392,7 @@ class TelegramRecipeBot:
             )
             context.chat_data["reply_keyboard"] = "main"
             return
-        if mode is None and text == "Создать продукт":
+        if mode is None and main_action == "food_create":
             group = await self._require_active_group(update)
             if group is None:
                 return
@@ -3875,13 +4410,13 @@ class TelegramRecipeBot:
             page = int(context.user_data.get("recipe_list_page") or 0)
             await self._send_batch_delete(update, context, page)
             return
-        if mode is None and text == "Меню / Дневник":
+        if mode is None and main_action == "diary":
             await self.diary(update, context)
             return
-        if mode is None and text == "Аккаунты":
+        if mode is None and main_action == "accounts":
             await self.accounts(update, context)
             return
-        if mode is None and text == "Группы":
+        if mode is None and main_action == "groups":
             await self.groups(update, context)
             return
         if mode == "recipe_search":
@@ -3890,6 +4425,8 @@ class TelegramRecipeBot:
             await self._handle_recipe_list_title(update, context, text)
         elif mode == "recipe_list_items":
             await self._handle_recipe_list_items(update, context, text)
+        elif mode == "recipe_edit_payload":
+            await self._handle_recipe_edit_payload(update, context, text)
         elif mode == "recipe_list_rename":
             await self._handle_recipe_list_rename(update, context, text)
         elif mode == "recipe_rename":
@@ -3946,6 +4483,19 @@ class TelegramRecipeBot:
             )
 
     async def _cancel_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if self._recipe_edit_is_active(context):
+            recipe_id = str(context.user_data.get("recipe_edit_recipe_id") or "")
+            self._clear_recipe_edit_state(context)
+            await update.effective_message.reply_text(
+                "Редактирование отменено. FatSecret не изменён.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🍽️ Открыть рецепт", callback_data=f"open:{recipe_id}")],
+                        [InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")],
+                    ]
+                ),
+            )
+            return
         if context.user_data.get("custom_food_origin") == "recipe":
             self._clear_custom_food_wizard(context)
             title = str(context.user_data.get("recipe_list_title") or "").strip()
@@ -3957,10 +4507,17 @@ class TelegramRecipeBot:
                 unresolved = unresolved if isinstance(unresolved, list) else []
                 steps = steps if isinstance(steps, list) else []
                 portions = portions if isinstance(portions, Decimal) else Decimal("1")
-                context.user_data["mode"] = "recipe_list_confirm"
+                editing = self._recipe_edit_is_active(context)
+                context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
                 await update.effective_message.reply_text(
                     _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
-                    reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+                    reply_markup=_recipe_list_draft_keyboard(
+                        draft_items,
+                        steps,
+                        unresolved,
+                        editing=editing,
+                        edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                    ),
                     parse_mode=ParseMode.HTML,
                 )
                 return
@@ -4166,15 +4723,15 @@ class TelegramRecipeBot:
             logger.exception("FatSecret cookbook import failed after account connect")
             await status.edit_text(
                 f"Аккаунт подключен, но рецепты не загрузились: {user_safe_error_message(exc)}",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Аккаунты", callback_data="accounts:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")]]),
             )
             return
         await status.edit_text(
             f"FatSecret аккаунт подключен. Загружено/смёржено рецептов: {imported}.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Поиск рецептов", callback_data="list:0")],
-                    [InlineKeyboardButton("Аккаунты", callback_data="accounts:0")],
+                    [InlineKeyboardButton("🍽️ Все рецепты", callback_data="list:0")],
+                    [InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")],
                 ]
             ),
         )
@@ -4254,7 +4811,7 @@ class TelegramRecipeBot:
             await query.edit_message_text(
                 "Неизвестный ингредиент в черновике больше не найден.",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]
+                    [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
                 ),
             )
             return
@@ -4267,7 +4824,7 @@ class TelegramRecipeBot:
             f"Создаем продукт для «{html.escape(item.query)}».\n"
             "Пришли название продукта. Оно появится во всех FatSecret аккаунтах группы.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
+                [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -4400,7 +4957,8 @@ class TelegramRecipeBot:
             context.user_data["recipe_list_draft"] = draft_items
             context.user_data["recipe_list_unresolved"] = unresolved
             self._clear_custom_food_wizard(context)
-            context.user_data["mode"] = "recipe_list_confirm"
+            editing = self._recipe_edit_is_active(context)
+            context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
             title = str(context.user_data.get("recipe_list_title") or "").strip()
             steps = context.user_data.get("recipe_list_steps")
             steps = steps if isinstance(steps, list) else []
@@ -4408,7 +4966,13 @@ class TelegramRecipeBot:
             portions = portions if isinstance(portions, Decimal) else Decimal("1")
             await status.edit_text(
                 _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
-                reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+                reply_markup=_recipe_list_draft_keyboard(
+                    draft_items,
+                    steps,
+                    unresolved,
+                    editing=editing,
+                    edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                ),
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -4421,8 +4985,8 @@ class TelegramRecipeBot:
                 "Новый продукт с тем же кодом создавать небезопасно. Можно продолжить без привязки штрих-кода.",
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("Продолжить без кода", callback_data="food_ignore_known_barcode:0")],
-                        [InlineKeyboardButton("Отмена", callback_data="food_cancel:0")],
+                        [InlineKeyboardButton("⏭️ Продолжить без кода", callback_data="food_ignore_known_barcode:0")],
+                        [InlineKeyboardButton("✖️ Отменить", callback_data="food_cancel:0")],
                     ]
                 ),
                 parse_mode=ParseMode.HTML,
@@ -4673,7 +5237,9 @@ class TelegramRecipeBot:
             context.user_data["recipe_list_draft"] = draft_items
             context.user_data["recipe_list_unresolved"] = unresolved
             self._clear_custom_food_wizard(context)
-            context.user_data["mode"] = "recipe_list_confirm"
+            context.user_data["mode"] = (
+                "recipe_edit_confirm" if self._recipe_edit_is_active(context) else "recipe_list_confirm"
+            )
             await self._edit_recipe_list_draft(query, context)
             return
 
@@ -4720,18 +5286,26 @@ class TelegramRecipeBot:
         )
 
     async def _start_recipe_list_rename(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if self._recipe_edit_is_active(context):
+            await query.edit_message_text(
+                "При редактировании содержимого название не меняется.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
+                ),
+            )
+            return
         title = str(context.user_data.get("recipe_list_title") or "").strip()
         draft_items = context.user_data.get("recipe_list_draft")
         if not title or not isinstance(draft_items, list):
             await query.edit_message_text(
                 "Черновик устарел. Начни создание заново из списка рецептов.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
             )
             return
         context.user_data["mode"] = "recipe_list_rename"
         await query.edit_message_text(
             f"Текущее имя: <b>{html.escape(title)}</b>\nПришли новое имя рецепта.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]),
             parse_mode=ParseMode.HTML,
         )
 
@@ -4741,7 +5315,7 @@ class TelegramRecipeBot:
         if not title or not isinstance(draft_items, list):
             await query.edit_message_text(
                 "Черновик устарел. Начни создание заново из списка рецептов.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
             )
             return
         context.user_data["mode"] = "recipe_list_steps"
@@ -4750,7 +5324,7 @@ class TelegramRecipeBot:
             f"Сохраню первые {MAX_RECIPE_STEPS} шагов в FatSecret.\n\n"
             "Отправь <code>-</code>, чтобы очистить шаги.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
+                [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -4771,7 +5345,8 @@ class TelegramRecipeBot:
             await update.effective_message.reply_text("Название не должно быть пустым.")
             return
         context.user_data["recipe_list_title"] = title
-        context.user_data["mode"] = "recipe_list_confirm"
+        editing = self._recipe_edit_is_active(context)
+        context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
         steps = context.user_data.get("recipe_list_steps")
         steps = steps if isinstance(steps, list) else []
         unresolved = context.user_data.get("recipe_list_unresolved")
@@ -4780,7 +5355,13 @@ class TelegramRecipeBot:
         portions = portions if isinstance(portions, Decimal) else Decimal("1")
         await update.effective_message.reply_text(
             _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
-            reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+            reply_markup=_recipe_list_draft_keyboard(
+                draft_items,
+                steps,
+                unresolved,
+                editing=editing,
+                edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+            ),
             parse_mode=ParseMode.HTML,
         )
 
@@ -4798,14 +5379,21 @@ class TelegramRecipeBot:
             return
         steps = _parse_recipe_steps(text)
         context.user_data["recipe_list_steps"] = steps
-        context.user_data["mode"] = "recipe_list_confirm"
+        editing = self._recipe_edit_is_active(context)
+        context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
         unresolved = context.user_data.get("recipe_list_unresolved")
         unresolved = unresolved if isinstance(unresolved, list) else []
         portions = context.user_data.get("recipe_list_portions")
         portions = portions if isinstance(portions, Decimal) else Decimal("1")
         await update.effective_message.reply_text(
             _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
-            reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+            reply_markup=_recipe_list_draft_keyboard(
+                draft_items,
+                steps,
+                unresolved,
+                editing=editing,
+                edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+            ),
             parse_mode=ParseMode.HTML,
         )
 
@@ -4855,11 +5443,18 @@ class TelegramRecipeBot:
         context.user_data["recipe_list_draft"] = draft.items
         context.user_data["recipe_list_unresolved"] = draft.unresolved
         context.user_data["recipe_list_portions"] = portions
-        context.user_data["mode"] = "recipe_list_confirm"
+        editing = self._recipe_edit_is_active(context)
+        context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
         context.user_data["recipe_list_steps"] = steps
         await status.edit_text(
             _format_recipe_list_draft(title, draft.items, steps, draft.unresolved, portions),
-            reply_markup=_recipe_list_draft_keyboard(draft.items, steps, draft.unresolved),
+            reply_markup=_recipe_list_draft_keyboard(
+                draft.items,
+                steps,
+                draft.unresolved,
+                editing=editing,
+                edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+            ),
             parse_mode=ParseMode.HTML,
         )
 
@@ -4871,10 +5466,11 @@ class TelegramRecipeBot:
         if not title or not isinstance(draft_items, list):
             await query.edit_message_text(
                 "Черновик устарел. Начни создание заново из списка рецептов.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
             )
             return
-        context.user_data["mode"] = "recipe_list_confirm"
+        editing = self._recipe_edit_is_active(context)
+        context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
         context.user_data.pop("recipe_list_replace_index", None)
         context.user_data.pop("recipe_list_candidates", None)
         context.user_data.pop("recipe_list_candidates_cache", None)
@@ -4894,7 +5490,13 @@ class TelegramRecipeBot:
         portions = portions if isinstance(portions, Decimal) else Decimal("1")
         await query.edit_message_text(
             _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
-            reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+            reply_markup=_recipe_list_draft_keyboard(
+                draft_items,
+                steps,
+                unresolved,
+                editing=editing,
+                edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+            ),
             parse_mode=ParseMode.HTML,
         )
 
@@ -4919,10 +5521,10 @@ class TelegramRecipeBot:
             f"Для копии использую имя: {html.escape(copy_title)}",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Обновить существующий", callback_data="recipe_list_replace_existing:0")],
-                    [InlineKeyboardButton("Создать копию", callback_data="recipe_list_copy:0")],
-                    [InlineKeyboardButton("Изменить имя", callback_data="recipe_list_rename:0")],
-                    [InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")],
+                    [InlineKeyboardButton("🔄 Заменить существующий рецепт", callback_data="recipe_list_replace_existing:0")],
+                    [InlineKeyboardButton("➕ Создать отдельный рецепт", callback_data="recipe_list_copy:0")],
+                    [InlineKeyboardButton("🏷️ Изменить название", callback_data="recipe_list_rename:0")],
+                    [InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
@@ -4943,7 +5545,7 @@ class TelegramRecipeBot:
         else:
             await query.edit_message_text(
                 "Не нашел рецепт для замены. Нажми создать еще раз.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]),
             )
             return
         context.user_data.pop("recipe_list_copy_base_title", None)
@@ -4960,7 +5562,7 @@ class TelegramRecipeBot:
         if not title or not group_id:
             await query.edit_message_text(
                 "Черновик устарел. Начни создание заново из списка рецептов.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
             )
             return
         context.user_data["recipe_list_copy_base_title"] = title
@@ -4980,7 +5582,7 @@ class TelegramRecipeBot:
         if not isinstance(draft_items, list) or index < 0 or index >= len(draft_items):
             await query.edit_message_text(
                 "Черновик устарел. Начни создание заново из списка рецептов.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
             )
             return
         item = draft_items[index]
@@ -4995,7 +5597,7 @@ class TelegramRecipeBot:
             f"Что искать вместо «{html.escape(item.ingredient.title)}»?\n"
             f"Массу оставлю {_format_decimal(item.grams)}г.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
+                [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -5010,7 +5612,7 @@ class TelegramRecipeBot:
         if not isinstance(unresolved, list) or index < 0 or index >= len(unresolved):
             await query.edit_message_text(
                 "Неизвестный ингредиент в черновике больше не найден.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]),
             )
             return
         item = unresolved[index]
@@ -5025,7 +5627,7 @@ class TelegramRecipeBot:
             f"Что искать для «{html.escape(item.query)}»?\n"
             f"Массу оставлю {_format_decimal(item.grams)}г.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")]]
+                [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -5040,7 +5642,7 @@ class TelegramRecipeBot:
         if not isinstance(unresolved, list) or index < 0 or index >= len(unresolved):
             await query.edit_message_text(
                 "Неизвестный ингредиент в черновике больше не найден.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]),
             )
             return
         unresolved.pop(index)
@@ -5108,7 +5710,7 @@ class TelegramRecipeBot:
             await self._edit_flow_message(
                 message,
                 "Контекст замены потерян. Начни создание заново из списка рецептов.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
             )
             return
         if replace_kind == "unresolved":
@@ -5117,7 +5719,7 @@ class TelegramRecipeBot:
                 await self._edit_flow_message(
                     message,
                     "Неизвестный ингредиент больше не найден. Начни создание заново.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
                 )
                 return
             grams = unresolved[index].grams
@@ -5126,7 +5728,7 @@ class TelegramRecipeBot:
             await self._edit_flow_message(
                 message,
                 "Ингредиент в черновике больше не найден. Начни создание заново.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К списку", callback_data="list:0")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]),
             )
             return
         else:
@@ -5138,13 +5740,19 @@ class TelegramRecipeBot:
             await self._ensure_recipe_list_candidate_cache(context, str(group_id), search_query, grams, end + 1)
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list replacement search failed")
+            edit_token = str(context.user_data.get("recipe_edit_token") or "")
+            cancel_callback = (
+                f"recipe_edit_cancel:{edit_token}"
+                if self._recipe_edit_is_active(context)
+                else "recipe_list_cancel:0"
+            )
             await self._edit_flow_message(
                 message,
                 f"Не удалось найти замену: {user_safe_error_message(exc)}",
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")],
-                        [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
+                        [InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")],
+                        [InlineKeyboardButton("✖️ Отменить", callback_data=cancel_callback)],
                     ]
                 ),
             )
@@ -5157,13 +5765,19 @@ class TelegramRecipeBot:
         visible_candidates = cache[start:end]
         has_next = len(cache) > end or not exhausted
         if not visible_candidates:
+            edit_token = str(context.user_data.get("recipe_edit_token") or "")
+            cancel_callback = (
+                f"recipe_edit_cancel:{edit_token}"
+                if self._recipe_edit_is_active(context)
+                else "recipe_list_cancel:0"
+            )
             await self._edit_flow_message(
                 message,
                 f"Не нашел вариантов для «{html.escape(search_query)}». Пришли другой запрос.",
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("Назад к проверке", callback_data="recipe_list_back:0")],
-                        [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
+                        [InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")],
+                        [InlineKeyboardButton("✖️ Отменить", callback_data=cancel_callback)],
                     ]
                 ),
                 parse_mode=ParseMode.HTML,
@@ -5229,7 +5843,7 @@ class TelegramRecipeBot:
             await query.edit_message_text(
                 "Выбор замены устарел. Вернись к проверке и попробуй еще раз.",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]
+                    [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
                 ),
             )
             return
@@ -5238,7 +5852,7 @@ class TelegramRecipeBot:
                 await query.edit_message_text(
                     "Неизвестный ингредиент больше не найден. Вернись к проверке и попробуй еще раз.",
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]
+                    [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
                     ),
                 )
                 return
@@ -5250,7 +5864,7 @@ class TelegramRecipeBot:
                 await query.edit_message_text(
                     "Ингредиент в черновике больше не найден. Вернись к проверке и попробуй еще раз.",
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")]]
+                    [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
                     ),
                 )
                 return
@@ -5304,8 +5918,8 @@ class TelegramRecipeBot:
                 f"Не удалось проверить актуальные названия рецептов: {user_safe_error_message(exc)}",
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")],
-                        [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
+                        [InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")],
+                        [InlineKeyboardButton("✖️ Отменить", callback_data="recipe_list_cancel:0")],
                     ]
                 ),
             )
@@ -5335,8 +5949,8 @@ class TelegramRecipeBot:
                     "Рецепт для замены изменился или был удален. Проверь свежий список и выбери замену заново.",
                     reply_markup=InlineKeyboardMarkup(
                         [
-                            [InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0")],
-                            [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
+                            [InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")],
+                            [InlineKeyboardButton("✖️ Отменить", callback_data="recipe_list_cancel:0")],
                         ]
                     ),
                 )
@@ -5369,10 +5983,10 @@ class TelegramRecipeBot:
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
-                            InlineKeyboardButton("Изменить имя", callback_data="recipe_list_rename:0"),
-                            InlineKeyboardButton("К проверке", callback_data="recipe_list_back:0"),
+                            InlineKeyboardButton("🏷️ Изменить название", callback_data="recipe_list_rename:0"),
+                            InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0"),
                         ],
-                        [InlineKeyboardButton("Отмена", callback_data="recipe_list_cancel:0")],
+                        [InlineKeyboardButton("✖️ Отменить", callback_data="recipe_list_cancel:0")],
                     ]
                 ),
             )
@@ -5415,8 +6029,8 @@ class TelegramRecipeBot:
             header + "\n" + "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("Открыть рецепт", callback_data=f"open:{created.recipe_id}")],
-                    [InlineKeyboardButton("К списку", callback_data="list:0")],
+                    [InlineKeyboardButton("🍽️ Открыть рецепт", callback_data=f"open:{created.recipe_id}")],
+                    [InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")],
                 ]
             ),
         )
@@ -5432,7 +6046,7 @@ class TelegramRecipeBot:
         cached = self._recipe_cache(context, str(group_id))
         if cached is None:
             await update.effective_message.reply_text(
-                "Список рецептов еще не загружен. Нажми «Поиск рецептов», потом пришли текст для поиска.",
+                "Список рецептов ещё не загружен. Нажми «🍽️ Все рецепты», потом пришли текст для поиска.",
                 reply_markup=self._main_keyboard(update.effective_user.id),
             )
             context.chat_data["reply_keyboard"] = "main"

@@ -98,10 +98,17 @@ def _validate_expected_recipe_source(
     source_recipe: Recipe,
     expected_remote_id: str | None,
     expected_content_digest: str | None,
+    expected_strict_digest: str | None = None,
 ) -> None:
     """Reject synchronization when the approved source version is no longer current."""
     if expected_remote_id is not None and source_remote_id != expected_remote_id:
         raise FatSecretError("Выбранная версия рецепта изменилась. Проверь источник и подтверди снова.")
+    if expected_strict_digest is not None:
+        if recipe_fingerprint(source_recipe).digest != expected_strict_digest:
+            raise FatSecretError(
+                "Рецепт изменился после проверки. Открой обновлённую версию и подтверди снова."
+            )
+        return
     if (
         expected_content_digest is not None
         and recipe_content_fingerprint(source_recipe).digest != expected_content_digest
@@ -163,6 +170,7 @@ def _recipe_list_request_fingerprint(
     portions: Decimal,
     steps: list[str],
     items: list[ResolvedRecipeListItem],
+    operation_identity: dict[str, object] | None = None,
 ) -> str:
     """Return a stable semantic key that excludes generated row IDs and timestamps."""
     payload = {
@@ -186,8 +194,64 @@ def _recipe_list_request_fingerprint(
             for item in items
         ],
     }
+    if operation_identity is not None:
+        payload["operation_identity"] = operation_identity
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _recipe_edit_operation_identity(
+    source_account_key: str,
+    source_remote_id: str,
+    source_content_digest: str,
+    replacement_recipe_id: str,
+    ingredient_ids: list[str],
+    account_keys: set[str],
+) -> dict[str, object]:
+    """Scope edit idempotency to one approved live source and preserved row identities."""
+    return {
+        "operation": "edit_recipe_from_list",
+        "source_account_key": source_account_key,
+        "source_remote_id": source_remote_id,
+        "source_content_digest": source_content_digest,
+        "replacement_recipe_id": replacement_recipe_id,
+        "ingredient_ids": ingredient_ids,
+        "account_keys": sorted(account_keys),
+    }
+
+
+def _recipe_edit_candidate(
+    recipe_id: str,
+    group_id: str,
+    source: Recipe,
+    items: list[ResolvedRecipeListItem],
+    portions: Decimal,
+    steps: list[str],
+) -> Recipe:
+    """Build edited content while retaining approved source metadata and item identities."""
+    return Recipe(
+        id=recipe_id,
+        title=source.title,
+        description=source.description,
+        portions=portions,
+        prep_time=source.prep_time,
+        cook_time=source.cook_time,
+        steps=list(steps),
+        group_id=group_id,
+        ingredients=[
+            Ingredient(
+                id=item.ingredient.id,
+                recipe_id=recipe_id,
+                food_id=item.ingredient.food_id,
+                title=item.ingredient.title,
+                portion_id=item.ingredient.portion_id or "0",
+                amount=item.ingredient.amount,
+                portion_description=item.ingredient.portion_description,
+                grams=item.ingredient.grams,
+            )
+            for item in items
+        ],
+    )
 
 
 def _recipe_list_payload_json(
@@ -2027,7 +2091,8 @@ class RecipeSyncEngine:
                                 account_key=account_key,
                                 remote_recipe_id=remote_id,
                                 recipe=display,
-                                fingerprint=recipe_content_fingerprint(transport),
+                                fingerprint=recipe_content_fingerprint(display),
+                                strict_fingerprint=strict_fingerprint,
                             )
                         )
             return recipe_ref.id, variants
@@ -2873,6 +2938,335 @@ class RecipeSyncEngine:
             if not await client.save_recipe_meta(recipe, remote_id):
                 raise FatSecretError(f"{client.account.label}: recipe metadata retry returned false")
 
+    async def edit_recipe_from_list(
+        self,
+        group_id: str,
+        source_account_key: str,
+        source_remote_id: str,
+        expected_source_content_digest: str,
+        items: list[ResolvedRecipeListItem],
+        updated_by: int,
+        *,
+        portions: Decimal,
+        steps: list[str],
+    ) -> RecipeCreateResult:
+        """Safely replace one opened live recipe across every connected account."""
+        if not source_account_key or not source_remote_id or not expected_source_content_digest:
+            raise FatSecretError("Источник рецепта задан не полностью. Открой рецепт заново.")
+        ingredient_ids = [item.ingredient.id for item in items]
+        if len(ingredient_ids) != len(set(ingredient_ids)):
+            raise FatSecretError("В рецепте повторяются внутренние ID ингредиентов. Открой рецепт заново.")
+
+        clients = self._build_clients(group_id)
+        connected_account_keys = set(clients)
+        replacement_ref: Recipe | None = None
+        source_metadata: Recipe | None = None
+        operation_identity: dict[str, object] | None = None
+        try:
+            source_client = clients.get(source_account_key)
+            if source_client is None:
+                raise FatSecretError("Аккаунт-источник больше не подключен.")
+
+            cookbook_results = await asyncio.gather(
+                *(client.cookbook() for client in clients.values()),
+                return_exceptions=True,
+            )
+            first_error = next(
+                (result for result in cookbook_results if isinstance(result, BaseException)),
+                None,
+            )
+            if first_error is not None:
+                raise first_error
+            cookbooks = {
+                account_key: list(summaries)
+                for account_key, summaries in zip(clients, cookbook_results, strict=True)
+            }
+            source_live_ids = {summary.remote_id for summary in cookbooks[source_account_key]}
+            if source_remote_id not in source_live_ids:
+                cached_snapshot = self.storage.remote_recipe_snapshot(source_account_key, source_remote_id)
+                if cached_snapshot is None:
+                    raise FatSecretError(
+                        "Выбранный рецепт больше не найден в аккаунте-источнике. Обнови список рецептов."
+                    )
+                cached_source, _ = cached_snapshot
+                if recipe_fingerprint(cached_source).digest != expected_source_content_digest:
+                    raise FatSecretError(
+                        "Выбранный рецепт больше не найден в аккаунте-источнике. Обнови список рецептов."
+                    )
+                live_recipe_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"fatsecret-bot:recipe:{group_id}:{normalize_title(cached_source.title)}",
+                    )
+                )
+                operation_identity = _recipe_edit_operation_identity(
+                    source_account_key,
+                    source_remote_id,
+                    expected_source_content_digest,
+                    live_recipe_id,
+                    ingredient_ids,
+                    connected_account_keys,
+                )
+                payload_fingerprint = _recipe_list_request_fingerprint(
+                    cached_source.title,
+                    portions,
+                    list(steps),
+                    items,
+                    operation_identity,
+                )
+                recovery_run = self.storage.matching_recipe_list_run(
+                    group_id,
+                    cached_source.title,
+                    payload_fingerprint,
+                )
+                source_account_run = next(
+                    (
+                        account
+                        for account in list(recovery_run.get("accounts") or [])
+                        if account.get("account_key") == source_account_key
+                    ),
+                    None,
+                ) if recovery_run is not None else None
+                if (
+                    recovery_run is None
+                    or recovery_run.get("replaced_recipe_id") != live_recipe_id
+                    or source_account_run is None
+                    or source_remote_id not in list(source_account_run.get("old_remote_ids") or [])
+                ):
+                    raise FatSecretError(
+                        "Выбранный рецепт больше не найден в аккаунте-источнике. Обнови список рецептов."
+                    )
+                journal_recipe, _, journal_custom_food_ids = _recipe_list_payload(
+                    str(recovery_run["payload_json"])
+                )
+                expected_custom_food_ids = {
+                    item.ingredient.id: dict(item.custom_food_ids)
+                    for item in items
+                    if item.custom_food_ids
+                }
+                if (
+                    normalize_title(str(recovery_run["requested_title"]))
+                    != normalize_title(cached_source.title)
+                    or journal_recipe.description != cached_source.description
+                    or journal_recipe.prep_time != cached_source.prep_time
+                    or journal_recipe.cook_time != cached_source.cook_time
+                    or journal_recipe.portions != portions
+                    or journal_recipe.steps != list(steps)
+                    or [ingredient.id for ingredient in journal_recipe.ingredients] != ingredient_ids
+                    or journal_custom_food_ids != expected_custom_food_ids
+                ):
+                    raise FatSecretError(
+                        "Незавершённая замена не совпадает с этим черновиком. Открой обновлённый рецепт заново."
+                    )
+                replacement_ref = Recipe(
+                    id=live_recipe_id,
+                    title=cached_source.title,
+                    description=cached_source.description,
+                    portions=cached_source.portions,
+                    prep_time=cached_source.prep_time,
+                    cook_time=cached_source.cook_time,
+                    steps=list(cached_source.steps),
+                    group_id=group_id,
+                    remote_ids={source_account_key: source_remote_id},
+                    remote_ids_by_account={source_account_key: [source_remote_id]},
+                )
+                source_metadata = cached_source
+                await self._close_clients(clients)
+                clients = {}
+                return await self._create_recipe_from_list(
+                    group_id,
+                    source_metadata.title,
+                    items,
+                    updated_by,
+                    portions=portions,
+                    steps=steps,
+                    replace_existing_recipe_ref=replacement_ref,
+                    recipe_metadata=source_metadata,
+                    preserve_ingredient_ids=True,
+                    operation_identity=operation_identity,
+                    expected_account_keys=connected_account_keys,
+                )
+
+            try:
+                remote_source = await source_client.get_recipe(source_remote_id)
+            except KeyError as exc:
+                raise FatSecretError(
+                    "Выбранный рецепт больше не найден в аккаунте-источнике. Обнови список рецептов."
+                ) from exc
+            live_recipe_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"fatsecret-bot:recipe:{group_id}:{normalize_title(remote_source.title)}",
+                )
+            )
+            source_transport = _copy_recipe_from_remote(live_recipe_id, remote_source)
+            if recipe_fingerprint(source_transport).digest != expected_source_content_digest:
+                raise FatSecretError(
+                    "Рецепт изменился после проверки. Открой обновлённую версию заново."
+                )
+            if not normalize_title(source_transport.title):
+                raise FatSecretError("У выбранного рецепта отсутствует название. Обнови список рецептов.")
+            for item in items:
+                if not item.custom_food_ids:
+                    continue
+                missing_account_keys = connected_account_keys - set(item.custom_food_ids)
+                if missing_account_keys:
+                    raise FatSecretError(
+                        f"Для личного продукта «{item.ingredient.title}» не готовы привязки аккаунтов: "
+                        + ", ".join(sorted(missing_account_keys))
+                        + ". Синхронизация остановлена до создания копий продукта."
+                    )
+            self.storage.upsert_remote_recipe_snapshot(
+                source_account_key,
+                source_remote_id,
+                source_transport,
+                recipe_fingerprint(source_transport),
+            )
+            if len(clients) > 1:
+                for item in items:
+                    if item.custom_food_ids:
+                        continue
+                    try:
+                        await source_client.get_custom_food_definition(item.ingredient.food_id)
+                    except FatSecretNotCustomFoodError:
+                        continue
+                    raise FatSecretError(
+                        f"Для личного продукта «{item.ingredient.title}» не готовы привязки всех аккаунтов. "
+                        "Синхронизация остановлена до создания копий продукта."
+                    )
+
+            edited_recipe = _recipe_edit_candidate(
+                live_recipe_id,
+                group_id,
+                source_transport,
+                items,
+                portions,
+                steps,
+            )
+            expected_content_digest = recipe_content_fingerprint(edited_recipe).digest
+            normalized_title = normalize_title(source_transport.title)
+            remote_ids_by_account: dict[str, list[str]] = {}
+            current_recipes: dict[tuple[str, str], Recipe] = {}
+            detail_tasks: dict[str, dict[str, asyncio.Task[FoodSearchResult]]] = {
+                account_key: {} for account_key in clients
+            }
+            for account_key, client in clients.items():
+                matching_ids = list(
+                    dict.fromkeys(
+                        summary.remote_id
+                        for summary in cookbooks[account_key]
+                        if normalize_title(summary.title) == normalized_title
+                    )
+                )
+                if account_key == source_account_key and source_remote_id not in matching_ids:
+                    raise FatSecretError(
+                        "Выбранный рецепт изменился во время проверки. Обнови список рецептов."
+                    )
+                remote_ids_by_account[account_key] = matching_ids
+                for remote_id in matching_ids:
+                    try:
+                        remote = (
+                            remote_source
+                            if account_key == source_account_key and remote_id == source_remote_id
+                            else await client.get_recipe(remote_id)
+                        )
+                    except KeyError as exc:
+                        raise FatSecretError(
+                            f"{client.account.label}: рецепт {remote_id} исчез во время проверки. Обнови список."
+                        ) from exc
+                    if normalize_title(remote.title) != normalized_title:
+                        raise FatSecretError(
+                            f"{client.account.label}: рецепт {remote_id} изменился во время проверки. Обнови список."
+                        )
+                    normalized_ingredients = await self._normalize_recipe_ingredients(
+                        client,
+                        remote.ingredients,
+                        detail_tasks=detail_tasks[account_key],
+                    )
+                    comparison_recipe = _copy_recipe_from_remote(live_recipe_id, remote)
+                    comparison_recipe.ingredients = _copy_remote_ingredients(
+                        live_recipe_id,
+                        normalized_ingredients,
+                    )
+                    current_recipes[(account_key, remote_id)] = comparison_recipe
+
+            all_accounts_identical = all(
+                len(remote_ids_by_account[account_key]) == 1
+                and recipe_content_fingerprint(
+                    current_recipes[(account_key, remote_ids_by_account[account_key][0])]
+                ).digest
+                == expected_content_digest
+                for account_key in clients
+            )
+            if all_accounts_identical:
+                cached = self.storage.find_recipe_by_title(group_id, source_transport.title)
+                return RecipeCreateResult(
+                    recipe_id=cached.id if cached is not None else live_recipe_id,
+                    results=[
+                        AccountSyncResult(
+                            account_key,
+                            remote_ids_by_account[account_key][0],
+                            True,
+                            "без изменений",
+                        )
+                        for account_key in sorted(clients)
+                    ],
+                    title=source_transport.title,
+                )
+
+            primary_remote_ids = {
+                account_key: (
+                    source_remote_id
+                    if account_key == source_account_key
+                    else remote_ids[0]
+                )
+                for account_key, remote_ids in remote_ids_by_account.items()
+                if remote_ids
+            }
+            replacement_ref = Recipe(
+                id=live_recipe_id,
+                title=source_transport.title,
+                description=source_transport.description,
+                portions=source_transport.portions,
+                prep_time=source_transport.prep_time,
+                cook_time=source_transport.cook_time,
+                steps=list(source_transport.steps),
+                group_id=group_id,
+                remote_ids=primary_remote_ids,
+                remote_ids_by_account={
+                    account_key: list(remote_ids)
+                    for account_key, remote_ids in remote_ids_by_account.items()
+                    if remote_ids
+                },
+            )
+            source_metadata = source_transport
+            operation_identity = _recipe_edit_operation_identity(
+                source_account_key,
+                source_remote_id,
+                expected_source_content_digest,
+                live_recipe_id,
+                ingredient_ids,
+                connected_account_keys,
+            )
+        finally:
+            await self._close_clients(clients)
+
+        if replacement_ref is None or source_metadata is None or operation_identity is None:
+            raise FatSecretError("Не удалось подготовить безопасную замену рецепта.")
+        return await self._create_recipe_from_list(
+            group_id,
+            source_metadata.title,
+            items,
+            updated_by,
+            portions=portions,
+            steps=steps,
+            replace_existing_recipe_ref=replacement_ref,
+            recipe_metadata=source_metadata,
+            preserve_ingredient_ids=True,
+            operation_identity=operation_identity,
+            expected_account_keys=connected_account_keys,
+        )
+
     async def create_recipe_from_list(
         self,
         group_id: str,
@@ -2880,12 +3274,40 @@ class RecipeSyncEngine:
         items: list[ResolvedRecipeListItem],
         updated_by: int,
         *,
-        portions: Decimal = Decimal("1"),
+        portions: Decimal = Decimal(1),
         steps: list[str] | None = None,
         replace_existing_recipe_id: str | None = None,
         replace_existing_recipe_ref: Recipe | None = None,
     ) -> RecipeCreateResult:
         """Create or replace a recipe through a durable, resumable multi-account journal."""
+        return await self._create_recipe_from_list(
+            group_id,
+            title,
+            items,
+            updated_by,
+            portions=portions,
+            steps=steps,
+            replace_existing_recipe_id=replace_existing_recipe_id,
+            replace_existing_recipe_ref=replace_existing_recipe_ref,
+        )
+
+    async def _create_recipe_from_list(
+        self,
+        group_id: str,
+        title: str,
+        items: list[ResolvedRecipeListItem],
+        updated_by: int,
+        *,
+        portions: Decimal = Decimal(1),
+        steps: list[str] | None = None,
+        replace_existing_recipe_id: str | None = None,
+        replace_existing_recipe_ref: Recipe | None = None,
+        recipe_metadata: Recipe | None = None,
+        preserve_ingredient_ids: bool = False,
+        operation_identity: dict[str, object] | None = None,
+        expected_account_keys: set[str] | None = None,
+    ) -> RecipeCreateResult:
+        """Execute the shared durable create-and-replace implementation."""
         final_title = title.strip()
         if not final_title:
             raise FatSecretError("Название рецепта не должно быть пустым.")
@@ -2908,7 +3330,13 @@ class RecipeSyncEngine:
                 raise FatSecretError("У рецепта для замены нет привязок к FatSecret.")
             create_title = self.storage.next_available_recipe_title(group_id, final_title, include_base=False)
         clean_steps = list(steps or [])
-        payload_fingerprint = _recipe_list_request_fingerprint(final_title, portions, clean_steps, items)
+        payload_fingerprint = _recipe_list_request_fingerprint(
+            final_title,
+            portions,
+            clean_steps,
+            items,
+            operation_identity,
+        )
         run = self.storage.matching_recipe_list_run(group_id, final_title, payload_fingerprint)
         if run is not None and run["status"] == "completed":
             return self._recipe_list_result_from_run(run)
@@ -2917,13 +3345,18 @@ class RecipeSyncEngine:
 
         clients = self._build_clients(group_id)
         try:
+            if expected_account_keys is not None and set(clients) != expected_account_keys:
+                raise FatSecretError(
+                    "Набор FatSecret аккаунтов изменился после проверки; открой рецепт заново."
+                )
             if run is None:
                 candidate_recipe_id = str(uuid.uuid4())
                 candidate_ingredients: list[Ingredient] = []
                 custom_food_ids: dict[str, dict[str, str]] = {}
                 for item in items:
+                    ingredient_id = item.ingredient.id if preserve_ingredient_ids else str(uuid.uuid4())
                     ingredient = Ingredient(
-                        id=str(uuid.uuid4()),
+                        id=ingredient_id,
                         recipe_id=candidate_recipe_id,
                         food_id=item.ingredient.food_id,
                         title=item.ingredient.title,
@@ -2938,10 +3371,14 @@ class RecipeSyncEngine:
                 candidate = Recipe(
                     id=candidate_recipe_id,
                     title=create_title,
-                    description=_sync_description(timezone=self.timezone),
+                    description=(
+                        recipe_metadata.description
+                        if recipe_metadata is not None
+                        else _sync_description(timezone=self.timezone)
+                    ),
                     portions=portions,
-                    prep_time=0,
-                    cook_time=0,
+                    prep_time=recipe_metadata.prep_time if recipe_metadata is not None else 0,
+                    cook_time=recipe_metadata.cook_time if recipe_metadata is not None else 0,
                     steps=clean_steps,
                     group_id=group_id,
                     ingredients=candidate_ingredients,
@@ -3505,6 +3942,7 @@ class RecipeSyncEngine:
         *,
         expected_source_remote_id: str | None = None,
         expected_source_content_digest: str | None = None,
+        expected_source_strict_digest: str | None = None,
     ) -> list[AccountSyncResult]:
         """Propagate an approved source version to every connected account."""
         sync_run = uuid.uuid4().hex[:12]
@@ -3537,6 +3975,7 @@ class RecipeSyncEngine:
                 source_recipe,
                 expected_source_remote_id,
                 expected_source_content_digest,
+                expected_source_strict_digest,
             )
             source_fingerprint = recipe_fingerprint(source_recipe)
             self.storage.upsert_remote_recipe_snapshot(
@@ -3677,6 +4116,7 @@ class RecipeSyncEngine:
         *,
         expected_source_remote_id: str | None = None,
         expected_source_content_digest: str | None = None,
+        expected_source_strict_digest: str | None = None,
     ) -> tuple[Recipe, list[AccountSyncResult]]:
         """Propagate an approved live source without persisting local recipe rows."""
         sync_run = uuid.uuid4().hex[:12]
@@ -3705,6 +4145,7 @@ class RecipeSyncEngine:
                 transport_recipe,
                 expected_source_remote_id,
                 expected_source_content_digest,
+                expected_source_strict_digest,
             )
             self.storage.upsert_remote_recipe_snapshot(
                 source_account_key,
