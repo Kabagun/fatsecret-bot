@@ -2153,6 +2153,98 @@ class RecipeSyncEngine:
             resolved.append(candidates[0])
         return RecipeListDraft(items=resolved, unresolved=unresolved)
 
+    async def hydrate_recipe_edit_source_items(
+        self,
+        group_id: str,
+        source_account_key: str,
+        items: list[ResolvedRecipeListItem],
+    ) -> list[ResolvedRecipeListItem]:
+        """Add exact source-account food metadata to unchanged recipe-edit items."""
+        accounts = {
+            account.key: account
+            for account in self.storage.list_fatsecret_accounts(group_id)
+        }
+        source_account = accounts.get(source_account_key)
+        if source_account is None:
+            raise FatSecretError("Аккаунт-источник больше не подключен.")
+
+        client = self._build_client(source_account)
+        semaphore = asyncio.Semaphore(INGREDIENT_NORMALIZE_CONCURRENCY)
+        representative_by_food_id: dict[str, ResolvedRecipeListItem] = {}
+        for item in items:
+            representative_by_food_id.setdefault(item.ingredient.food_id, item)
+
+        async def load_detail(
+            food_id: str,
+            item: ResolvedRecipeListItem,
+        ) -> tuple[str, FoodSearchResult | None]:
+            try:
+                async with semaphore:
+                    detail = await client.resolve_food_detail(
+                        FoodSearchResult(
+                            food_id=food_id,
+                            title=item.ingredient.title,
+                            default_portion_id=item.ingredient.portion_id or "0",
+                            default_portion_description=item.ingredient.portion_description,
+                        )
+                    )
+            except Exception:  # Missing display metadata must not make an edit unsafe.
+                logger.warning(
+                    "recipe edit nutrient hydration failed account=%s food_id=%s title=%r",
+                    source_account_key,
+                    food_id,
+                    item.ingredient.title,
+                    exc_info=True,
+                )
+                return food_id, None
+            if detail.food_id != food_id:
+                logger.warning(
+                    "recipe edit nutrient hydration returned mismatched food account=%s expected_food_id=%s "
+                    "actual_food_id=%s",
+                    source_account_key,
+                    food_id,
+                    detail.food_id,
+                )
+                return food_id, None
+            return food_id, detail
+
+        try:
+            resolved_details = await asyncio.gather(
+                *(
+                    load_detail(food_id, item)
+                    for food_id, item in representative_by_food_id.items()
+                )
+            )
+        finally:
+            await client.close()
+
+        details_by_food_id = dict(resolved_details)
+        hydrated: list[ResolvedRecipeListItem] = []
+        for item in items:
+            detail = details_by_food_id.get(item.ingredient.food_id)
+            if detail is None:
+                hydrated.append(item)
+                continue
+            protein = detail.protein_per_portion
+            fat = detail.fat_per_portion
+            carbohydrate = detail.carbohydrate_per_portion
+            hydrated.append(
+                replace(
+                    item,
+                    brand=detail.brand,
+                    energy_per_100g=_correct_energy(
+                        detail.energy_per_portion,
+                        protein,
+                        fat,
+                        carbohydrate,
+                    ),
+                    protein_per_100g=protein,
+                    fat_per_100g=fat,
+                    carbohydrate_per_100g=carbohydrate,
+                )
+            )
+        return hydrated
+
     async def _local_food_metadata(
         self,
         client: FatSecretClient,

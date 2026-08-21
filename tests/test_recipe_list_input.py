@@ -326,6 +326,76 @@ def test_format_recipe_list_draft_includes_steps() -> None:
     assert "2. Запечь" in text
 
 
+def test_recipe_list_draft_labels_partial_totals_when_macros_are_missing() -> None:
+    known = ResolvedRecipeListItem(
+        requested_query="хлеб",
+        grams=Decimal("100"),
+        ingredient=Ingredient(
+            id="known",
+            recipe_id="",
+            food_id="food-known",
+            title="Хлеб",
+            portion_id="0",
+            amount=Decimal("1"),
+            portion_description="100г",
+        ),
+        source="FatSecret",
+        energy_per_100g=Decimal("250"),
+        protein_per_100g=Decimal("8"),
+        fat_per_100g=Decimal("3"),
+        carbohydrate_per_100g=Decimal("48"),
+    )
+    missing = ResolvedRecipeListItem(
+        requested_query="сыр",
+        grams=Decimal("50"),
+        ingredient=Ingredient(
+            id="missing",
+            recipe_id="",
+            food_id="food-missing",
+            title="Сыр Лёгкий",
+            portion_id="0",
+            amount=Decimal("0.5"),
+            portion_description="100г",
+        ),
+        source="recipe-edit",
+    )
+
+    text = _format_recipe_list_draft("Сэндвич", [known, missing])
+
+    assert "Пока учтено ккал/Б/Ж/У: 250/8/3/48" in text
+    assert "Итого ккал/Б/Ж/У" not in text
+    assert "⚠️ Расчёт неполный: нет полного КБЖУ: Сыр Лёгкий." in text
+    assert "1. Хлеб" in text
+    assert "2. Сыр Лёгкий" in text
+
+
+def test_recipe_list_draft_labels_partial_when_only_one_macro_is_missing() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="сыр",
+        grams=Decimal("100"),
+        ingredient=Ingredient(
+            id="cheese",
+            recipe_id="",
+            food_id="food-cheese",
+            title="Сыр",
+            portion_id="0",
+            amount=Decimal("1"),
+            portion_description="100г",
+        ),
+        source="FatSecret",
+        energy_per_100g=Decimal("200"),
+        protein_per_100g=Decimal("25"),
+        fat_per_100g=Decimal("10"),
+        carbohydrate_per_100g=None,
+    )
+
+    text = _format_recipe_list_draft("Тест", [item])
+
+    assert "Пока учтено ккал/Б/Ж/У: 200/25/10/-" in text
+    assert "⚠️ Расчёт неполный: нет полного КБЖУ: Сыр." in text
+    assert "Итого ккал/Б/Ж/У" not in text
+
+
 def test_recipe_list_draft_shows_unresolved_items_and_blocks_create() -> None:
     item = ResolvedRecipeListItem(
         requested_query="филе",
@@ -345,11 +415,50 @@ def test_recipe_list_draft_shows_unresolved_items_and_blocks_create() -> None:
 
     text = _format_recipe_list_draft("Тест", [item], unresolved=unresolved)
     keyboard = _recipe_list_draft_keyboard([item], unresolved=unresolved)
-    flat_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+    rows = [[(button.text, button.callback_data) for button in row] for row in keyboard.inline_keyboard]
+    flat_buttons = [text for row in rows for text, _ in row]
 
     assert "<b>Нужно заполнить или удалить</b>" in text
-    assert "- ? Приправа для фарша Green | масса: 3г" in text
-    assert any(button.startswith("🔎 Подобрать: Приправа") for button in flat_buttons)
+    assert "Пока учтено ккал/Б/Ж/У" in text
+    assert "⚠️ Расчёт неполный" in text
+    assert "2. ? Приправа для фарша Green | масса: 3г" in text
+    assert any(button.startswith("🔎 2. Подобрать: Приправа") for button in flat_buttons)
     assert "➕ Создать продукт" in flat_buttons
-    assert "🗑️ Убрать ингредиент" in flat_buttons
+    assert "🗑️ Убрать" in flat_buttons
     assert "✅ Создать рецепт" not in flat_buttons
+    assert rows[0][0][1] == "recipe_list_replace:0"
+    assert rows[1][0][1] == "recipe_list_resolve:0"
+    assert [callback for _, callback in rows[2]] == [
+        "recipe_list_create_food:0",
+        "recipe_list_drop:0",
+    ]
+
+
+def test_recipe_list_draft_keyboard_packs_resolved_items_two_per_row() -> None:
+    items = [
+        ResolvedRecipeListItem(
+            requested_query=f"ingredient {index}",
+            grams=Decimal("100"),
+            ingredient=Ingredient(
+                id=f"i{index}",
+                recipe_id="",
+                food_id=f"f{index}",
+                title=f"Очень длинное название ингредиента {index}",
+                portion_id="0",
+                amount=Decimal("1"),
+                portion_description="100г",
+            ),
+            source="FatSecret",
+        )
+        for index in range(5)
+    ]
+
+    keyboard = _recipe_list_draft_keyboard(items)
+    rows = keyboard.inline_keyboard
+
+    assert [len(row) for row in rows[:3]] == [2, 2, 1]
+    assert [button.callback_data for row in rows[:3] for button in row] == [
+        f"recipe_list_replace:{index}" for index in range(5)
+    ]
+    assert all(len(button.text) <= 24 for row in rows[:3] for button in row)
+    assert [button.text for button in rows[3]] == ["🏷️ Название", "📝 Шаги"]

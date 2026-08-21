@@ -167,6 +167,36 @@ class FakeSlowDetailClient(FakeFatSecretClient):
             self.active_detail_calls -= 1
 
 
+class FakeRecipeEditHydrationClient(FakeFatSecretClient):
+    def __init__(
+        self,
+        details: dict[str, FoodSearchResult],
+        *,
+        failures: set[str] | None = None,
+    ) -> None:
+        super().__init__(Recipe(id="unused", title="Unused"), account_key="tg11", details=details)
+        self.failures = failures or set()
+        self.detail_calls: list[str] = []
+        self.active_detail_calls = 0
+        self.max_active_detail_calls = 0
+        self.closed = False
+
+    async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
+        self.detail_calls.append(result.food_id)
+        self.active_detail_calls += 1
+        self.max_active_detail_calls = max(self.max_active_detail_calls, self.active_detail_calls)
+        try:
+            await asyncio.sleep(0.01)
+            if result.food_id in self.failures:
+                raise RuntimeError(f"detail failed for {result.food_id}")
+            return self.details.get(result.food_id, result)
+        finally:
+            self.active_detail_calls -= 1
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 class FakeTimeoutAfterIngredientClient(FakeFatSecretClient):
     def __init__(self, target: Recipe, account_key: str) -> None:
         super().__init__(target, account_key=account_key)
@@ -660,6 +690,22 @@ def _resolved_recipe_item(ingredient: Ingredient) -> ResolvedRecipeListItem:
     )
 
 
+def _recipe_edit_hydration_engine(tmp_path, client):  # type: ignore[no-untyped-def]
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.register_user(11, "One")
+    group = storage.create_group(11, "Семья")
+    storage.upsert_fatsecret_account(11, "One", "one@example.com", "secret", "BY", "ru")
+    engine = RecipeSyncEngine(storage, _device())
+    built_account_keys: list[str] = []
+
+    def build_client(account):  # type: ignore[no-untyped-def]
+        built_account_keys.append(account.key)
+        return client
+
+    engine._build_client = build_client  # type: ignore[method-assign]
+    return storage, group.id, engine, built_account_keys
+
+
 def _cache_foods(
     storage: Storage,
     group_id: str,
@@ -682,6 +728,198 @@ def _cache_foods(
                 )
             )
     storage.replace_food_usage_cache(group_id, ingredients)
+
+
+def test_hydrate_recipe_edit_source_items_uses_exact_id_and_preserves_item_identity(tmp_path) -> None:
+    detail = FoodSearchResult(
+        food_id="food-water",
+        title="Вода",
+        brand="Источник",
+        energy_per_portion=Decimal("0"),
+        protein_per_portion=Decimal("0"),
+        fat_per_portion=Decimal("0"),
+        carbohydrate_per_portion=Decimal("0"),
+    )
+    client = FakeRecipeEditHydrationClient({detail.food_id: detail})
+    storage, group_id, engine, built_account_keys = _recipe_edit_hydration_engine(tmp_path, client)
+    try:
+        ingredient = Ingredient(
+            id="ingredient-water",
+            recipe_id="recipe-source",
+            food_id="food-water",
+            title="Вода",
+            portion_id="portion-water",
+            amount=Decimal("1.25"),
+            portion_description="100г",
+            remote_ingredient_id="remote-water",
+            grams=Decimal("125"),
+        )
+        custom_food_ids = {"tg11": "food-water", "tg22": "food-water-other"}
+        item = ResolvedRecipeListItem(
+            requested_query="вода питьевая",
+            grams=Decimal("125"),
+            ingredient=ingredient,
+            source="recipe-edit",
+            brand="Старый бренд",
+            usage_count=7,
+            energy_per_100g=Decimal("99"),
+            protein_per_100g=Decimal("9"),
+            fat_per_100g=Decimal("9"),
+            carbohydrate_per_100g=Decimal("9"),
+            custom_food_ids=custom_food_ids,
+        )
+
+        hydrated = asyncio.run(engine.hydrate_recipe_edit_source_items(group_id, "tg11", [item]))
+
+        assert built_account_keys == ["tg11"]
+        assert client.detail_calls == ["food-water"]
+        assert client.closed is True
+        assert len(hydrated) == 1
+        assert hydrated[0] is not item
+        assert hydrated[0].ingredient is ingredient
+        assert hydrated[0].custom_food_ids is custom_food_ids
+        assert hydrated[0].requested_query == item.requested_query
+        assert hydrated[0].grams == item.grams
+        assert hydrated[0].source == item.source
+        assert hydrated[0].usage_count == item.usage_count
+        assert hydrated[0].brand == "Источник"
+        assert hydrated[0].energy_per_100g == Decimal("0")
+        assert hydrated[0].protein_per_100g == Decimal("0")
+        assert hydrated[0].fat_per_100g == Decimal("0")
+        assert hydrated[0].carbohydrate_per_100g == Decimal("0")
+    finally:
+        storage.close()
+
+
+def test_hydrate_recipe_edit_source_items_preserves_order_dedupes_and_bounds_concurrency(tmp_path) -> None:
+    food_ids = [f"food-{index}" for index in range(INGREDIENT_NORMALIZE_CONCURRENCY + 3)]
+    details = {
+        food_id: FoodSearchResult(
+            food_id=food_id,
+            title=f"Продукт {index}",
+            brand=f"Бренд {index}",
+            energy_per_portion=Decimal(index),
+            protein_per_portion=Decimal(index) / Decimal("10"),
+            fat_per_portion=Decimal("0"),
+            carbohydrate_per_portion=Decimal("1"),
+        )
+        for index, food_id in enumerate(food_ids)
+    }
+    client = FakeRecipeEditHydrationClient(details)
+    storage, group_id, engine, built_account_keys = _recipe_edit_hydration_engine(tmp_path, client)
+    try:
+        ordered_food_ids = [food_ids[2], food_ids[0], food_ids[2], food_ids[1], *food_ids[3:]]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query=f"запрос {index}",
+                grams=Decimal(100 + index),
+                ingredient=Ingredient(
+                    id=f"ingredient-{index}",
+                    recipe_id="recipe-source",
+                    food_id=food_id,
+                    title=f"Строка {index}",
+                    portion_id="0",
+                    amount=Decimal("1"),
+                    portion_description="100г",
+                    grams=Decimal(100 + index),
+                ),
+                source="recipe-edit",
+            )
+            for index, food_id in enumerate(ordered_food_ids)
+        ]
+
+        hydrated = asyncio.run(engine.hydrate_recipe_edit_source_items(group_id, "tg11", items))
+
+        assert built_account_keys == ["tg11"]
+        assert len(client.detail_calls) == len(food_ids)
+        assert set(client.detail_calls) == set(food_ids)
+        assert 1 < client.max_active_detail_calls <= INGREDIENT_NORMALIZE_CONCURRENCY
+        assert [item.ingredient.id for item in hydrated] == [item.ingredient.id for item in items]
+        assert all(result.ingredient is original.ingredient for result, original in zip(hydrated, items, strict=True))
+        assert [item.brand for item in hydrated] == [details[food_id].brand for food_id in ordered_food_ids]
+        assert client.closed is True
+    finally:
+        storage.close()
+
+
+def test_hydrate_recipe_edit_source_items_keeps_failed_item_unchanged(tmp_path, caplog) -> None:
+    good_detail = FoodSearchResult(
+        food_id="food-good",
+        title="Хороший",
+        brand="Точный бренд",
+        energy_per_portion=Decimal("120"),
+        protein_per_portion=Decimal("10"),
+        fat_per_portion=Decimal("4"),
+        carbohydrate_per_portion=Decimal("12"),
+    )
+    client = FakeRecipeEditHydrationClient(
+        {good_detail.food_id: good_detail},
+        failures={"food-bad"},
+    )
+    storage, group_id, engine, _ = _recipe_edit_hydration_engine(tmp_path, client)
+    try:
+        good = _resolved_recipe_item(
+            Ingredient("good", "recipe", "food-good", "Хороший", "0", Decimal("1"), "100г")
+        )
+        bad = _resolved_recipe_item(
+            Ingredient("bad", "recipe", "food-bad", "Проблемный", "0", Decimal("1"), "100г")
+        )
+
+        with caplog.at_level("WARNING", logger="fatsecret_bot.sync"):
+            hydrated = asyncio.run(engine.hydrate_recipe_edit_source_items(group_id, "tg11", [bad, good]))
+
+        assert hydrated[0] is bad
+        assert hydrated[1].ingredient is good.ingredient
+        assert hydrated[1].brand == "Точный бренд"
+        assert hydrated[1].energy_per_100g == Decimal("120")
+        assert "recipe edit nutrient hydration failed" in caplog.text
+        assert "food-bad" in caplog.text
+        assert client.closed is True
+    finally:
+        storage.close()
+
+
+def test_hydrate_recipe_edit_source_items_rejects_mismatched_detail_id(tmp_path, caplog) -> None:
+    mismatched = FoodSearchResult(
+        food_id="food-other",
+        title="Другой продукт",
+        energy_per_portion=Decimal("999"),
+        protein_per_portion=Decimal("99"),
+        fat_per_portion=Decimal("99"),
+        carbohydrate_per_portion=Decimal("99"),
+    )
+    client = FakeRecipeEditHydrationClient({"food-source": mismatched})
+    storage, group_id, engine, _ = _recipe_edit_hydration_engine(tmp_path, client)
+    try:
+        source = _resolved_recipe_item(
+            Ingredient("source", "recipe", "food-source", "Исходный", "0", Decimal("1"), "100г")
+        )
+
+        with caplog.at_level("WARNING", logger="fatsecret_bot.sync"):
+            hydrated = asyncio.run(engine.hydrate_recipe_edit_source_items(group_id, "tg11", [source]))
+
+        assert hydrated == [source]
+        assert hydrated[0] is source
+        assert "returned mismatched food" in caplog.text
+        assert "expected_food_id=food-source" in caplog.text
+        assert "actual_food_id=food-other" in caplog.text
+        assert client.closed is True
+    finally:
+        storage.close()
+
+
+def test_hydrate_recipe_edit_source_items_rejects_missing_source_account(tmp_path) -> None:
+    client = FakeRecipeEditHydrationClient({})
+    storage, group_id, engine, built_account_keys = _recipe_edit_hydration_engine(tmp_path, client)
+    try:
+        with pytest.raises(FatSecretError, match="Аккаунт-источник больше не подключен"):
+            asyncio.run(engine.hydrate_recipe_edit_source_items(group_id, "missing", []))
+
+        assert built_account_keys == []
+        assert client.detail_calls == []
+        assert client.closed is False
+    finally:
+        storage.close()
 
 
 def test_sync_ingredients_updates_by_remote_iid_and_adds_missing(tmp_path) -> None:

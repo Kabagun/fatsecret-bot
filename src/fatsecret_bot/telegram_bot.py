@@ -883,6 +883,14 @@ def _plain_item_title(item: ResolvedRecipeListItem) -> str:
     return title
 
 
+def _compact_button_title(value: str, limit: int = 16) -> str:
+    """Return a readable ingredient label that fits a half-width Telegram button."""
+    title = " ".join(value.split()) or "Ингредиент"
+    if len(title) <= limit:
+        return title
+    return title[: limit - 1].rstrip() + "…"
+
+
 def _format_item_title(item: ResolvedRecipeListItem) -> str:
     return html.escape(_plain_item_title(item))
 
@@ -896,12 +904,17 @@ def _format_macros_per_100g(item: ResolvedRecipeListItem) -> str:
     )
 
 
-def _format_resolved_item(item: ResolvedRecipeListItem) -> str:
-    return f"- {_format_item_title(item)} | 100г: {_format_macros_per_100g(item)} | масса: {_format_decimal(item.grams)}г"
+def _format_resolved_item(item: ResolvedRecipeListItem, position: int | None = None) -> str:
+    prefix = f"{position}." if position is not None else "-"
+    return (
+        f"{prefix} {_format_item_title(item)} | 100г: {_format_macros_per_100g(item)} | "
+        f"масса: {_format_decimal(item.grams)}г"
+    )
 
 
-def _format_unresolved_item(item: RecipeListItem) -> str:
-    return f"- ? {html.escape(item.query)} | масса: {_format_decimal(item.grams)}г"
+def _format_unresolved_item(item: RecipeListItem, position: int | None = None) -> str:
+    prefix = f"{position}." if position is not None else "-"
+    return f"{prefix} ? {html.escape(item.query)} | масса: {_format_decimal(item.grams)}г"
 
 
 def _sum_known_macros(values: list[Decimal | None]) -> Decimal | None:
@@ -924,14 +937,42 @@ def _format_recipe_list_draft(
     carbs = _sum_known_macros([_scaled_macro(item.carbohydrate_per_100g, item.grams) for item in items])
     steps = steps or []
     unresolved = unresolved or []
+    missing_macros = [
+        item
+        for item in items
+        if any(
+            value is None
+            for value in (
+                item.energy_per_100g,
+                item.protein_per_100g,
+                item.fat_per_100g,
+                item.carbohydrate_per_100g,
+            )
+        )
+    ]
+    totals_complete = not unresolved and not missing_macros
+    totals_label = "Итого" if totals_complete else "Пока учтено"
     lines = [
         f"<b>Рецепт: {html.escape(title)}</b>",
         f"Порций: {_format_decimal(portions)}",
-        f"Итого ккал/Б/Ж/У: {_format_decimal(energy, 0)}/{_format_decimal(protein)}/{_format_decimal(fat)}/{_format_decimal(carbs)}",
+        f"{totals_label} ккал/Б/Ж/У: {_format_decimal(energy, 0)}/{_format_decimal(protein)}/{_format_decimal(fat)}/{_format_decimal(carbs)}",
         "",
         "<b>Ингредиенты</b>",
     ]
-    lines.extend(_format_resolved_item(item) for item in items)
+    if not totals_complete:
+        reasons: list[str] = []
+        if unresolved:
+            unresolved_titles = ", ".join(html.escape(item.query) for item in unresolved[:3])
+            if len(unresolved) > 3:
+                unresolved_titles += f" и ещё {len(unresolved) - 3}"
+            reasons.append(f"не выбрано: {unresolved_titles}")
+        if missing_macros:
+            missing_titles = ", ".join(_format_item_title(item) for item in missing_macros[:3])
+            if len(missing_macros) > 3:
+                missing_titles += f" и ещё {len(missing_macros) - 3}"
+            reasons.append(f"нет полного КБЖУ: {missing_titles}")
+        lines.insert(3, f"⚠️ Расчёт неполный: {'; '.join(reasons)}.")
+    lines.extend(_format_resolved_item(item, index) for index, item in enumerate(items, start=1))
     if not items:
         lines.append("Пока нет подобранных ингредиентов.")
     if unresolved:
@@ -939,7 +980,10 @@ def _format_recipe_list_draft(
             [
                 "",
                 "<b>Нужно заполнить или удалить</b>",
-                *(_format_unresolved_item(item) for item in unresolved),
+                *(
+                    _format_unresolved_item(item, len(items) + index)
+                    for index, item in enumerate(unresolved, start=1)
+                ),
                 "",
                 "Создать рецепт можно после заполнения или удаления этих позиций.",
             ]
@@ -958,31 +1002,39 @@ def _recipe_list_draft_keyboard(
     edit_token: str = "",
 ) -> InlineKeyboardMarkup:
     unresolved = unresolved or []
-    buttons = [
-        [
-            InlineKeyboardButton(
-                f"✏️ Заменить: {item.ingredient.title[:38]}",
-                callback_data=f"recipe_list_replace:{index}",
-            )
-        ]
+    resolved_buttons = [
+        InlineKeyboardButton(
+            f"✏️ {index + 1}. {_compact_button_title(item.ingredient.title)}",
+            callback_data=f"recipe_list_replace:{index}",
+        )
         for index, item in enumerate(items)
     ]
+    buttons = [resolved_buttons[index : index + 2] for index in range(0, len(resolved_buttons), 2)]
     for index, item in enumerate(unresolved):
+        position = len(items) + index + 1
         buttons.append(
             [
                 InlineKeyboardButton(
-                    f"🔎 Подобрать: {item.query[:18]}",
+                    f"🔎 {position}. Подобрать: {_compact_button_title(item.query, 24)}",
                     callback_data=f"recipe_list_resolve:{index}",
-                ),
+                )
+            ]
+        )
+        buttons.append(
+            [
                 InlineKeyboardButton("➕ Создать продукт", callback_data=f"recipe_list_create_food:{index}"),
-                InlineKeyboardButton("🗑️ Убрать ингредиент", callback_data=f"recipe_list_drop:{index}"),
+                InlineKeyboardButton("🗑️ Убрать", callback_data=f"recipe_list_drop:{index}"),
             ]
         )
     if not editing:
-        buttons.append([InlineKeyboardButton("🏷️ Изменить название", callback_data="recipe_list_rename:0")])
-    buttons.append(
-        [InlineKeyboardButton("📝 Добавить/изменить шаги", callback_data="recipe_list_steps:0")]
-    )
+        buttons.append(
+            [
+                InlineKeyboardButton("🏷️ Название", callback_data="recipe_list_rename:0"),
+                InlineKeyboardButton("📝 Шаги", callback_data="recipe_list_steps:0"),
+            ]
+        )
+    else:
+        buttons.append([InlineKeyboardButton("📝 Шаги", callback_data="recipe_list_steps:0")])
     if items and not unresolved:
         label = "✅ Сохранить изменения" if editing else "✅ Создать рецепт"
         callback = f"recipe_edit_confirm:{edit_token}" if editing else "recipe_list_confirm:0"
@@ -1663,13 +1715,13 @@ class TelegramRecipeBot:
         context.user_data.clear()
         if self.storage.active_group_for_user(update.effective_user.id) is None:
             await update.effective_message.reply_text(
-                "Готов. Для синхронизации рецептов нужна группа.",
+                "👋 Добро пожаловать! Чтобы пользоваться рецептами, сначала создай группу или вступи в существующую.",
                 reply_markup=self._groups_keyboard(update.effective_user.id),
                 parse_mode=ParseMode.HTML,
             )
             return
         await update.effective_message.reply_text(
-            "Гото. Начни с «🍽️ Все рецепты»: там можно открыть, изменить, экспортировать и синхронизировать рецепты. Для поиска просто пришли текст.",
+            "👋 Добро пожаловать! Начни с «🍽️ Все рецепты»: там можно открыть, изменить, экспортировать и синхронизировать рецепты. Для поиска просто пришли текст.",
             reply_markup=self._main_keyboard(update.effective_user.id),
         )
         context.chat_data["reply_keyboard"] = "main"
@@ -3557,17 +3609,26 @@ class TelegramRecipeBot:
                 ordered.append(requested)
                 new_items.append(requested)
 
-        status = await update.effective_message.reply_text("Проверяю изменённые ингредиенты…")
+        source_items = [item for item in ordered if isinstance(item, ResolvedRecipeListItem)]
+        status = await update.effective_message.reply_text("Проверяю ингредиенты и КБЖУ…")
         try:
-            new_draft = (
-                await self.sync_engine.resolve_recipe_list_items(group_id, new_items)
-                if new_items
-                else None
+            source_hydration = self.sync_engine.hydrate_recipe_edit_source_items(
+                group_id,
+                source_account_key,
+                source_items,
             )
+            if new_items:
+                hydrated_source_items, new_draft = await asyncio.gather(
+                    source_hydration,
+                    self.sync_engine.resolve_recipe_list_items(group_id, new_items),
+                )
+            else:
+                hydrated_source_items = await source_hydration
+                new_draft = None
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe edit ingredient resolve failed")
             await status.edit_text(
-                f"Не удалось подобрать новые ингредиенты: {user_safe_error_message(exc)}",
+                f"Не удалось проверить ингредиенты: {user_safe_error_message(exc)}",
                 reply_markup=_recipe_edit_input_error_keyboard(edit_token),
             )
             return
@@ -3584,9 +3645,10 @@ class TelegramRecipeBot:
             )
         resolved_items: list[ResolvedRecipeListItem] = []
         unresolved_items: list[RecipeListItem] = []
+        hydrated_source_queue = deque(hydrated_source_items)
         for item in ordered:
             if isinstance(item, ResolvedRecipeListItem):
-                resolved_items.append(item)
+                resolved_items.append(hydrated_source_queue.popleft())
                 continue
             key = (normalize_title(item.query), item.grams)
             candidates = resolved_queues.get(key)

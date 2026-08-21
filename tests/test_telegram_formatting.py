@@ -59,6 +59,42 @@ def test_require_user_registers_any_new_telegram_user(tmp_path) -> None:
         storage.close()
 
 
+@pytest.mark.parametrize("with_group", [False, True])
+def test_start_uses_welcome_greeting_and_expected_keyboard(tmp_path, with_group: bool) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        user_id = 33
+        storage.register_user(user_id, "QA User")
+        if with_group:
+            storage.create_group(user_id, "QA")
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.admin_user_id = 11
+        reply_text = AsyncMock()
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=user_id, full_name="QA User"),
+            effective_message=SimpleNamespace(reply_text=reply_text),
+        )
+        context = SimpleNamespace(user_data={"stale": True}, chat_data={})
+
+        asyncio.run(bot.start(update, context))
+
+        message = reply_text.await_args.args[0]
+        assert message.startswith("👋 Добро пожаловать!")
+        assert "Гото." not in message
+        assert "Готов." not in message
+        assert context.user_data == {}
+        markup = reply_text.await_args.kwargs["reply_markup"]
+        if with_group:
+            assert hasattr(markup, "keyboard")
+            assert context.chat_data["reply_keyboard"] == "main"
+        else:
+            assert hasattr(markup, "inline_keyboard")
+            assert "reply_keyboard" not in context.chat_data
+    finally:
+        storage.close()
+
+
 def test_main_keyboard_shows_diary_only_to_admin() -> None:
     bot = object.__new__(TelegramRecipeBot)
     bot.admin_user_id = 11
@@ -700,10 +736,32 @@ def test_recipe_edit_parsing_preserves_unchanged_food_identity_and_orders_additi
             source="FatSecret",
         )
         resolve = AsyncMock(return_value=RecipeListDraft(items=[cheese], unresolved=[]))
+        hydrated_egg = ResolvedRecipeListItem(
+            requested_query="Яйцо",
+            grams=Decimal("150"),
+            ingredient=Ingredient(
+                id=source.recipe.ingredients[0].id,
+                recipe_id=source.recipe.id,
+                food_id=source.recipe.ingredients[0].food_id,
+                title="Яйцо",
+                portion_id=source.recipe.ingredients[0].portion_id,
+                amount=Decimal("1.5"),
+                portion_description=source.recipe.ingredients[0].portion_description,
+                grams=Decimal("150"),
+            ),
+            source="recipe-edit",
+            brand="Тестовый бренд",
+            energy_per_100g=Decimal("143"),
+            protein_per_100g=Decimal("13"),
+            fat_per_100g=Decimal("10"),
+            carbohydrate_per_100g=Decimal("1"),
+        )
+        hydrate_source = AsyncMock(return_value=[hydrated_egg])
         edit_recipe = AsyncMock()
         bot = object.__new__(TelegramRecipeBot)
         bot.storage = storage
         bot.sync_engine = SimpleNamespace(
+            hydrate_recipe_edit_source_items=hydrate_source,
             resolve_recipe_list_items=resolve,
             edit_recipe_from_list=edit_recipe,
         )
@@ -729,6 +787,9 @@ def test_recipe_edit_parsing_preserves_unchanged_food_identity_and_orders_additi
         assert draft[0].ingredient.portion_id == source.recipe.ingredients[0].portion_id
         assert draft[0].ingredient.amount == Decimal("1.5")
         assert draft[0].grams == Decimal("150")
+        assert draft[0].energy_per_100g == Decimal("143")
+        assert draft[0].protein_per_100g == Decimal("13")
+        assert "Яйцо (Тестовый бренд) | 100г: 143/13/10/1" in status.edit_text.await_args.args[0]
         assert context.user_data["recipe_list_portions"] == Decimal("3")
         assert context.user_data["recipe_list_steps"] == ["Запечь"]
         assert context.user_data["recipe_list_title"] == "Омлет"
@@ -740,6 +801,10 @@ def test_recipe_edit_parsing_preserves_unchanged_food_identity_and_orders_additi
         callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
         assert "recipe_edit_confirm:edit-token" in callbacks
         assert "recipe_edit_cancel:edit-token" in callbacks
+        hydrate_source.assert_awaited_once()
+        hydrated_args = hydrate_source.await_args.args
+        assert hydrated_args[:2] == (group.id, "tg11")
+        assert hydrated_args[2][0].ingredient.id == source.recipe.ingredients[0].id
         edit_recipe.assert_not_awaited()
     finally:
         storage.close()
