@@ -9,7 +9,10 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from fatsecret_bot.fatsecret_client import FatSecretActionError, FatSecretNotCustomFoodError
+from fatsecret_bot.fatsecret_client import (
+    FatSecretActionError,
+    FatSecretNotCustomFoodError,
+)
 from fatsecret_bot.models import (
     BarcodeLookupResult,
     CustomFoodDefinition,
@@ -23,12 +26,17 @@ from fatsecret_bot.models import (
 from fatsecret_bot.recipe_compare import recipe_fingerprint
 from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import (
+    COOKED_WEIGHT_DESCRIPTION_PREFIX,
     INGREDIENT_NORMALIZE_CONCURRENCY,
     FatSecretError,
     RecipeSyncEngine,
     ResolvedRecipeListItem,
     _custom_food_request_fingerprint,
+    _recipe_list_request_fingerprint,
     _sync_description,
+    cooked_weight_coefficient,
+    recipe_cooked_weight_from_description,
+    recipe_description_with_cooked_weight,
 )
 
 
@@ -2330,6 +2338,88 @@ def test_create_recipe_from_list_uses_last_sync_description(tmp_path) -> None:
         storage.close()
 
 
+def test_create_recipe_from_list_propagates_cooked_weight_without_rescaling_ingredients(
+    tmp_path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        engine = RecipeSyncEngine(storage, _device())
+        clients = {key: FakeCreateClient(key) for key in ("tg11", "tg22")}
+        engine._build_clients = lambda group_id=None: clients  # type: ignore[method-assign]
+        items = [
+            ResolvedRecipeListItem(
+                requested_query="Филе",
+                grams=Decimal("500"),
+                ingredient=Ingredient(
+                    "ingredient-1",
+                    "",
+                    "food-1",
+                    "Филе",
+                    "portion-1",
+                    Decimal("4.8"),
+                    "100г",
+                    grams=Decimal("480"),
+                ),
+                source="FatSecret",
+            ),
+            ResolvedRecipeListItem(
+                requested_query="Соус",
+                grams=Decimal("51"),
+                ingredient=Ingredient(
+                    "ingredient-2",
+                    "",
+                    "food-2",
+                    "Соус",
+                    "portion-2",
+                    Decimal("0.51"),
+                    "100г",
+                ),
+                source="FatSecret",
+            ),
+        ]
+
+        created = asyncio.run(
+            engine.create_recipe_from_list(
+                "group",
+                "Тест",
+                items,
+                updated_by=11,
+                cooked_weight_grams=Decimal("415"),
+            )
+        )
+        repeated = asyncio.run(
+            engine.create_recipe_from_list(
+                "group",
+                "Тест",
+                items,
+                updated_by=11,
+                cooked_weight_grams=Decimal("415.0"),
+            )
+        )
+
+        managed_line = (
+            "⚖️ Готовый вес: 415 г; вес ингредиентов: 551 г; коэффициент: 1.328. "
+            "Вес готовой порции × 1.328 = эквивалентный вес рецепта; "
+            "результат округлить до целых граммов."
+        )
+        assert created.recipe_id == repeated.recipe_id
+        for client in clients.values():
+            assert client.create_calls == 1
+            assert client.created_recipe is not None
+            assert client.created_recipe.description.startswith("Последняя синхронизация: ")
+            assert client.created_recipe.description.endswith(managed_line)
+            assert [ingredient.amount for ingredient in client.saved_ingredients] == [
+                Decimal("4.8"),
+                Decimal("0.51"),
+            ]
+            assert [ingredient.grams for ingredient in client.saved_ingredients] == [
+                Decimal("480"),
+                None,
+            ]
+    finally:
+        storage.close()
+
+
 def test_create_recipe_from_list_recovers_create_before_remote_id_journal_write(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -2388,6 +2478,138 @@ def test_sync_description_uses_configured_timezone() -> None:
     value = _sync_description(dt.datetime(2026, 6, 17, 12, 50, tzinfo=dt.UTC), timezone="Europe/Minsk")
 
     assert value == "Последняя синхронизация: 17.06.2026 15:50"
+
+
+@pytest.mark.parametrize(
+    ("raw_grams", "cooked_grams", "expected"),
+    [
+        (Decimal("551"), Decimal("415"), Decimal("1.328")),
+        (Decimal("415"), Decimal("551"), Decimal("0.753")),
+        (Decimal("415"), Decimal("415"), Decimal("1.000")),
+        (Decimal("2469"), Decimal("2000"), Decimal("1.235")),
+    ],
+)
+def test_cooked_weight_coefficient_uses_half_up_thousandths(
+    raw_grams: Decimal,
+    cooked_grams: Decimal,
+    expected: Decimal,
+) -> None:
+    assert cooked_weight_coefficient(raw_grams, cooked_grams) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_grams", "cooked_grams"),
+    [
+        (Decimal("0"), Decimal("415")),
+        (Decimal("-1"), Decimal("415")),
+        (Decimal("551"), Decimal("0")),
+        (Decimal("551"), Decimal("-1")),
+        (Decimal("NaN"), Decimal("415")),
+        (Decimal("551"), Decimal("Infinity")),
+    ],
+)
+def test_cooked_weight_coefficient_rejects_nonpositive_or_nonfinite_weights(
+    raw_grams: Decimal,
+    cooked_grams: Decimal,
+) -> None:
+    with pytest.raises(ValueError, match="positive finite Decimal"):
+        cooked_weight_coefficient(raw_grams, cooked_grams)
+
+
+def test_cooked_weight_description_parses_replaces_and_removes_only_exact_managed_lines() -> None:
+    expected = (
+        "⚖️ Готовый вес: 415 г; вес ингредиентов: 551 г; коэффициент: 1.328. "
+        "Вес готовой порции × 1.328 = эквивалентный вес рецепта; "
+        "результат округлить до целых граммов."
+    )
+    assert COOKED_WEIGHT_DESCRIPTION_PREFIX == "⚖️ Готовый вес:"
+    assert recipe_description_with_cooked_weight("", Decimal("551"), Decimal("415")) == expected
+    assert recipe_cooked_weight_from_description(f"Заметка\n{expected}") == Decimal("415")
+
+    replaced = recipe_description_with_cooked_weight(
+        f"До\r\n{expected}\r\nПосле",
+        Decimal("600"),
+        Decimal("500"),
+    )
+    replacement = (
+        "⚖️ Готовый вес: 500 г; вес ингредиентов: 600 г; коэффициент: 1.200. "
+        "Вес готовой порции × 1.200 = эквивалентный вес рецепта; "
+        "результат округлить до целых граммов."
+    )
+    assert replaced == f"До\r\n{replacement}\r\nПосле"
+    assert recipe_description_with_cooked_weight(replaced, Decimal("600"), None) == "До\r\nПосле"
+
+    duplicated = recipe_description_with_cooked_weight(
+        f"До\n{expected}\nМежду\n{expected}\nПосле",
+        Decimal("600"),
+        Decimal("500"),
+    )
+    assert duplicated == f"До\n{replacement}\nМежду\nПосле"
+    assert recipe_description_with_cooked_weight(
+        duplicated,
+        Decimal("600"),
+        None,
+    ) == "До\nМежду\nПосле"
+
+    human_line = expected.replace("коэффициент: 1.328", "коэффициент: 9.999")
+    assert recipe_cooked_weight_from_description(human_line) is None
+    assert recipe_description_with_cooked_weight(human_line, Decimal("551"), None) == human_line
+
+
+def test_recipe_list_fingerprint_distinguishes_cooked_weight_and_target_description() -> None:
+    ingredient = Ingredient(
+        "ingredient-1",
+        "",
+        "food-1",
+        "Филе",
+        "portion-1",
+        Decimal("5.51"),
+        "100г",
+        grams=Decimal("551"),
+    )
+    items = [
+        ResolvedRecipeListItem(
+            requested_query="Филе",
+            grams=Decimal("551"),
+            ingredient=ingredient,
+            source="FatSecret",
+        )
+    ]
+    first = _recipe_list_request_fingerprint(
+        "Тест",
+        Decimal("1"),
+        [],
+        items,
+        cooked_weight_grams=Decimal("415"),
+        target_description="Описание A",
+    )
+    same = _recipe_list_request_fingerprint(
+        "Тест",
+        Decimal("1"),
+        [],
+        items,
+        cooked_weight_grams=Decimal("415.0"),
+        target_description="Описание A",
+    )
+    changed_weight = _recipe_list_request_fingerprint(
+        "Тест",
+        Decimal("1"),
+        [],
+        items,
+        cooked_weight_grams=Decimal("416"),
+        target_description="Описание A",
+    )
+    changed_description = _recipe_list_request_fingerprint(
+        "Тест",
+        Decimal("1"),
+        [],
+        items,
+        cooked_weight_grams=Decimal("415"),
+        target_description="Описание B",
+    )
+
+    assert first == same
+    assert len({first, changed_weight, changed_description}) == 3
 
 
 def test_storage_next_available_recipe_title_skips_existing_titles(tmp_path) -> None:
@@ -3154,6 +3376,101 @@ def test_edit_recipe_from_list_is_noop_only_when_every_account_has_one_identical
         storage.close()
 
 
+def test_edit_recipe_from_list_propagates_and_removes_cooked_description_then_noops(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        ingredient = Ingredient(
+            "ingredient-egg",
+            "source-1",
+            "food-egg",
+            "Яйцо",
+            "51772",
+            Decimal("100"),
+            "г",
+            grams=Decimal("100"),
+        )
+        source_recipe = Recipe(
+            id="source-1",
+            title="Омлет",
+            description="Примечание",
+            portions=Decimal("1"),
+            ingredients=[ingredient],
+        )
+        target_recipe = copy.deepcopy(source_recipe)
+        target_recipe.id = "target-1"
+        target_recipe.ingredients[0].recipe_id = target_recipe.id
+        source = FakeCreateClient("tg11")
+        target = FakeCreateClient("tg22")
+        source.recipes[source_recipe.id] = source_recipe
+        target.recipes[target_recipe.id] = target_recipe
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": source,
+            "tg22": target,
+        }
+
+        asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                [_resolved_recipe_item(ingredient)],
+                updated_by=11,
+                portions=source_recipe.portions,
+                steps=[],
+                cooked_weight_grams=Decimal("80"),
+            )
+        )
+
+        for client in (source, target):
+            assert client.create_calls == 1
+            remote = next(iter(client.recipes.values()))
+            assert recipe_cooked_weight_from_description(remote.description) == Decimal("80")
+            assert remote.ingredients[0].amount == Decimal("100")
+            assert remote.ingredients[0].grams == Decimal("100")
+
+        cooked_source = next(iter(source.recipes.values()))
+        cooked_source_id = cooked_source.id
+        asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                cooked_source_id,
+                recipe_fingerprint(cooked_source).digest,
+                [_resolved_recipe_item(cooked_source.ingredients[0])],
+                updated_by=11,
+                portions=cooked_source.portions,
+                steps=[],
+            )
+        )
+
+        for client in (source, target):
+            assert client.create_calls == 2
+            remote = next(iter(client.recipes.values()))
+            assert remote.description == "Примечание"
+            assert recipe_cooked_weight_from_description(remote.description) is None
+
+        plain_source = next(iter(source.recipes.values()))
+        no_op = asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                plain_source.id,
+                recipe_fingerprint(plain_source).digest,
+                [_resolved_recipe_item(plain_source.ingredients[0])],
+                updated_by=11,
+                portions=plain_source.portions,
+                steps=[],
+            )
+        )
+
+        assert [result.message for result in no_op.results] == ["без изменений", "без изменений"]
+        assert [source.create_calls, target.create_calls] == [2, 2]
+    finally:
+        storage.close()
+
+
 def test_hydrated_raw_source_fingerprint_accepts_unchanged_normalized_edit_without_mutation(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -3448,6 +3765,7 @@ def test_edit_recipe_from_list_resumes_exact_journal_after_validated_source_was_
                     updated_by=11,
                     portions=Decimal("3"),
                     steps=["Взбить", "Запечь"],
+                    cooked_weight_grams=Decimal("80"),
                 )
             )
 
@@ -3461,6 +3779,7 @@ def test_edit_recipe_from_list_resumes_exact_journal_after_validated_source_was_
                 updated_by=11,
                 portions=Decimal("3"),
                 steps=["Взбить", "Запечь"],
+                cooked_weight_grams=Decimal("80"),
             )
         )
 
@@ -3471,6 +3790,7 @@ def test_edit_recipe_from_list_resumes_exact_journal_after_validated_source_was_
         assert stored is not None
         assert stored.portions == Decimal("3")
         assert stored.steps == ["Взбить", "Запечь"]
+        assert recipe_cooked_weight_from_description(stored.description) == Decimal("80")
     finally:
         storage.close()
 

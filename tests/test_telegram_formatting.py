@@ -13,7 +13,13 @@ import pytest
 from fatsecret_bot.models import Ingredient, Recipe, RemoteRecipeVariant
 from fatsecret_bot.recipe_compare import recipe_content_fingerprint, recipe_fingerprint
 from fatsecret_bot.storage import Storage
-from fatsecret_bot.sync import AccountSyncResult, RecipeCreateResult, RecipeListDraft, ResolvedRecipeListItem
+from fatsecret_bot.sync import (
+    AccountSyncResult,
+    RecipeCreateResult,
+    RecipeListDraft,
+    ResolvedRecipeListItem,
+    recipe_description_with_cooked_weight,
+)
 from fatsecret_bot.telegram_bot import (
     MAIN_ACTION_BY_LABEL,
     RECIPE_WARNING_RENDER_TASK_KEY,
@@ -519,17 +525,40 @@ def test_recipe_export_round_trips_through_real_import_parser_with_special_chara
     )
 
     payload = _recipe_export_payload(recipe)
-    portions, items, bad_lines, steps = _parse_recipe_list_payload(payload)
+    parsed = _parse_recipe_list_payload(payload)
 
     assert payload.startswith("Порций: 2.5\n")
     assert "Не экспортируется" not in payload
-    assert portions == Decimal("2.5")
-    assert bad_lines == []
-    assert [(item.query, item.grams) for item in items] == [
+    assert parsed.portions == Decimal("2.5")
+    assert parsed.cooked_weight_grams is None
+    assert parsed.bad_lines == []
+    assert [(item.query, item.grams) for item in parsed.items] == [
         ('Томаты <черри> & "соль"', Decimal("125.5")),
         ("Сыр 50%", Decimal("40")),
     ]
-    assert steps == ["Смешать <аккуратно>", "Подать & съесть"]
+    assert parsed.steps == ["Смешать <аккуратно>", "Подать & съесть"]
+
+
+def test_recipe_export_import_round_trip_includes_only_managed_cooked_weight() -> None:
+    recipe = Recipe(
+        id="recipe-1",
+        title="Запеканка",
+        portions=Decimal("2"),
+        description=recipe_description_with_cooked_weight(
+            "Пользовательское описание",
+            Decimal("500"),
+            Decimal("415"),
+        ),
+        ingredients=[_ingredient("curd", "Творог", "500")],
+    )
+
+    payload = _recipe_export_payload(recipe)
+    parsed = _parse_recipe_list_payload(payload)
+
+    assert payload.splitlines()[:3] == ["Порций: 2", "Готовый вес: 415", "Творог 500"]
+    assert "Пользовательское описание" not in payload
+    assert parsed.cooked_weight_grams == Decimal("415")
+    assert parsed.bad_lines == []
 
 
 def test_recipe_export_refuses_an_ingredient_without_a_resolvable_gram_weight() -> None:
@@ -598,11 +627,17 @@ def test_recipe_edit_renders_copyable_payload_and_defers_all_mutation(tmp_path) 
     try:
         source = _flow_variant(recipe_ref, "tg11", "111", grams="100", portions="2")
         source.recipe.steps = ["Взбить & запечь"]
+        source.recipe.description = recipe_description_with_cooked_weight(
+            "Обычное описание",
+            Decimal("100"),
+            Decimal("85"),
+        )
         raw_source = Recipe(
             id=source.recipe.id,
             title=source.recipe.title,
             group_id=source.recipe.group_id,
             portions=source.recipe.portions,
+            description=source.recipe.description,
             steps=list(source.recipe.steps),
             ingredients=[
                 Ingredient(
@@ -646,10 +681,12 @@ def test_recipe_edit_renders_copyable_payload_and_defers_all_mutation(tmp_path) 
         rendered = query.edit_message_text.await_args
         assert rendered.args[0].startswith("✏️ <b>Омлет</b>")
         assert "<pre>Порций: 2" in rendered.args[0]
+        assert "Готовый вес: 85" in rendered.args[0]
         assert "Взбить &amp; запечь" in rendered.args[0]
         assert "не изменяется" in rendered.args[0]
         assert context.user_data["mode"] == "recipe_edit_payload"
         assert context.user_data["recipe_edit_source_remote_id"] == "111"
+        assert context.user_data["recipe_list_cooked_weight"] == Decimal("85")
         assert "recipe_list_duplicate_id" not in context.user_data
         assert "recipe_list_duplicate_ref" not in context.user_data
         assert "recipe_list_replace_existing_id" not in context.user_data
@@ -705,6 +742,11 @@ def test_recipe_edit_parsing_preserves_unchanged_food_identity_and_orders_additi
         source = _flow_variant(recipe_ref, "tg11", "111", grams="100")
         source.recipe.ingredients.append(
             _ingredient("milk", "Молоко", "75")
+        )
+        source.recipe.description = recipe_description_with_cooked_weight(
+            "Обычное описание",
+            Decimal("175"),
+            Decimal("150"),
         )
         context.user_data.update(
             {
@@ -792,6 +834,7 @@ def test_recipe_edit_parsing_preserves_unchanged_food_identity_and_orders_additi
         assert "Яйцо (Тестовый бренд) | 100г: 143/13/10/1" in status.edit_text.await_args.args[0]
         assert context.user_data["recipe_list_portions"] == Decimal("3")
         assert context.user_data["recipe_list_steps"] == ["Запечь"]
+        assert context.user_data["recipe_list_cooked_weight"] is None
         assert context.user_data["recipe_list_title"] == "Омлет"
         assert context.user_data["mode"] == "recipe_edit_confirm"
         keyboard = status.edit_text.await_args.kwargs["reply_markup"]
@@ -859,6 +902,133 @@ def test_recipe_edit_invalid_payload_keeps_draft_and_defers_mutation(tmp_path) -
         storage.close()
 
 
+def _cooked_weight_draft_item() -> ResolvedRecipeListItem:
+    return ResolvedRecipeListItem(
+        requested_query="Яйцо",
+        grams=Decimal("500"),
+        ingredient=_ingredient("egg-weight", "Яйцо", "500"),
+        source="FatSecret",
+        energy_per_100g=Decimal("143"),
+        protein_per_100g=Decimal("13"),
+        fat_per_100g=Decimal("10"),
+        carbohydrate_per_100g=Decimal("1"),
+    )
+
+
+def test_cooked_weight_prompt_and_back_preserve_existing_draft_value() -> None:
+    item = _cooked_weight_draft_item()
+    context = SimpleNamespace(
+        user_data={
+            "recipe_list_title": "Омлет",
+            "recipe_list_draft": [item],
+            "recipe_list_unresolved": [],
+            "recipe_list_portions": Decimal("2"),
+            "recipe_list_steps": [],
+            "recipe_list_cooked_weight": Decimal("415"),
+            "mode": "recipe_list_confirm",
+        }
+    )
+    query = SimpleNamespace(edit_message_text=AsyncMock())
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._start_recipe_list_cooked_weight(query, context))
+
+    assert context.user_data["mode"] == "recipe_list_cooked_weight"
+    assert context.user_data["recipe_list_cooked_weight"] == Decimal("415")
+    assert "Сейчас: <b>415 г</b>" in query.edit_message_text.await_args.args[0]
+    back = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert back.callback_data == "recipe_list_back:0"
+
+    query.edit_message_text.reset_mock()
+    asyncio.run(bot._edit_recipe_list_draft(query, context))
+
+    assert context.user_data["mode"] == "recipe_list_confirm"
+    assert context.user_data["recipe_list_cooked_weight"] == Decimal("415")
+    assert "Готовый вес: 415 г" in query.edit_message_text.await_args.args[0]
+
+
+def test_cooked_weight_text_sets_updates_and_clears_without_sync_mutation() -> None:
+    item = _cooked_weight_draft_item()
+    context = SimpleNamespace(
+        user_data={
+            "recipe_list_title": "Омлет",
+            "recipe_list_draft": [item],
+            "recipe_list_unresolved": [],
+            "recipe_list_portions": Decimal("2"),
+            "recipe_list_steps": [],
+            "mode": "recipe_list_cooked_weight",
+        }
+    )
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    create_recipe = AsyncMock()
+    edit_recipe = AsyncMock()
+    bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = SimpleNamespace(
+        create_recipe_from_list=create_recipe,
+        edit_recipe_from_list=edit_recipe,
+    )
+
+    asyncio.run(bot._handle_recipe_list_cooked_weight(update, context, "415"))
+    assert context.user_data["recipe_list_cooked_weight"] == Decimal("415")
+    assert context.user_data["mode"] == "recipe_list_confirm"
+    assert "Коэффициент: 1.205" in message.reply_text.await_args.args[0]
+
+    context.user_data["mode"] = "recipe_list_cooked_weight"
+    asyncio.run(bot._handle_recipe_list_cooked_weight(update, context, "400,5 г"))
+    assert context.user_data["recipe_list_cooked_weight"] == Decimal("400.5")
+    assert "⚖️ Готовый вес: 400.5 г" in [
+        button.text
+        for row in message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+
+    context.user_data["mode"] = "recipe_list_cooked_weight"
+    asyncio.run(bot._handle_recipe_list_cooked_weight(update, context, "-"))
+    assert context.user_data["recipe_list_cooked_weight"] is None
+    assert "Готовый вес:" not in message.reply_text.await_args.args[0]
+    create_recipe.assert_not_awaited()
+    edit_recipe.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "не число", "415 кг"])
+def test_cooked_weight_text_rejects_invalid_input_without_changing_draft(value: str) -> None:
+    context = SimpleNamespace(
+        user_data={
+            "recipe_list_title": "Омлет",
+            "recipe_list_draft": [_cooked_weight_draft_item()],
+            "recipe_list_cooked_weight": Decimal("415"),
+            "mode": "recipe_list_cooked_weight",
+        }
+    )
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._handle_recipe_list_cooked_weight(update, context, value))
+
+    assert context.user_data["recipe_list_cooked_weight"] == Decimal("415")
+    assert context.user_data["mode"] == "recipe_list_cooked_weight"
+    assert "recipe_list_back:0" == (
+        message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+    )
+
+
+def test_on_text_dispatches_cooked_weight_mode() -> None:
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=11),
+        effective_message=SimpleNamespace(text="415 г"),
+    )
+    context = SimpleNamespace(user_data={"mode": "recipe_list_cooked_weight"})
+    bot = object.__new__(TelegramRecipeBot)
+    bot._require_user = AsyncMock(return_value=True)
+    bot._handle_recipe_list_cooked_weight = AsyncMock()
+
+    asyncio.run(bot.on_text(update, context))
+
+    bot._handle_recipe_list_cooked_weight.assert_awaited_once_with(update, context, "415 г")
+
+
 def test_recipe_edit_confirmation_passes_approved_source_and_refreshes_cache(tmp_path) -> None:
     storage, group, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
     try:
@@ -893,6 +1063,7 @@ def test_recipe_edit_confirmation_passes_approved_source_and_refreshes_cache(tmp
                 "recipe_list_unresolved": [],
                 "recipe_list_portions": Decimal("2"),
                 "recipe_list_steps": ["Запечь"],
+                "recipe_list_cooked_weight": Decimal("415"),
                 "mode": "recipe_edit_confirm",
             }
         )
@@ -920,6 +1091,7 @@ def test_recipe_edit_confirmation_passes_approved_source_and_refreshes_cache(tmp
             11,
             portions=Decimal("2"),
             steps=["Запечь"],
+            cooked_weight_grams=Decimal("415"),
         )
         assert "Изменения сохранены" in query.edit_message_text.await_args.args[0]
         assert context.chat_data["recipe_cache"] == [recipe_ref]
@@ -2129,6 +2301,7 @@ def test_recipe_list_create_refreshes_live_titles_and_ignores_reconciled_stale_r
                 "recipe_list_unresolved": [],
                 "recipe_list_portions": Decimal("1"),
                 "recipe_list_steps": [],
+                "recipe_list_cooked_weight": Decimal("415"),
             }
             self.chat_data: dict[str, object] = {}
 
@@ -2136,6 +2309,7 @@ def test_recipe_list_create_refreshes_live_titles_and_ignores_reconciled_stale_r
         def __init__(self, storage: Storage) -> None:
             self.storage = storage
             self.created_titles: list[str] = []
+            self.create_kwargs: dict[str, object] = {}
 
         async def load_remote_recipe_index(self, group_id: str) -> list[Recipe]:
             self.storage.reconcile_group_remote_recipes(group_id, {"tg11": set()})
@@ -2143,6 +2317,7 @@ def test_recipe_list_create_refreshes_live_titles_and_ignores_reconciled_stale_r
 
         async def create_recipe_from_list(self, group_id: str, title: str, items, updated_by: int, **kwargs):  # noqa: ANN001, ANN003
             self.created_titles.append(title)
+            self.create_kwargs = kwargs
             recipe_id = self.storage.create_recipe(title, "", Decimal("1"), 0, 0, updated_by, group_id)
             return RecipeCreateResult(recipe_id=recipe_id, results=[], title=title)
 
@@ -2159,6 +2334,7 @@ def test_recipe_list_create_refreshes_live_titles_and_ignores_reconciled_stale_r
         asyncio.run(TelegramRecipeBot._create_recipe_list_from_draft(bot, query, context, 11))
 
         assert bot.sync_engine.created_titles == ["Блины тонкие"]
+        assert bot.sync_engine.create_kwargs["cooked_weight_grams"] == Decimal("415")
         assert storage.get_recipe(stale_id) is None
         assert all("Рецепт с таким названием уже есть" not in message for message in query.messages)
     finally:

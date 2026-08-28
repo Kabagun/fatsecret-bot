@@ -7,17 +7,17 @@ import pytest
 from fatsecret_bot.models import CustomFoodDefinition, Ingredient
 from fatsecret_bot.sync import RecipeListItem, ResolvedRecipeListItem
 from fatsecret_bot.telegram_bot import (
-    _format_recipe_list_draft,
-    _format_custom_food_draft,
-    _format_custom_food_created,
-    _format_resolved_item,
-    _parse_recipe_list_lines,
-    _parse_recipe_list_payload,
-    _parse_recipe_steps,
-    _parse_custom_food_macros,
     _custom_food_barcode_keyboard,
     _custom_food_brand_keyboard,
     _custom_food_brand_suggestions_keyboard,
+    _format_custom_food_created,
+    _format_custom_food_draft,
+    _format_recipe_list_draft,
+    _format_resolved_item,
+    _parse_custom_food_macros,
+    _parse_recipe_list_lines,
+    _parse_recipe_list_payload,
+    _parse_recipe_steps,
     _recipe_list_candidate_keyboard,
     _recipe_list_draft_keyboard,
     _recipe_list_input_error_keyboard,
@@ -150,9 +150,10 @@ def test_parse_recipe_list_lines_reports_bad_lines() -> None:
 
 
 def test_parse_recipe_list_payload_splits_ingredients_and_steps() -> None:
-    portions, items, bad_lines, steps = _parse_recipe_list_payload(
+    parsed = _parse_recipe_list_payload(
         """
         Порций: 4
+        Готовый вес: 415,5 г
         Филе 300
         Куркума 5
 
@@ -164,13 +165,44 @@ def test_parse_recipe_list_payload_splits_ingredients_and_steps() -> None:
         """
     )
 
-    assert portions == Decimal("4")
-    assert bad_lines == []
-    assert [(item.query, item.grams) for item in items] == [
+    assert parsed.portions == Decimal("4")
+    assert parsed.cooked_weight_grams == Decimal("415.5")
+    assert parsed.bad_lines == []
+    assert [(item.query, item.grams) for item in parsed.items] == [
         ("Филе", Decimal("300")),
         ("Куркума", Decimal("5")),
     ]
-    assert steps == ["Нарезать филе", "Запечь", "Подать", "Лишнее"]
+    assert parsed.steps == ["Нарезать филе", "Запечь", "Подать", "Лишнее"]
+
+
+@pytest.mark.parametrize(
+    ("line", "expected_bad_lines"),
+    [
+        ("Готовый вес: 0", ["Готовый вес: 0"]),
+        ("Готовый вес: -10", ["Готовый вес: -10"]),
+        ("Готовый вес: много", ["Готовый вес: много"]),
+        (
+            "Готовый вес: 415\nГотовый вес: 400 г",
+            ["Готовый вес: 400 г"],
+        ),
+    ],
+)
+def test_parse_recipe_list_payload_rejects_invalid_or_duplicate_cooked_weight(
+    line: str,
+    expected_bad_lines: list[str],
+) -> None:
+    parsed = _parse_recipe_list_payload(f"Порций: 2\n{line}\nФиле 300")
+
+    assert parsed.bad_lines == expected_bad_lines
+
+
+def test_parse_recipe_list_payload_keeps_legacy_format_without_cooked_weight() -> None:
+    parsed = _parse_recipe_list_payload("Порций: 2\nФиле 300\nШаги:\nЗапечь")
+
+    assert parsed.portions == Decimal("2")
+    assert parsed.cooked_weight_grams is None
+    assert parsed.bad_lines == []
+    assert parsed.steps == ["Запечь"]
 
 
 def test_list_validation_errors_always_offer_visible_cancel() -> None:
@@ -183,7 +215,7 @@ def test_list_validation_errors_always_offer_visible_cancel() -> None:
 
 
 def test_parse_recipe_list_payload_requires_portions_separately() -> None:
-    portions, items, bad_lines, steps = _parse_recipe_list_payload(
+    parsed = _parse_recipe_list_payload(
         """
         Филе 300
         Шаги:
@@ -191,10 +223,10 @@ def test_parse_recipe_list_payload_requires_portions_separately() -> None:
         """
     )
 
-    assert portions is None
-    assert bad_lines == []
-    assert [(item.query, item.grams) for item in items] == [("Филе", Decimal("300"))]
-    assert steps == ["Запечь"]
+    assert parsed.portions is None
+    assert parsed.bad_lines == []
+    assert [(item.query, item.grams) for item in parsed.items] == [("Филе", Decimal("300"))]
+    assert parsed.steps == ["Запечь"]
 
 
 def test_format_resolved_item_shows_macros_per_100g_and_brand() -> None:
@@ -324,6 +356,49 @@ def test_format_recipe_list_draft_includes_steps() -> None:
     assert "<b>Шаги</b>" in text
     assert "1. Смешать" in text
     assert "2. Запечь" in text
+
+
+def test_recipe_list_draft_shows_cooked_weight_math_without_rescaling_nutrition() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="филе",
+        grams=Decimal("300"),
+        ingredient=Ingredient(
+            id="i1",
+            recipe_id="",
+            food_id="f1",
+            title="Куриное Филе",
+            portion_id="p1",
+            amount=Decimal("300"),
+            portion_description="г",
+        ),
+        source="FatSecret",
+        energy_per_100g=Decimal("100"),
+        protein_per_100g=Decimal("20"),
+        fat_per_100g=Decimal("5"),
+        carbohydrate_per_100g=Decimal("0"),
+    )
+    unresolved = [RecipeListItem(query="Маринад", grams=Decimal("200"))]
+
+    text = _format_recipe_list_draft(
+        "Тест",
+        [item],
+        unresolved=unresolved,
+        cooked_weight_grams=Decimal("400"),
+    )
+
+    assert "Вес ингредиентов: 500 г" in text
+    assert "Готовый вес: 400 г" in text
+    assert "Коэффициент: 1.250" in text
+    assert "Пока учтено ккал/Б/Ж/У: 300/60/15/0" in text
+    assert "масса: 300г" in text
+    lines = text.splitlines()
+    assert lines[2:5] == [
+        "Вес ингредиентов: 500 г",
+        "Готовый вес: 400 г",
+        "Коэффициент: 1.250",
+    ]
+    assert lines[5].startswith("Пока учтено ккал/Б/Ж/У:")
+    assert lines[6].startswith("⚠️ Расчёт неполный:")
 
 
 def test_recipe_list_draft_labels_partial_totals_when_macros_are_missing() -> None:
@@ -462,3 +537,17 @@ def test_recipe_list_draft_keyboard_packs_resolved_items_two_per_row() -> None:
     ]
     assert all(len(button.text) <= 24 for row in rows[:3] for button in row)
     assert [button.text for button in rows[3]] == ["🏷️ Название", "📝 Шаги"]
+
+
+def test_recipe_list_draft_keyboard_labels_absent_and_present_cooked_weight() -> None:
+    absent = _recipe_list_draft_keyboard([])
+    present = _recipe_list_draft_keyboard([], cooked_weight_grams=Decimal("415"))
+
+    absent_buttons = [button for row in absent.inline_keyboard for button in row]
+    present_buttons = [button for row in present.inline_keyboard for button in row]
+    assert ("⚖️ Готовый вес", "recipe_list_cooked_weight:0") in [
+        (button.text, button.callback_data) for button in absent_buttons
+    ]
+    assert ("⚖️ Готовый вес: 415 г", "recipe_list_cooked_weight:0") in [
+        (button.text, button.callback_data) for button in present_buttons
+    ]

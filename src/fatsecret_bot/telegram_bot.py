@@ -13,7 +13,13 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -25,7 +31,12 @@ from telegram.ext import (
     filters,
 )
 
-from .barcodes import BarcodeDecodeError, DecodedBarcode, decode_barcode_image, normalize_barcode
+from .barcodes import (
+    BarcodeDecodeError,
+    DecodedBarcode,
+    decode_barcode_image,
+    normalize_barcode,
+)
 from .fatsecret_client import user_safe_error_message
 from .models import (
     MAX_RECIPE_STEPS,
@@ -42,7 +53,13 @@ from .nutrition import custom_food_macro_error
 from .portions import grams_from_portion
 from .recipe_compare import recipe_fingerprint
 from .storage import GroupMemberLimitError, Storage, normalize_title
-from .sync import RecipeListItem, RecipeSyncEngine, ResolvedRecipeListItem
+from .sync import (
+    RecipeListItem,
+    RecipeSyncEngine,
+    ResolvedRecipeListItem,
+    cooked_weight_coefficient,
+    recipe_cooked_weight_from_description,
+)
 
 logger = logging.getLogger(__name__)
 RECIPES_PAGE_SIZE = 8
@@ -98,6 +115,15 @@ RECIPE_LIST_PORTIONS_RE = re.compile(
     r"^\s*(?:порц(?:ий|ии|ия)?|servings?)\s*:?\s*(?P<portions>\d+(?:[,.]\d+)?)\s*$",
     re.IGNORECASE,
 )
+RECIPE_LIST_COOKED_WEIGHT_RE = re.compile(
+    r"^\s*готовый\s+вес\s*:\s*(?P<grams>\d+(?:[,.]\d+)?)\s*г?\s*$",
+    re.IGNORECASE,
+)
+RECIPE_LIST_COOKED_WEIGHT_PREFIX_RE = re.compile(r"^\s*готовый\s+вес\s*:", re.IGNORECASE)
+RECIPE_LIST_COOKED_WEIGHT_INPUT_RE = re.compile(
+    r"^\s*(?P<grams>\d+(?:[,.]\d+)?)\s*г?\s*$",
+    re.IGNORECASE,
+)
 RECIPE_STEPS_HEADER_RE = re.compile(r"^\s*(?:шаги|приготовление|способ приготовления)\s*:?\s*(.*)$", re.IGNORECASE)
 RECIPE_STEP_PREFIX_RE = re.compile(r"^\s*(?:\d+[\).]\s*|[-*]\s*)?(?P<step>.+?)\s*$")
 
@@ -125,6 +151,15 @@ DIARY_RANGE_RE = re.compile(
     re.IGNORECASE,
 )
 CUSTOM_FOOD_NUMBER_RE = re.compile(r"(?<!\w)[+-]?\d+(?:[,.]\d+)?(?!\w)")
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedRecipeListPayload:
+    portions: Decimal | None
+    items: list[RecipeListItem]
+    bad_lines: list[str]
+    steps: list[str]
+    cooked_weight_grams: Decimal | None
 
 
 def _parse_diary_date(value: str, today: dt.date | None = None) -> dt.date:
@@ -205,7 +240,11 @@ def _recipe_export_payload(recipe: Recipe) -> str:
         raise ValueError(f"Не удалось определить массу в граммах: {names}.")
     if not ingredient_lines:
         raise ValueError("В рецепте нет ингредиентов для экспорта.")
-    lines = [f"Порций: {_format_decimal_plain(recipe.portions)}", *ingredient_lines]
+    lines = [f"Порций: {_format_decimal_plain(recipe.portions)}"]
+    cooked_weight_grams = recipe_cooked_weight_from_description(recipe.description)
+    if cooked_weight_grams is not None:
+        lines.append(f"Готовый вес: {_format_decimal_plain(cooked_weight_grams)}")
+    lines.extend(ingredient_lines)
     steps = [step.strip() for step in recipe.steps if step.strip()]
     if steps:
         lines.extend(["", "Шаги:"])
@@ -814,9 +853,12 @@ def _clean_recipe_step(line: str) -> str:
     return match.group("step").strip() if match else line.strip()
 
 
-def _parse_recipe_list_payload(text: str) -> tuple[Decimal | None, list[RecipeListItem], list[str], list[str]]:
+def _parse_recipe_list_payload(text: str) -> _ParsedRecipeListPayload:
     portions: Decimal | None = None
+    cooked_weight_grams: Decimal | None = None
+    cooked_weight_seen = False
     ingredient_lines: list[str] = []
+    bad_lines: list[str] = []
     step_lines: list[str] = []
     in_steps = False
     for raw_line in text.splitlines():
@@ -835,6 +877,22 @@ def _parse_recipe_list_payload(text: str) -> tuple[Decimal | None, list[RecipeLi
                 continue
             ingredient_lines.append(line)
             continue
+        cooked_weight_match = RECIPE_LIST_COOKED_WEIGHT_RE.match(line)
+        if RECIPE_LIST_COOKED_WEIGHT_PREFIX_RE.match(line) is not None:
+            if in_steps or cooked_weight_match is None or cooked_weight_seen:
+                bad_lines.append(line)
+                continue
+            cooked_weight_seen = True
+            try:
+                parsed_cooked_weight = Decimal(cooked_weight_match.group("grams").replace(",", "."))
+            except InvalidOperation:
+                bad_lines.append(line)
+                continue
+            if parsed_cooked_weight <= 0:
+                bad_lines.append(line)
+                continue
+            cooked_weight_grams = parsed_cooked_weight
+            continue
         header = RECIPE_STEPS_HEADER_RE.match(line)
         if header is not None:
             in_steps = True
@@ -848,8 +906,15 @@ def _parse_recipe_list_payload(text: str) -> tuple[Decimal | None, list[RecipeLi
                 step_lines.append(step)
         else:
             ingredient_lines.append(line)
-    items, bad_lines = _parse_recipe_list_lines("\n".join(ingredient_lines))
-    return portions, items, bad_lines, step_lines[:MAX_RECIPE_STEPS]
+    items, ingredient_bad_lines = _parse_recipe_list_lines("\n".join(ingredient_lines))
+    bad_lines.extend(ingredient_bad_lines)
+    return _ParsedRecipeListPayload(
+        portions=portions,
+        items=items,
+        bad_lines=bad_lines,
+        steps=step_lines[:MAX_RECIPE_STEPS],
+        cooked_weight_grams=cooked_weight_grams,
+    )
 
 
 def _parse_recipe_steps(text: str) -> list[str]:
@@ -930,6 +995,7 @@ def _format_recipe_list_draft(
     steps: list[str] | None = None,
     unresolved: list[RecipeListItem] | None = None,
     portions: Decimal = Decimal("1"),
+    cooked_weight_grams: Decimal | None = None,
 ) -> str:
     energy = _sum_known_macros([_scaled_macro(item.energy_per_100g, item.grams) for item in items])
     protein = _sum_known_macros([_scaled_macro(item.protein_per_100g, item.grams) for item in items])
@@ -959,6 +1025,23 @@ def _format_recipe_list_draft(
         "",
         "<b>Ингредиенты</b>",
     ]
+    totals_line_index = 2
+    if cooked_weight_grams is not None:
+        raw_weight_grams = sum(
+            (item.grams for item in [*items, *unresolved]),
+            Decimal("0"),
+        )
+        coefficient = (
+            cooked_weight_coefficient(raw_weight_grams, cooked_weight_grams)
+            if raw_weight_grams > 0
+            else None
+        )
+        lines[2:2] = [
+            f"Вес ингредиентов: {_format_decimal(raw_weight_grams)} г",
+            f"Готовый вес: {_format_decimal(cooked_weight_grams)} г",
+            f"Коэффициент: {coefficient:.3f}" if coefficient is not None else "Коэффициент: -",
+        ]
+        totals_line_index += 3
     if not totals_complete:
         reasons: list[str] = []
         if unresolved:
@@ -971,7 +1054,7 @@ def _format_recipe_list_draft(
             if len(missing_macros) > 3:
                 missing_titles += f" и ещё {len(missing_macros) - 3}"
             reasons.append(f"нет полного КБЖУ: {missing_titles}")
-        lines.insert(3, f"⚠️ Расчёт неполный: {'; '.join(reasons)}.")
+        lines.insert(totals_line_index + 1, f"⚠️ Расчёт неполный: {'; '.join(reasons)}.")
     lines.extend(_format_resolved_item(item, index) for index, item in enumerate(items, start=1))
     if not items:
         lines.append("Пока нет подобранных ингредиентов.")
@@ -1000,6 +1083,7 @@ def _recipe_list_draft_keyboard(
     *,
     editing: bool = False,
     edit_token: str = "",
+    cooked_weight_grams: Decimal | None = None,
 ) -> InlineKeyboardMarkup:
     unresolved = unresolved or []
     resolved_buttons = [
@@ -1035,6 +1119,12 @@ def _recipe_list_draft_keyboard(
         )
     else:
         buttons.append([InlineKeyboardButton("📝 Шаги", callback_data="recipe_list_steps:0")])
+    cooked_weight_label = "⚖️ Готовый вес"
+    if cooked_weight_grams is not None:
+        cooked_weight_label += f": {_format_decimal(cooked_weight_grams)} г"
+    buttons.append(
+        [InlineKeyboardButton(cooked_weight_label, callback_data="recipe_list_cooked_weight:0")]
+    )
     if items and not unresolved:
         label = "✅ Сохранить изменения" if editing else "✅ Создать рецепт"
         callback = f"recipe_edit_confirm:{edit_token}" if editing else "recipe_list_confirm:0"
@@ -2606,6 +2696,8 @@ class TelegramRecipeBot:
             await self._start_recipe_list_rename(query, context)
         elif action == "recipe_list_steps":
             await self._start_recipe_list_steps(query, context)
+        elif action == "recipe_list_cooked_weight":
+            await self._start_recipe_list_cooked_weight(query, context)
         elif action == "recipe_list_back":
             await self._edit_recipe_list_draft(query, context)
         elif action == "recipe_list_cancel":
@@ -3398,6 +3490,7 @@ class TelegramRecipeBot:
             "recipe_list_unresolved",
             "recipe_list_portions",
             "recipe_list_steps",
+            "recipe_list_cooked_weight",
             "recipe_list_replace_index",
             "recipe_list_replace_kind",
             "recipe_list_replace_query",
@@ -3477,6 +3570,7 @@ class TelegramRecipeBot:
                 "recipe_edit_source_recipe": recipe,
                 "recipe_edit_variant_index": variant_index,
                 "recipe_edit_token": edit_token,
+                "recipe_list_cooked_weight": recipe_cooked_weight_from_description(recipe.description),
             }
         )
         title = recipe.title.strip() or "Рецепт"
@@ -3565,23 +3659,29 @@ class TelegramRecipeBot:
             self._clear_recipe_edit_state(context)
             await update.effective_message.reply_text("Рецепт для изменения потерян. Открой его заново.")
             return
-        portions, requested_items, bad_lines, steps = _parse_recipe_list_payload(text)
-        if bad_lines:
-            lines = "\n".join(f"- {html.escape(line)}" for line in bad_lines)
+        parsed = _parse_recipe_list_payload(text)
+        if parsed.bad_lines:
+            lines = "\n".join(f"- {html.escape(line)}" for line in parsed.bad_lines)
+            cooked_weight_hint = (
+                "\nСтрока готового веса должна быть единственной, стоять до «Шаги» и содержать "
+                "положительное число, например: <code>Готовый вес: 415</code>."
+                if any(RECIPE_LIST_COOKED_WEIGHT_PREFIX_RE.match(line) for line in parsed.bad_lines)
+                else ""
+            )
             await update.effective_message.reply_text(
                 "Эти строки не удалось разобрать:\n"
-                f"{lines}\n\nВ каждой строке нужны название и масса в граммах.",
+                f"{lines}{cooked_weight_hint}\n\nВ каждой строке ингредиента нужны название и масса в граммах.",
                 reply_markup=_recipe_edit_input_error_keyboard(edit_token),
                 parse_mode=ParseMode.HTML,
             )
             return
-        if not requested_items:
+        if not parsed.items:
             await update.effective_message.reply_text(
                 "В рецепте должен остать хотя бы один ингредиент.",
                 reply_markup=_recipe_edit_input_error_keyboard(edit_token),
             )
             return
-        if portions is None:
+        if parsed.portions is None:
             await update.effective_message.reply_text(
                 "Добавь первой строкой количество порций, например: <code>Порций: 4</code>",
                 reply_markup=_recipe_edit_input_error_keyboard(edit_token),
@@ -3594,7 +3694,7 @@ class TelegramRecipeBot:
             source_by_title.setdefault(normalize_title(ingredient.title), deque()).append(ingredient)
         ordered: list[ResolvedRecipeListItem | RecipeListItem] = []
         new_items: list[RecipeListItem] = []
-        for requested in requested_items:
+        for requested in parsed.items:
             matches = source_by_title.get(normalize_title(requested.query))
             if matches:
                 ordered.append(
@@ -3662,17 +3762,26 @@ class TelegramRecipeBot:
 
         context.user_data["recipe_list_draft"] = resolved_items
         context.user_data["recipe_list_unresolved"] = unresolved_items
-        context.user_data["recipe_list_portions"] = portions
-        context.user_data["recipe_list_steps"] = steps
+        context.user_data["recipe_list_portions"] = parsed.portions
+        context.user_data["recipe_list_steps"] = parsed.steps
+        context.user_data["recipe_list_cooked_weight"] = parsed.cooked_weight_grams
         context.user_data["mode"] = "recipe_edit_confirm"
         await status.edit_text(
-            _format_recipe_list_draft(source_recipe.title, resolved_items, steps, unresolved_items, portions),
+            _format_recipe_list_draft(
+                source_recipe.title,
+                resolved_items,
+                parsed.steps,
+                unresolved_items,
+                parsed.portions,
+                parsed.cooked_weight_grams,
+            ),
             reply_markup=_recipe_list_draft_keyboard(
                 resolved_items,
-                steps,
+                parsed.steps,
                 unresolved_items,
                 editing=True,
                 edit_token=edit_token,
+                cooked_weight_grams=parsed.cooked_weight_grams,
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -3702,6 +3811,7 @@ class TelegramRecipeBot:
         unresolved = context.user_data.get("recipe_list_unresolved")
         portions = context.user_data.get("recipe_list_portions")
         steps = context.user_data.get("recipe_list_steps")
+        cooked_weight_grams = context.user_data.get("recipe_list_cooked_weight")
         if (
             not group_id
             or not source_account_key
@@ -3723,6 +3833,9 @@ class TelegramRecipeBot:
                     unresolved,
                     editing=True,
                     edit_token=edit_token,
+                    cooked_weight_grams=(
+                        cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+                    ),
                 ),
             )
             return
@@ -3735,6 +3848,9 @@ class TelegramRecipeBot:
                     unresolved,
                     editing=True,
                     edit_token=edit_token,
+                    cooked_weight_grams=(
+                        cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+                    ),
                 ),
             )
             return
@@ -3749,6 +3865,9 @@ class TelegramRecipeBot:
                 telegram_id,
                 portions=portions,
                 steps=steps,
+                cooked_weight_grams=(
+                    cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe edit failed")
@@ -4495,6 +4614,8 @@ class TelegramRecipeBot:
             await self._handle_recipe_rename(update, context, text)
         elif mode == "recipe_list_steps":
             await self._handle_recipe_list_steps(update, context, text)
+        elif mode == "recipe_list_cooked_weight":
+            await self._handle_recipe_list_cooked_weight(update, context, text)
         elif mode == "recipe_list_replace_query":
             await self._handle_recipe_list_replace_query(update, context, text)
         elif mode == "custom_food_title":
@@ -4565,20 +4686,32 @@ class TelegramRecipeBot:
             unresolved = context.user_data.get("recipe_list_unresolved")
             steps = context.user_data.get("recipe_list_steps")
             portions = context.user_data.get("recipe_list_portions")
+            cooked_weight_grams = context.user_data.get("recipe_list_cooked_weight")
             if title and isinstance(draft_items, list):
                 unresolved = unresolved if isinstance(unresolved, list) else []
                 steps = steps if isinstance(steps, list) else []
                 portions = portions if isinstance(portions, Decimal) else Decimal("1")
+                cooked_weight_grams = (
+                    cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+                )
                 editing = self._recipe_edit_is_active(context)
                 context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
                 await update.effective_message.reply_text(
-                    _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
+                    _format_recipe_list_draft(
+                        title,
+                        draft_items,
+                        steps,
+                        unresolved,
+                        portions,
+                        cooked_weight_grams,
+                    ),
                     reply_markup=_recipe_list_draft_keyboard(
                         draft_items,
                         steps,
                         unresolved,
                         editing=editing,
                         edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                        cooked_weight_grams=cooked_weight_grams,
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -5026,14 +5159,26 @@ class TelegramRecipeBot:
             steps = steps if isinstance(steps, list) else []
             portions = context.user_data.get("recipe_list_portions")
             portions = portions if isinstance(portions, Decimal) else Decimal("1")
+            cooked_weight_grams = context.user_data.get("recipe_list_cooked_weight")
+            cooked_weight_grams = (
+                cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+            )
             await status.edit_text(
-                _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
+                _format_recipe_list_draft(
+                    title,
+                    draft_items,
+                    steps,
+                    unresolved,
+                    portions,
+                    cooked_weight_grams,
+                ),
                 reply_markup=_recipe_list_draft_keyboard(
                     draft_items,
                     steps,
                     unresolved,
                     editing=editing,
                     edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                    cooked_weight_grams=cooked_weight_grams,
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -5336,9 +5481,11 @@ class TelegramRecipeBot:
         await update.effective_message.reply_text(
             "Пришли ингредиенты списком. Последнее число в строке считаю граммами.\n"
             "Первой строкой обязательно укажи количество порций: <code>Порций: 4</code>.\n"
+            "Готовый вес можно указать следующей строкой: <code>Готовый вес: 415</code>.\n"
             "Шаги можно добавить в этом же сообщении после строки <b>Шаги:</b>.\n\n"
             "Например:\n"
             "Порций: 4\n"
+            "Готовый вес: 415\n"
             "Филе 100\n"
             "Теос греческий 200\n\n"
             "Шаги:\n"
@@ -5391,6 +5538,38 @@ class TelegramRecipeBot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _start_recipe_list_cooked_weight(
+        self,
+        query,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        draft_items = context.user_data.get("recipe_list_draft")
+        if not title or not isinstance(draft_items, list):
+            await query.edit_message_text(
+                "Черновик устарел. Начни создание заново из списка рецептов.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Все рецепты", callback_data="list:0")]]
+                ),
+            )
+            return
+        current = context.user_data.get("recipe_list_cooked_weight")
+        context.user_data["mode"] = "recipe_list_cooked_weight"
+        current_text = (
+            f"Сейчас: <b>{_format_decimal(current)} г</b>.\n\n"
+            if isinstance(current, Decimal)
+            else "Сейчас готовый вес не указан.\n\n"
+        )
+        await query.edit_message_text(
+            current_text
+            + "Пришли готовый вес одним положительным числом, например <code>415</code> "
+            "или <code>415,5 г</code>.\nЧтобы убрать готовый вес, пришли <code>-</code>.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
     async def _handle_recipe_list_rename(
         self,
         update: Update,
@@ -5415,14 +5594,26 @@ class TelegramRecipeBot:
         unresolved = unresolved if isinstance(unresolved, list) else []
         portions = context.user_data.get("recipe_list_portions")
         portions = portions if isinstance(portions, Decimal) else Decimal("1")
+        cooked_weight_grams = context.user_data.get("recipe_list_cooked_weight")
+        cooked_weight_grams = (
+            cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+        )
         await update.effective_message.reply_text(
-            _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
+            _format_recipe_list_draft(
+                title,
+                draft_items,
+                steps,
+                unresolved,
+                portions,
+                cooked_weight_grams,
+            ),
             reply_markup=_recipe_list_draft_keyboard(
                 draft_items,
                 steps,
                 unresolved,
                 editing=editing,
                 edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                cooked_weight_grams=cooked_weight_grams,
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -5447,14 +5638,99 @@ class TelegramRecipeBot:
         unresolved = unresolved if isinstance(unresolved, list) else []
         portions = context.user_data.get("recipe_list_portions")
         portions = portions if isinstance(portions, Decimal) else Decimal("1")
+        cooked_weight_grams = context.user_data.get("recipe_list_cooked_weight")
+        cooked_weight_grams = (
+            cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+        )
         await update.effective_message.reply_text(
-            _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
+            _format_recipe_list_draft(
+                title,
+                draft_items,
+                steps,
+                unresolved,
+                portions,
+                cooked_weight_grams,
+            ),
             reply_markup=_recipe_list_draft_keyboard(
                 draft_items,
                 steps,
                 unresolved,
                 editing=editing,
                 edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                cooked_weight_grams=cooked_weight_grams,
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _handle_recipe_list_cooked_weight(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        title = str(context.user_data.get("recipe_list_title") or "").strip()
+        draft_items = context.user_data.get("recipe_list_draft")
+        if not title or not isinstance(draft_items, list):
+            await update.effective_message.reply_text(
+                "Черновик устарел. Начни создание заново из списка рецептов."
+            )
+            return
+        value = text.strip()
+        cooked_weight_grams: Decimal | None
+        if value == "-":
+            cooked_weight_grams = None
+        else:
+            match = RECIPE_LIST_COOKED_WEIGHT_INPUT_RE.fullmatch(value)
+            if match is None:
+                await update.effective_message.reply_text(
+                    "Пришли одно положительное число в граммах, например <code>415</code> "
+                    "или <code>415,5 г</code>. Чтобы убрать вес, пришли <code>-</code>.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            try:
+                cooked_weight_grams = Decimal(match.group("grams").replace(",", "."))
+            except InvalidOperation:
+                cooked_weight_grams = Decimal("0")
+            if cooked_weight_grams <= 0:
+                await update.effective_message.reply_text(
+                    "Готовый вес должен быть больше нуля. Пришли другое число или <code>-</code>, "
+                    "чтобы убрать вес.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⬅️ К проверке", callback_data="recipe_list_back:0")]]
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+        context.user_data["recipe_list_cooked_weight"] = cooked_weight_grams
+        editing = self._recipe_edit_is_active(context)
+        context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
+        steps = context.user_data.get("recipe_list_steps")
+        steps = steps if isinstance(steps, list) else []
+        unresolved = context.user_data.get("recipe_list_unresolved")
+        unresolved = unresolved if isinstance(unresolved, list) else []
+        portions = context.user_data.get("recipe_list_portions")
+        portions = portions if isinstance(portions, Decimal) else Decimal("1")
+        await update.effective_message.reply_text(
+            _format_recipe_list_draft(
+                title,
+                draft_items,
+                steps,
+                unresolved,
+                portions,
+                cooked_weight_grams,
+            ),
+            reply_markup=_recipe_list_draft_keyboard(
+                draft_items,
+                steps,
+                unresolved,
+                editing=editing,
+                edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                cooked_weight_grams=cooked_weight_grams,
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -5467,24 +5743,30 @@ class TelegramRecipeBot:
             context.user_data.clear()
             await update.effective_message.reply_text("Контекст создания рецепта потерян. Начни заново из списка рецептов.")
             return
-        portions, items, bad_lines, steps = _parse_recipe_list_payload(text)
-        if bad_lines:
-            lines = "\n".join(f"- {html.escape(line)}" for line in bad_lines)
+        parsed = _parse_recipe_list_payload(text)
+        if parsed.bad_lines:
+            lines = "\n".join(f"- {html.escape(line)}" for line in parsed.bad_lines)
+            cooked_weight_hint = (
+                "\nСтрока готового веса должна быть единственной, стоять до «Шаги» и содержать "
+                "положительное число, например: <code>Готовый вес: 415</code>."
+                if any(RECIPE_LIST_COOKED_WEIGHT_PREFIX_RE.match(line) for line in parsed.bad_lines)
+                else ""
+            )
             await update.effective_message.reply_text(
                 "Эти строки я совсем не понимаю:\n"
-                f"{lines}\n\n"
+                f"{lines}{cooked_weight_hint}\n\n"
                 "Формат: название и последним токеном масса в граммах.",
                 reply_markup=_recipe_list_input_error_keyboard(),
                 parse_mode=ParseMode.HTML,
             )
             return
-        if not items:
+        if not parsed.items:
             await update.effective_message.reply_text(
                 "Не вижу ингредиентов. Пришли строки вида: Филе 100",
                 reply_markup=_recipe_list_input_error_keyboard(),
             )
             return
-        if portions is None:
+        if parsed.portions is None:
             await update.effective_message.reply_text(
                 "Не вижу количество порций. Добавь первой строкой, например:\n"
                 "<code>Порций: 4</code>",
@@ -5494,7 +5776,7 @@ class TelegramRecipeBot:
             return
         status = await update.effective_message.reply_text("Подбираю ингредиенты по твоим прошлым рецептам и FatSecret...")
         try:
-            draft = await self.sync_engine.resolve_recipe_list_items(str(group_id), items)
+            draft = await self.sync_engine.resolve_recipe_list_items(str(group_id), parsed.items)
         except Exception as exc:  # noqa: BLE001
             logger.exception("recipe list resolve failed")
             await status.edit_text(
@@ -5504,18 +5786,27 @@ class TelegramRecipeBot:
             return
         context.user_data["recipe_list_draft"] = draft.items
         context.user_data["recipe_list_unresolved"] = draft.unresolved
-        context.user_data["recipe_list_portions"] = portions
+        context.user_data["recipe_list_portions"] = parsed.portions
+        context.user_data["recipe_list_cooked_weight"] = parsed.cooked_weight_grams
         editing = self._recipe_edit_is_active(context)
         context.user_data["mode"] = "recipe_edit_confirm" if editing else "recipe_list_confirm"
-        context.user_data["recipe_list_steps"] = steps
+        context.user_data["recipe_list_steps"] = parsed.steps
         await status.edit_text(
-            _format_recipe_list_draft(title, draft.items, steps, draft.unresolved, portions),
+            _format_recipe_list_draft(
+                title,
+                draft.items,
+                parsed.steps,
+                draft.unresolved,
+                parsed.portions,
+                parsed.cooked_weight_grams,
+            ),
             reply_markup=_recipe_list_draft_keyboard(
                 draft.items,
-                steps,
+                parsed.steps,
                 draft.unresolved,
                 editing=editing,
                 edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                cooked_weight_grams=parsed.cooked_weight_grams,
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -5550,14 +5841,26 @@ class TelegramRecipeBot:
         unresolved = unresolved if isinstance(unresolved, list) else []
         portions = context.user_data.get("recipe_list_portions")
         portions = portions if isinstance(portions, Decimal) else Decimal("1")
+        cooked_weight_grams = context.user_data.get("recipe_list_cooked_weight")
+        cooked_weight_grams = (
+            cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+        )
         await query.edit_message_text(
-            _format_recipe_list_draft(title, draft_items, steps, unresolved, portions),
+            _format_recipe_list_draft(
+                title,
+                draft_items,
+                steps,
+                unresolved,
+                portions,
+                cooked_weight_grams,
+            ),
             reply_markup=_recipe_list_draft_keyboard(
                 draft_items,
                 steps,
                 unresolved,
                 editing=editing,
                 edit_token=str(context.user_data.get("recipe_edit_token") or "") if editing else "",
+                cooked_weight_grams=cooked_weight_grams,
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -5941,6 +6244,10 @@ class TelegramRecipeBot:
         unresolved = context.user_data.get("recipe_list_unresolved")
         portions = context.user_data.get("recipe_list_portions")
         steps = context.user_data.get("recipe_list_steps")
+        cooked_weight_grams = context.user_data.get("recipe_list_cooked_weight")
+        cooked_weight_grams = (
+            cooked_weight_grams if isinstance(cooked_weight_grams, Decimal) else None
+        )
         if not title or not group_id or not isinstance(draft_items, list):
             await query.edit_message_text("Черновик устарел. Начни создание заново из списка рецептов.")
             return
@@ -5952,7 +6259,12 @@ class TelegramRecipeBot:
         if unresolved:
             await query.edit_message_text(
                 "Сначала заполни или удали неизвестные ингредиенты.",
-                reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+                reply_markup=_recipe_list_draft_keyboard(
+                    draft_items,
+                    steps,
+                    unresolved,
+                    cooked_weight_grams=cooked_weight_grams,
+                ),
             )
             return
         replace_existing_id = context.user_data.get("recipe_list_replace_existing_id")
@@ -5968,7 +6280,12 @@ class TelegramRecipeBot:
         if not draft_items:
             await query.edit_message_text(
                 "В рецепте не осталось ингредиентов. Добавь хотя бы один ингредиент или отмени черновик.",
-                reply_markup=_recipe_list_draft_keyboard(draft_items, steps, unresolved),
+                reply_markup=_recipe_list_draft_keyboard(
+                    draft_items,
+                    steps,
+                    unresolved,
+                    cooked_weight_grams=cooked_weight_grams,
+                ),
             )
             return
         await query.edit_message_text("Проверяю актуальный список рецептов в FatSecret...")
@@ -6035,6 +6352,7 @@ class TelegramRecipeBot:
                 telegram_id,
                 portions=portions,
                 steps=steps,
+                cooked_weight_grams=cooked_weight_grams,
                 replace_existing_recipe_id=replace_existing_id,
                 replace_existing_recipe_ref=replace_existing_ref,
             )

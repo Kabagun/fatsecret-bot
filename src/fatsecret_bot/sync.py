@@ -9,7 +9,7 @@ import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -39,7 +39,11 @@ from .models import (
 )
 from .nutrition import custom_food_macro_error, estimated_macro_energy
 from .portions import grams_from_portion, is_explicit_weight_portion, portion_unit_size
-from .recipe_compare import recipe_content_fingerprint, recipe_fingerprint, recipe_fingerprint_diff
+from .recipe_compare import (
+    recipe_content_fingerprint,
+    recipe_fingerprint,
+    recipe_fingerprint_diff,
+)
 from .storage import Storage, normalize_title
 
 logger = logging.getLogger(__name__)
@@ -47,6 +51,122 @@ SEARCH_TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 INGREDIENT_NORMALIZE_CONCURRENCY = 6
 MAX_DIARY_COPY_DAYS = 7
 CUSTOM_FOOD_BRAND_CATALOG_TTL = dt.timedelta(hours=24)
+COOKED_WEIGHT_DESCRIPTION_PREFIX = "⚖️ Готовый вес:"
+_COOKED_WEIGHT_QUANTUM = Decimal("0.001")
+_COOKED_WEIGHT_DESCRIPTION_RE = re.compile(
+    rf"^{re.escape(COOKED_WEIGHT_DESCRIPTION_PREFIX)} "
+    r"(?P<cooked>[0-9]+(?:\.[0-9]+)?) г; "
+    r"вес ингредиентов: (?P<raw>[0-9]+(?:\.[0-9]+)?) г; "
+    r"коэффициент: (?P<coefficient>[0-9]+\.[0-9]{3})\. "
+    r"Вес готовой порции × (?P=coefficient) = эквивалентный вес рецепта; "
+    r"результат округлить до целых граммов\.$"
+)
+
+
+def _positive_weight(value: Decimal, label: str) -> Decimal:
+    try:
+        weight = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a positive finite Decimal") from exc
+    if not weight.is_finite() or weight <= 0:
+        raise ValueError(f"{label} must be a positive finite Decimal")
+    return weight
+
+
+def _description_decimal(value: Decimal) -> str:
+    text = format(value.normalize(), "f")
+    return "0" if text in {"", "-0"} else text
+
+
+def cooked_weight_coefficient(raw_grams: Decimal, cooked_grams: Decimal) -> Decimal:
+    """Return the raw-to-cooked weight coefficient rounded half up to three decimals."""
+    raw = _positive_weight(raw_grams, "raw_grams")
+    cooked = _positive_weight(cooked_grams, "cooked_grams")
+    return (raw / cooked).quantize(_COOKED_WEIGHT_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _managed_cooked_weight(match_text: str) -> Decimal | None:
+    match = _COOKED_WEIGHT_DESCRIPTION_RE.fullmatch(match_text)
+    if match is None:
+        return None
+    try:
+        cooked = _positive_weight(Decimal(match.group("cooked")), "cooked_grams")
+        raw = _positive_weight(Decimal(match.group("raw")), "raw_grams")
+        coefficient = Decimal(match.group("coefficient"))
+        expected_coefficient = cooked_weight_coefficient(raw, cooked)
+    except (InvalidOperation, ValueError):
+        return None
+    if coefficient != expected_coefficient:
+        return None
+    return cooked
+
+
+def recipe_cooked_weight_from_description(description: str) -> Decimal | None:
+    """Read cooked grams from the first exact bot-managed description line."""
+    for line in description.splitlines():
+        cooked = _managed_cooked_weight(line)
+        if cooked is not None:
+            return cooked
+    return None
+
+
+def _description_line_parts(description: str) -> list[tuple[str, str]]:
+    parts: list[tuple[str, str]] = []
+    for line in description.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        parts.append((content, line[len(content) :]))
+    if description and not parts:
+        parts.append((description, ""))
+    return parts
+
+
+def recipe_description_with_cooked_weight(
+    description: str,
+    raw_grams: Decimal,
+    cooked_grams: Decimal | None,
+) -> str:
+    """Replace, append, or remove only exact bot-managed cooked-weight lines."""
+    lines = _description_line_parts(description)
+    managed_indexes = {
+        index
+        for index, (content, _) in enumerate(lines)
+        if _managed_cooked_weight(content) is not None
+    }
+    if cooked_grams is None:
+        if not managed_indexes:
+            return description
+        retained = [
+            part for index, part in enumerate(lines) if index not in managed_indexes
+        ]
+        if retained and max(managed_indexes) == len(lines) - 1:
+            retained[-1] = (retained[-1][0], "")
+        return "".join(content + ending for content, ending in retained)
+
+    raw = _positive_weight(raw_grams, "raw_grams")
+    cooked = _positive_weight(cooked_grams, "cooked_grams")
+    coefficient = cooked_weight_coefficient(raw, cooked)
+    managed_line = (
+        f"{COOKED_WEIGHT_DESCRIPTION_PREFIX} {_description_decimal(cooked)} г; "
+        f"вес ингредиентов: {_description_decimal(raw)} г; "
+        f"коэффициент: {coefficient:.3f}. "
+        f"Вес готовой порции × {coefficient:.3f} = эквивалентный вес рецепта; "
+        "результат округлить до целых граммов."
+    )
+    if managed_indexes:
+        first_managed = min(managed_indexes)
+        replaced: list[tuple[str, str]] = []
+        for index, part in enumerate(lines):
+            if index == first_managed:
+                replaced.append((managed_line, part[1]))
+            elif index not in managed_indexes:
+                replaced.append(part)
+        return "".join(content + ending for content, ending in replaced)
+
+    if not description:
+        return managed_line
+    newline = "\r\n" if "\r\n" in description else "\n"
+    separator = "" if description.endswith(("\n", "\r")) else newline
+    return f"{description}{separator}{managed_line}"
 
 
 @dataclass(frozen=True)
@@ -171,6 +291,9 @@ def _recipe_list_request_fingerprint(
     steps: list[str],
     items: list[ResolvedRecipeListItem],
     operation_identity: dict[str, object] | None = None,
+    *,
+    cooked_weight_grams: Decimal | None = None,
+    target_description: str | None = None,
 ) -> str:
     """Return a stable semantic key that excludes generated row IDs and timestamps."""
     payload = {
@@ -193,6 +316,16 @@ def _recipe_list_request_fingerprint(
             }
             for item in items
         ],
+        "cooked_weight_grams": (
+            str(cooked_weight_grams.normalize())
+            if cooked_weight_grams is not None
+            else None
+        ),
+        "target_description": (
+            target_description
+            if target_description is not None
+            else {"mode": "generated_sync_timestamp"}
+        ),
     }
     if operation_identity is not None:
         payload["operation_identity"] = operation_identity
@@ -227,12 +360,13 @@ def _recipe_edit_candidate(
     items: list[ResolvedRecipeListItem],
     portions: Decimal,
     steps: list[str],
+    description: str,
 ) -> Recipe:
     """Build edited content while retaining approved source metadata and item identities."""
     return Recipe(
         id=recipe_id,
         title=source.title,
-        description=source.description,
+        description=description,
         portions=portions,
         prep_time=source.prep_time,
         cook_time=source.cook_time,
@@ -3041,6 +3175,7 @@ class RecipeSyncEngine:
         *,
         portions: Decimal,
         steps: list[str],
+        cooked_weight_grams: Decimal | None = None,
     ) -> RecipeCreateResult:
         """Safely replace one opened live recipe across every connected account."""
         if not source_account_key or not source_remote_id or not expected_source_content_digest:
@@ -3048,6 +3183,9 @@ class RecipeSyncEngine:
         ingredient_ids = [item.ingredient.id for item in items]
         if len(ingredient_ids) != len(set(ingredient_ids)):
             raise FatSecretError("В рецепте повторяются внутренние ID ингредиентов. Открой рецепт заново.")
+        raw_grams = sum((item.grams for item in items), Decimal(0))
+        if cooked_weight_grams is not None:
+            cooked_weight_coefficient(raw_grams, cooked_weight_grams)
 
         clients = self._build_clients(group_id)
         connected_account_keys = set(clients)
@@ -3099,12 +3237,19 @@ class RecipeSyncEngine:
                     ingredient_ids,
                     connected_account_keys,
                 )
+                target_description = recipe_description_with_cooked_weight(
+                    cached_source.description,
+                    raw_grams,
+                    cooked_weight_grams,
+                )
                 payload_fingerprint = _recipe_list_request_fingerprint(
                     cached_source.title,
                     portions,
                     list(steps),
                     items,
                     operation_identity,
+                    cooked_weight_grams=cooked_weight_grams,
+                    target_description=target_description,
                 )
                 recovery_run = self.storage.matching_recipe_list_run(
                     group_id,
@@ -3139,7 +3284,7 @@ class RecipeSyncEngine:
                 if (
                     normalize_title(str(recovery_run["requested_title"]))
                     != normalize_title(cached_source.title)
-                    or journal_recipe.description != cached_source.description
+                    or journal_recipe.description != target_description
                     or journal_recipe.prep_time != cached_source.prep_time
                     or journal_recipe.cook_time != cached_source.cook_time
                     or journal_recipe.portions != portions
@@ -3177,6 +3322,7 @@ class RecipeSyncEngine:
                     preserve_ingredient_ids=True,
                     operation_identity=operation_identity,
                     expected_account_keys=connected_account_keys,
+                    cooked_weight_grams=cooked_weight_grams,
                 )
 
             try:
@@ -3234,6 +3380,11 @@ class RecipeSyncEngine:
                 items,
                 portions,
                 steps,
+                recipe_description_with_cooked_weight(
+                    source_transport.description,
+                    raw_grams,
+                    cooked_weight_grams,
+                ),
             )
             expected_content_digest = recipe_content_fingerprint(edited_recipe).digest
             normalized_title = normalize_title(source_transport.title)
@@ -3357,6 +3508,7 @@ class RecipeSyncEngine:
             preserve_ingredient_ids=True,
             operation_identity=operation_identity,
             expected_account_keys=connected_account_keys,
+            cooked_weight_grams=cooked_weight_grams,
         )
 
     async def create_recipe_from_list(
@@ -3370,6 +3522,7 @@ class RecipeSyncEngine:
         steps: list[str] | None = None,
         replace_existing_recipe_id: str | None = None,
         replace_existing_recipe_ref: Recipe | None = None,
+        cooked_weight_grams: Decimal | None = None,
     ) -> RecipeCreateResult:
         """Create or replace a recipe through a durable, resumable multi-account journal."""
         return await self._create_recipe_from_list(
@@ -3381,6 +3534,7 @@ class RecipeSyncEngine:
             steps=steps,
             replace_existing_recipe_id=replace_existing_recipe_id,
             replace_existing_recipe_ref=replace_existing_recipe_ref,
+            cooked_weight_grams=cooked_weight_grams,
         )
 
     async def _create_recipe_from_list(
@@ -3398,6 +3552,7 @@ class RecipeSyncEngine:
         preserve_ingredient_ids: bool = False,
         operation_identity: dict[str, object] | None = None,
         expected_account_keys: set[str] | None = None,
+        cooked_weight_grams: Decimal | None = None,
     ) -> RecipeCreateResult:
         """Execute the shared durable create-and-replace implementation."""
         final_title = title.strip()
@@ -3422,12 +3577,26 @@ class RecipeSyncEngine:
                 raise FatSecretError("У рецепта для замены нет привязок к FatSecret.")
             create_title = self.storage.next_available_recipe_title(group_id, final_title, include_base=False)
         clean_steps = list(steps or [])
+        raw_grams = sum((item.grams for item in items), Decimal(0))
+        target_description = (
+            recipe_description_with_cooked_weight(
+                recipe_metadata.description,
+                raw_grams,
+                cooked_weight_grams,
+            )
+            if recipe_metadata is not None
+            else None
+        )
+        if cooked_weight_grams is not None and target_description is None:
+            cooked_weight_coefficient(raw_grams, cooked_weight_grams)
         payload_fingerprint = _recipe_list_request_fingerprint(
             final_title,
             portions,
             clean_steps,
             items,
             operation_identity,
+            cooked_weight_grams=cooked_weight_grams,
+            target_description=target_description,
         )
         run = self.storage.matching_recipe_list_run(group_id, final_title, payload_fingerprint)
         if run is not None and run["status"] == "completed":
@@ -3463,10 +3632,14 @@ class RecipeSyncEngine:
                 candidate = Recipe(
                     id=candidate_recipe_id,
                     title=create_title,
-                    description=(
-                        recipe_metadata.description
-                        if recipe_metadata is not None
-                        else _sync_description(timezone=self.timezone)
+                    description=recipe_description_with_cooked_weight(
+                        (
+                            recipe_metadata.description
+                            if recipe_metadata is not None
+                            else _sync_description(timezone=self.timezone)
+                        ),
+                        raw_grams,
+                        cooked_weight_grams,
                     ),
                     portions=portions,
                     prep_time=recipe_metadata.prep_time if recipe_metadata is not None else 0,
