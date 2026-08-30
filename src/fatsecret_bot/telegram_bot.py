@@ -5605,8 +5605,8 @@ class TelegramRecipeBot:
             "Филе 100\n"
             "Теос греческий 200\n\n"
             "Шаги:\n"
-            "1. Нарезать\n"
-            "2. Запечь",
+            "Нарезать\n"
+            "Запечь",
             parse_mode=ParseMode.HTML,
         )
 
