@@ -10,6 +10,7 @@ from fatsecret_bot.telegram_bot import (
     _custom_food_barcode_keyboard,
     _custom_food_brand_keyboard,
     _custom_food_brand_suggestions_keyboard,
+    _custom_food_confirm_keyboard,
     _format_custom_food_created,
     _format_custom_food_draft,
     _format_recipe_list_draft,
@@ -100,6 +101,7 @@ def test_custom_food_optional_steps_have_explicit_skip_buttons() -> None:
 
     assert ("⏭️ Без штрих-кода", "food_skip_barcode:0") in barcode_buttons
     assert ("⏭️ Без бренда", "food_skip_brand:0") in brand_buttons
+    assert all(callback != "food_cancel:0" for _, callback in barcode_buttons + brand_buttons)
 
 
 def test_custom_food_brand_suggestions_use_index_callbacks_and_keep_fallbacks() -> None:
@@ -117,6 +119,7 @@ def test_custom_food_brand_suggestions_use_index_callbacks_and_keep_fallbacks() 
     assert ("Санта Бремор", "food_brand_pick:token:1") in buttons
     assert ("Использовать введённое: санта", "food_brand_custom:token") in buttons
     assert ("⏭️ Без бренда", "food_skip_brand:0") in buttons
+    assert all(callback != "food_cancel:0" for _, callback in buttons)
 
 
 def test_parse_recipe_list_lines_uses_last_number_as_grams() -> None:
@@ -205,13 +208,8 @@ def test_parse_recipe_list_payload_keeps_legacy_format_without_cooked_weight() -
     assert parsed.steps == ["Запечь"]
 
 
-def test_list_validation_errors_always_offer_visible_cancel() -> None:
-    keyboard = _recipe_list_input_error_keyboard()
-
-    buttons = [button for row in keyboard.inline_keyboard for button in row]
-    assert [(button.text, button.callback_data) for button in buttons] == [
-        ("✖️ Отменить", "recipe_list_cancel:0")
-    ]
+def test_list_validation_errors_do_not_duplicate_reply_mode_cancel() -> None:
+    assert _recipe_list_input_error_keyboard() is None
 
 
 def test_parse_recipe_list_payload_requires_portions_separately() -> None:
@@ -321,6 +319,41 @@ def test_recipe_list_candidate_keyboard_shows_brand_in_button_text() -> None:
     flat_texts = [button.text for row in keyboard.inline_keyboard for button in row]
 
     assert "11. Филе Куриное (Витконпродукт)" in flat_texts
+
+
+def test_recipe_list_candidate_keyboard_keeps_objects_single_and_navigation_separate() -> None:
+    candidates = [
+        ResolvedRecipeListItem(
+            requested_query=f"ingredient {index}",
+            grams=Decimal("100"),
+            ingredient=Ingredient(
+                id=f"i{index}",
+                recipe_id="",
+                food_id=f"f{index}",
+                title=f"Ингредиент {index}",
+                portion_id="0",
+                amount=Decimal("1"),
+                portion_description="100г",
+            ),
+            source="FatSecret",
+        )
+        for index in range(2)
+    ]
+
+    rows = _recipe_list_candidate_keyboard(candidates, page=1, has_next=True).inline_keyboard
+
+    assert [len(row) for row in rows] == [1, 1, 2, 1]
+    assert [button.callback_data for row in rows[:2] for button in row] == [
+        "recipe_list_pick:0",
+        "recipe_list_pick:1",
+    ]
+    assert [button.callback_data for button in rows[-2]] == [
+        "recipe_list_cpage:0",
+        "recipe_list_cpage:2",
+    ]
+    assert [(button.text, button.callback_data) for button in rows[-1]] == [
+        ("⬅️ К проверке", "recipe_list_back:0")
+    ]
 
 
 def test_parse_recipe_steps_keeps_first_100_non_empty_lines() -> None:
@@ -499,17 +532,16 @@ def test_recipe_list_draft_shows_unresolved_items_and_blocks_create() -> None:
     assert "2. ? Приправа для фарша Green | масса: 3г" in text
     assert any(button.startswith("🔎 2. Подобрать: Приправа") for button in flat_buttons)
     assert "➕ Создать продукт" in flat_buttons
-    assert "🗑️ Убрать" in flat_buttons
+    assert "🗑️ Убрать ингредиент" in flat_buttons
     assert "✅ Создать рецепт" not in flat_buttons
     assert rows[0][0][1] == "recipe_list_replace:0"
     assert rows[1][0][1] == "recipe_list_resolve:0"
-    assert [callback for _, callback in rows[2]] == [
-        "recipe_list_create_food:0",
-        "recipe_list_drop:0",
-    ]
+    assert rows[2] == [("➕ Создать продукт", "recipe_list_create_food:0")]
+    assert rows[3] == [("🗑️ Убрать ингредиент", "recipe_list_drop:0")]
+    assert all(callback != "recipe_list_cancel:0" for row in rows for _, callback in row)
 
 
-def test_recipe_list_draft_keyboard_packs_resolved_items_two_per_row() -> None:
+def test_recipe_list_draft_keyboard_keeps_every_object_and_action_on_a_wide_row() -> None:
     items = [
         ResolvedRecipeListItem(
             requested_query=f"ingredient {index}",
@@ -531,12 +563,48 @@ def test_recipe_list_draft_keyboard_packs_resolved_items_two_per_row() -> None:
     keyboard = _recipe_list_draft_keyboard(items)
     rows = keyboard.inline_keyboard
 
-    assert [len(row) for row in rows[:3]] == [2, 2, 1]
-    assert [button.callback_data for row in rows[:3] for button in row] == [
+    assert [len(row) for row in rows] == [1] * len(rows)
+    assert [button.callback_data for row in rows[:5] for button in row] == [
         f"recipe_list_replace:{index}" for index in range(5)
     ]
-    assert all(len(button.text) <= 24 for row in rows[:3] for button in row)
-    assert [button.text for button in rows[3]] == ["🏷️ Название", "📝 Шаги"]
+    assert all(len(button.text) <= 24 for row in rows[:5] for button in row)
+    assert [button.text for button in rows[5]] == ["✏️ Изменить название"]
+    assert [button.text for button in rows[6]] == ["✏️ Изменить шаги"]
+    assert [(button.text, button.callback_data) for button in rows[-1]] == [
+        ("✅ Создать", "recipe_list_confirm:0")
+    ]
+
+
+def test_custom_food_and_recipe_edit_confirmation_use_exact_ctas_without_inline_cancel() -> None:
+    custom_rows = _custom_food_confirm_keyboard().inline_keyboard
+    assert [[(button.text, button.callback_data) for button in row] for row in custom_rows] == [
+        [("✅ Создать", "food_create:0")],
+        [("✏️ Изменить название", "food_change_title:0")],
+    ]
+
+    edit_rows = _recipe_list_draft_keyboard(
+        [
+            ResolvedRecipeListItem(
+                requested_query="ingredient",
+                grams=Decimal("100"),
+                ingredient=Ingredient(
+                    id="i1",
+                    recipe_id="",
+                    food_id="f1",
+                    title="Ингредиент",
+                    portion_id="0",
+                    amount=Decimal("1"),
+                    portion_description="100г",
+                ),
+                source="FatSecret",
+            )
+        ],
+        editing=True,
+        edit_token="edit-token",
+    ).inline_keyboard
+    edit_buttons = [(button.text, button.callback_data) for row in edit_rows for button in row]
+    assert ("✅ Сохранить", "recipe_edit_confirm:edit-token") in edit_buttons
+    assert all(callback != "recipe_edit_cancel:edit-token" for _, callback in edit_buttons)
 
 
 def test_recipe_list_draft_keyboard_labels_absent_and_present_cooked_weight() -> None:
