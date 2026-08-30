@@ -256,7 +256,7 @@ def _recipe_export_payload(recipe: Recipe) -> str:
     steps = [step.strip() for step in recipe.steps if step.strip()]
     if steps:
         lines.extend(["", "Шаги:"])
-        lines.extend(f"{index}. {step}" for index, step in enumerate(steps, start=1))
+        lines.extend(steps)
     return "\n".join(lines)
 
 

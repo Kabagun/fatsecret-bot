@@ -725,6 +725,9 @@ def test_recipe_export_round_trips_through_real_import_parser_with_special_chara
 
     assert payload.startswith("Порций: 2.5\n")
     assert "Не экспортируется" not in payload
+    assert "\nШаги:\nСмешать <аккуратно>\nПодать & съесть" in payload
+    assert "\n1. " not in payload
+    assert "\n2. " not in payload
     assert parsed.portions == Decimal("2.5")
     assert parsed.cooked_weight_grams is None
     assert parsed.bad_lines == []
@@ -879,6 +882,7 @@ def test_recipe_edit_renders_copyable_payload_and_defers_all_mutation(tmp_path) 
         assert "<pre>Порций: 2" in rendered.args[0]
         assert "Готовый вес: 85" in rendered.args[0]
         assert "Взбить &amp; запечь" in rendered.args[0]
+        assert "1. Взбить" not in rendered.args[0]
         assert "не изменяется" in rendered.args[0]
         assert context.user_data["mode"] == "recipe_edit_payload"
         assert context.user_data["recipe_edit_source_remote_id"] == "111"
