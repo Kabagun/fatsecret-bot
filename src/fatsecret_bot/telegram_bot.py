@@ -3799,7 +3799,11 @@ class TelegramRecipeBot:
             if new_items:
                 hydrated_source_items, new_draft = await asyncio.gather(
                     source_hydration,
-                    self.sync_engine.resolve_recipe_list_items(group_id, new_items),
+                    self.sync_engine.resolve_recipe_list_items(
+                        group_id,
+                        new_items,
+                        preferred_account_key=source_account_key,
+                    ),
                 )
             else:
                 hydrated_source_items = await source_hydration
@@ -6323,6 +6327,9 @@ class TelegramRecipeBot:
                 grams,
                 limit=RECIPE_LIST_CANDIDATES_PREFETCH_SIZE + 1,
                 offset=offset,
+                preferred_account_key=(
+                    str(context.user_data.get("recipe_edit_source_account_key") or "") or None
+                ),
             )
             if len(fetched) <= RECIPE_LIST_CANDIDATES_PREFETCH_SIZE:
                 exhausted = True

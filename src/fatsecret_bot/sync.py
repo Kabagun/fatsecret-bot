@@ -2274,13 +2274,25 @@ class RecipeSyncEngine:
         }
         return recipe
 
-    async def resolve_recipe_list_items(self, group_id: str, items: list[RecipeListItem]) -> RecipeListDraft:
-        """Resolve free-text ingredient lines using daily FatSecret usage cache and live search."""
+    async def resolve_recipe_list_items(
+        self,
+        group_id: str,
+        items: list[RecipeListItem],
+        *,
+        preferred_account_key: str | None = None,
+    ) -> RecipeListDraft:
+        """Resolve free-text ingredients, searching from the preferred account when supplied."""
         await self.ensure_food_usage_cache(group_id)
         resolved: list[ResolvedRecipeListItem] = []
         unresolved: list[str] = []
         for item in items:
-            candidates = await self.recipe_list_candidates(group_id, item.query, item.grams, limit=1)
+            candidates = await self.recipe_list_candidates(
+                group_id,
+                item.query,
+                item.grams,
+                limit=1,
+                preferred_account_key=preferred_account_key,
+            )
             if not candidates:
                 unresolved.append(item)
                 continue
@@ -2513,24 +2525,31 @@ class RecipeSyncEngine:
         grams: Decimal,
         limit: int = 6,
         offset: int = 0,
+        *,
+        preferred_account_key: str | None = None,
     ) -> list[ResolvedRecipeListItem]:
-        """Return replacement candidates for one free-text ingredient line."""
+        """Return candidates, searching from the preferred account when supplied."""
         limit = max(1, limit)
         offset = max(0, offset)
         local_candidates: list[ResolvedRecipeListItem] = []
         clients: dict[str, FatSecretClient] | None = None
 
-        def get_first_client() -> FatSecretClient:
+        def get_search_client() -> FatSecretClient:
             nonlocal clients
             if clients is None:
                 clients = self._build_clients(group_id)
+            if preferred_account_key is not None:
+                preferred_client = clients.get(preferred_account_key)
+                if preferred_client is None:
+                    raise FatSecretError("Аккаунт-источник больше не подключен.")
+                return preferred_client
             return next(iter(clients.values()))
 
         try:
             await self.ensure_food_usage_cache(group_id)
             first_client_for_cache: FatSecretClient | None = None
             try:
-                first_client_for_cache = get_first_client()
+                first_client_for_cache = get_search_client()
             except FatSecretError:
                 first_client_for_cache = None
             local_candidates = await self._cached_food_usage_candidates(
@@ -2541,7 +2560,7 @@ class RecipeSyncEngine:
             )
 
             try:
-                first_client = get_first_client()
+                first_client = get_search_client()
             except FatSecretError:
                 if local_candidates:
                     local_candidates.sort(key=lambda item: _resolved_candidate_rank(query, item))

@@ -1917,6 +1917,58 @@ def test_recipe_list_candidates_uses_remote_when_usage_cache_is_empty(tmp_path) 
         storage.close()
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        'Смесь сухая «для приготовления котлет»',
+        "Гэта мяса",
+    ],
+)
+def test_recipe_list_candidates_searches_selected_edit_account_for_personal_food(
+    tmp_path,
+    query: str,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        expected_title = 'Смесь Сухая «для приготовления котлет»'
+        engine = RecipeSyncEngine(storage, _device())
+        alphabetical_first = FakeSearchClient(
+            [],
+            search_results=[FoodSearchResult(food_id="wrong-account-food", title=query)],
+        )
+        selected_edit_account = FakeSearchClient(
+            [],
+            search_results=[
+                FoodSearchResult(
+                    food_id="116349871",
+                    title=expected_title,
+                    brand="Гэта Мяса",
+                    is_own=True,
+                )
+            ],
+        )
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "alphabetical-first": alphabetical_first,
+            "selected-edit-account": selected_edit_account,
+        }
+
+        candidates = asyncio.run(
+            engine.recipe_list_candidates(
+                "group",
+                query,
+                Decimal("100"),
+                limit=1,
+                preferred_account_key="selected-edit-account",
+            )
+        )
+
+        assert candidates[0].ingredient.food_id == "116349871"
+        assert candidates[0].ingredient.title == expected_title
+        assert candidates[0].brand == "Гэта Мяса"
+    finally:
+        storage.close()
+
+
 def test_recipe_list_candidates_ranks_remote_matches_before_raw_order(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:

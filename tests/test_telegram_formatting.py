@@ -1052,6 +1052,7 @@ def test_recipe_edit_parsing_preserves_unchanged_food_identity_and_orders_additi
         hydrated_args = hydrate_source.await_args.args
         assert hydrated_args[:2] == (group.id, "tg11")
         assert hydrated_args[2][0].ingredient.id == source.recipe.ingredients[0].id
+        assert resolve.await_args.kwargs == {"preferred_account_key": "tg11"}
         edit_recipe.assert_not_awaited()
     finally:
         storage.close()
@@ -1492,6 +1493,7 @@ def test_recipe_edit_replacement_error_keeps_mode_without_inline_cancel(tmp_path
         assert "recipe_list_cancel:0" not in callbacks
         assert callbacks == ["recipe_list_back:0"]
         assert context.chat_data["reply_keyboard"] == "mode"
+        assert bot.sync_engine.recipe_list_candidates.await_args.kwargs["preferred_account_key"] == "tg11"
     finally:
         storage.close()
 
