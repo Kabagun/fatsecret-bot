@@ -49,6 +49,7 @@ from .storage import Storage, normalize_title
 logger = logging.getLogger(__name__)
 SEARCH_TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 INGREDIENT_NORMALIZE_CONCURRENCY = 6
+RECIPE_LIST_SEARCH_CONCURRENCY = 4
 MAX_DIARY_COPY_DAYS = 7
 CUSTOM_FOOD_BRAND_CATALOG_TTL = dt.timedelta(hours=24)
 COOKED_WEIGHT_DESCRIPTION_PREFIX = "⚖️ Готовый вес:"
@@ -255,6 +256,7 @@ class ResolvedRecipeListItem:
     fat_per_100g: Decimal | None = None
     carbohydrate_per_100g: Decimal | None = None
     custom_food_ids: dict[str, str] = field(default_factory=dict)
+    food_source_account_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2012,6 +2014,142 @@ class RecipeSyncEngine:
             custom_food_ids=dict(created.food_ids),
         )
 
+    def _with_known_recipe_list_custom_food_mappings(
+        self,
+        items: list[ResolvedRecipeListItem],
+        account_keys: set[str],
+    ) -> list[ResolvedRecipeListItem]:
+        """Expand stored personal-food mappings without performing remote mutations."""
+        hydrated: list[ResolvedRecipeListItem] = []
+        for item in items:
+            mappings = {
+                account_key: food_id
+                for account_key, food_id in item.custom_food_ids.items()
+                if account_key in account_keys and food_id
+            }
+            source_account_key = item.food_source_account_key
+            if source_account_key is None and mappings:
+                source_account_key = next(
+                    (
+                        account_key
+                        for account_key, food_id in sorted(mappings.items())
+                        if food_id == item.ingredient.food_id
+                    ),
+                    sorted(mappings)[0],
+                )
+            if source_account_key is None:
+                hydrated.append(item)
+                continue
+            if source_account_key not in account_keys:
+                raise FatSecretError("Аккаунт личного продукта больше не подключен.")
+            mappings[source_account_key] = (
+                mappings.get(source_account_key) or item.ingredient.food_id
+            )
+            changed = True
+            while changed:
+                changed = False
+                for known_account_key, known_food_id in list(sorted(mappings.items())):
+                    for target_account_key in sorted(account_keys - set(mappings)):
+                        mapped_food_id = self.storage.custom_food_mapping(
+                            known_account_key,
+                            known_food_id,
+                            target_account_key,
+                        )
+                        if mapped_food_id is not None:
+                            mappings[target_account_key] = mapped_food_id
+                            changed = True
+            ingredient = item.ingredient
+            if account_keys and set(mappings) == account_keys:
+                ingredient = _ingredient_with_food_id(
+                    ingredient,
+                    mappings[sorted(account_keys)[0]],
+                )
+            hydrated.append(
+                replace(
+                    item,
+                    ingredient=ingredient,
+                    custom_food_ids=mappings,
+                )
+            )
+        return hydrated
+
+    async def _materialize_recipe_list_custom_foods(
+        self,
+        group_id: str,
+        items: list[ResolvedRecipeListItem],
+        initiated_by: int,
+        *,
+        expected_account_keys: set[str] | None = None,
+    ) -> None:
+        """Complete account-specific personal-food IDs before any recipe mutation."""
+        accounts = {
+            account.key: account
+            for account in self.storage.list_fatsecret_accounts(group_id)
+        }
+        account_keys = set(accounts)
+        if expected_account_keys is not None and account_keys != expected_account_keys:
+            raise FatSecretError(
+                "Набор FatSecret аккаунтов изменился после проверки; открой рецепт заново."
+            )
+        items[:] = self._with_known_recipe_list_custom_food_mappings(items, account_keys)
+        materialized: list[ResolvedRecipeListItem] = []
+        created_cache: dict[tuple[str, str], CustomFoodCreateResult] = {}
+        for item in items:
+            mappings = dict(item.custom_food_ids)
+            source_account_key = item.food_source_account_key
+            if source_account_key is None and mappings:
+                source_account_key = next(
+                    (
+                        account_key
+                        for account_key, food_id in sorted(mappings.items())
+                        if food_id == item.ingredient.food_id
+                    ),
+                    sorted(mappings)[0],
+                )
+            if source_account_key is None:
+                materialized.append(item)
+                continue
+            if source_account_key not in accounts:
+                raise FatSecretError("Аккаунт личного продукта больше не подключен.")
+
+            source_food_id = mappings.get(source_account_key) or item.ingredient.food_id
+            if set(mappings) != account_keys:
+                cache_key = (source_account_key, source_food_id)
+                created = created_cache.get(cache_key)
+                if created is None:
+                    source_client = self._build_client(accounts[source_account_key])
+                    try:
+                        definition = await source_client.get_custom_food_definition(source_food_id)
+                    finally:
+                        await source_client.close()
+                    definition = replace(definition, barcode="", barcode_type="")
+                    created = await self.create_custom_food_for_group(
+                        group_id,
+                        definition,
+                        initiated_by,
+                    )
+                    created_cache[cache_key] = created
+                mappings = dict(created.food_ids)
+            if set(mappings) != account_keys:
+                missing_account_keys = sorted(account_keys - set(mappings))
+                raise FatSecretError(
+                    f"Для личного продукта «{item.ingredient.title}» не готовы привязки аккаунтов: "
+                    + ", ".join(missing_account_keys)
+                    + ". Синхронизация остановлена до создания копий продукта."
+                )
+            canonical_account_key = sorted(account_keys)[0]
+            materialized.append(
+                replace(
+                    item,
+                    ingredient=_ingredient_with_food_id(
+                        item.ingredient,
+                        mappings[canonical_account_key],
+                    ),
+                    custom_food_ids=mappings,
+                )
+            )
+        items[:] = materialized
+
     async def _normalize_recipe_ingredients(
         self,
         client: FatSecretClient,
@@ -2281,8 +2419,7 @@ class RecipeSyncEngine:
         *,
         preferred_account_key: str | None = None,
     ) -> RecipeListDraft:
-        """Resolve free-text ingredients, searching from the preferred account when supplied."""
-        await self.ensure_food_usage_cache(group_id)
+        """Resolve free-text ingredients across every connected group account."""
         resolved: list[ResolvedRecipeListItem] = []
         unresolved: list[str] = []
         for item in items:
@@ -2518,6 +2655,94 @@ class RecipeSyncEngine:
             )
         return candidates
 
+    async def _classify_cached_recipe_list_candidates(
+        self,
+        candidates: list[ResolvedRecipeListItem],
+        clients: dict[str, FatSecretClient],
+        semaphore: asyncio.Semaphore,
+    ) -> list[ResolvedRecipeListItem]:
+        """Return cache candidates only after live public/private classification."""
+        if not candidates or not clients:
+            return candidates
+
+        async def probe(
+            account_key: str,
+            client: FatSecretClient,
+            food_id: str,
+        ) -> tuple[str, str, CustomFoodDefinition | None, bool]:
+            try:
+                async with semaphore:
+                    definition = await client.get_custom_food_definition(food_id)
+            except FatSecretNotCustomFoodError:
+                return account_key, food_id, None, True
+            except Exception:  # noqa: BLE001 - ambiguity suppresses the cache candidate.
+                logger.warning(
+                    "cached recipe-list food classification failed account=%s food_id=%s",
+                    account_key,
+                    food_id,
+                    exc_info=True,
+                )
+                return account_key, food_id, None, False
+            return account_key, food_id, definition, True
+
+        food_ids = sorted({candidate.ingredient.food_id for candidate in candidates})
+        account_keys = sorted(clients)
+        probe_results = await asyncio.gather(
+            *(
+                probe(account_key, clients[account_key], food_id)
+                for food_id in food_ids
+                for account_key in account_keys
+            )
+        )
+        probes_by_food_id: dict[
+            str,
+            list[tuple[str, CustomFoodDefinition | None, bool]],
+        ] = {food_id: [] for food_id in food_ids}
+        for account_key, food_id, definition, definitive in probe_results:
+            probes_by_food_id[food_id].append((account_key, definition, definitive))
+
+        classified: list[ResolvedRecipeListItem] = []
+        account_key_set = set(account_keys)
+        for candidate in candidates:
+            probes = probes_by_food_id[candidate.ingredient.food_id]
+            matching_owners = [
+                (account_key, definition)
+                for account_key, definition, _ in probes
+                if definition is not None
+                and normalize_title(definition.title)
+                == normalize_title(candidate.ingredient.title)
+            ]
+            if matching_owners:
+                for account_key, definition in matching_owners:
+                    assert definition is not None
+                    private_candidate = replace(
+                        candidate,
+                        ingredient=replace(candidate.ingredient, title=definition.title),
+                        brand=definition.manufacturer_name,
+                        energy_per_100g=definition.nutrients.get("calories"),
+                        protein_per_100g=definition.nutrients.get("protein"),
+                        fat_per_100g=definition.nutrients.get("totalFat"),
+                        carbohydrate_per_100g=definition.nutrients.get("carbohydrate"),
+                        custom_food_ids={account_key: candidate.ingredient.food_id},
+                        food_source_account_key=account_key,
+                    )
+                    classified.extend(
+                        self._with_known_recipe_list_custom_food_mappings(
+                            [private_candidate],
+                            account_key_set,
+                        )
+                    )
+                continue
+            if all(definitive and definition is None for _, definition, definitive in probes):
+                classified.append(candidate)
+                continue
+            logger.warning(
+                "cached recipe-list food suppressed after ambiguous classification food_id=%s title=%r",
+                candidate.ingredient.food_id,
+                candidate.ingredient.title,
+            )
+        return classified
+
     async def recipe_list_candidates(
         self,
         group_id: str,
@@ -2528,122 +2753,239 @@ class RecipeSyncEngine:
         *,
         preferred_account_key: str | None = None,
     ) -> list[ResolvedRecipeListItem]:
-        """Return candidates, searching from the preferred account when supplied."""
+        """Return deterministically ranked candidates from every connected group account."""
         limit = max(1, limit)
         offset = max(0, offset)
         local_candidates: list[ResolvedRecipeListItem] = []
-        clients: dict[str, FatSecretClient] | None = None
-
-        def get_search_client() -> FatSecretClient:
-            nonlocal clients
-            if clients is None:
-                clients = self._build_clients(group_id)
-            if preferred_account_key is not None:
-                preferred_client = clients.get(preferred_account_key)
-                if preferred_client is None:
-                    raise FatSecretError("Аккаунт-источник больше не подключен.")
-                return preferred_client
-            return next(iter(clients.values()))
+        clients: dict[str, FatSecretClient] = {}
+        client_error: FatSecretError | None = None
 
         try:
-            await self.ensure_food_usage_cache(group_id)
-            first_client_for_cache: FatSecretClient | None = None
             try:
-                first_client_for_cache = get_search_client()
-            except FatSecretError:
-                first_client_for_cache = None
+                await self.ensure_food_usage_cache(group_id)
+            except Exception:  # noqa: BLE001 - live all-account search remains authoritative.
+                logger.warning(
+                    "recipe list food usage refresh failed group=%s query=%r",
+                    group_id,
+                    query,
+                    exc_info=True,
+                )
+            try:
+                clients = self._build_clients(group_id)
+            except FatSecretError as exc:
+                client_error = exc
+            ordered_account_keys = sorted(clients)
+            metadata_account_key = (
+                preferred_account_key
+                if preferred_account_key in clients
+                else (ordered_account_keys[0] if ordered_account_keys else None)
+            )
             local_candidates = await self._cached_food_usage_candidates(
                 group_id,
                 query,
                 grams,
-                first_client_for_cache,
+                clients.get(metadata_account_key) if metadata_account_key is not None else None,
             )
-
-            try:
-                first_client = get_search_client()
-            except FatSecretError:
+            if not clients:
                 if local_candidates:
                     local_candidates.sort(key=lambda item: _resolved_candidate_rank(query, item))
                     return local_candidates[offset : offset + limit]
-                raise
+                if client_error is not None:
+                    raise client_error
             remote_limit = offset + limit + 10
-            raw_target_count = remote_limit
-            remote_candidates: list[FoodSearchResult] = []
-            variants = _query_variants(query)
-
-            search_pages = max(1, (raw_target_count // 10) + 1)
-            for page in range(search_pages):
-                remote_candidates.extend(await first_client.search_recipes(query, page=page))
-
-            if len(_dedupe_food_results(remote_candidates)) < raw_target_count:
-                for variant in variants[1:]:
-                    remote_candidates.extend(await first_client.search_recipes(variant, page=0))
-                    if len(_dedupe_food_results(remote_candidates)) >= raw_target_count:
-                        break
-
-            if not _dedupe_food_results(remote_candidates):
-                for variant in variants:
-                    remote_candidates.extend(await first_client.autocomplete_food(variant))
-
-            remote_candidates = [
-                item
-                for item in _dedupe_food_results(remote_candidates)
-                if _matches_requested_food(query, item.title, _food_search_text(item))
-            ]
-            remote_candidates.sort(key=lambda item: _food_result_rank(query, item))
-            remote_candidates = remote_candidates[: remote_limit + 5]
-
-            remote_resolved: list[ResolvedRecipeListItem] = []
-            for remote in remote_candidates:
-                if len(remote_resolved) >= remote_limit:
-                    break
-                try:
-                    found = remote if _food_result_has_detail(remote) else await first_client.resolve_food_detail(remote)
-                except Exception:  # noqa: BLE001 - keep alternative candidates usable.
-                    logger.debug("recipe list candidate resolve failed for %s", remote.title, exc_info=True)
-                    continue
-                if not _matches_requested_food(query, found.title, _food_search_text(found)):
-                    continue
-                protein = found.protein_per_portion
-                fat = found.fat_per_portion
-                carbohydrate = found.carbohydrate_per_portion
-                remote_resolved.append(
-                    ResolvedRecipeListItem(
-                        requested_query=query,
-                        grams=grams,
-                        ingredient=_ingredient_from_food_result(found, grams),
-                        source="FatSecret",
-                        brand=found.brand,
-                        energy_per_100g=_correct_energy(found.energy_per_portion, protein, fat, carbohydrate),
-                        protein_per_100g=protein,
-                        fat_per_100g=fat,
-                        carbohydrate_per_100g=carbohydrate,
+            semaphore = asyncio.Semaphore(RECIPE_LIST_SEARCH_CONCURRENCY)
+            search_results = await asyncio.gather(
+                *(
+                    self._recipe_list_candidates_for_account(
+                        account_key,
+                        clients[account_key],
+                        query,
+                        grams,
+                        remote_limit,
+                        semaphore,
+                        ordered_account_keys,
                     )
-                )
+                    for account_key in ordered_account_keys
+                ),
+                return_exceptions=True,
+            )
+            remote_resolved: list[ResolvedRecipeListItem] = []
+            search_errors: list[tuple[str, BaseException]] = []
+            for account_key, result in zip(ordered_account_keys, search_results, strict=True):
+                if isinstance(result, BaseException):
+                    search_errors.append((account_key, result))
+                    logger.warning(
+                        "recipe list account search failed group=%s account=%s query=%r",
+                        group_id,
+                        account_key,
+                        query,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                    continue
+                remote_resolved.extend(result)
+            local_candidates = await self._classify_cached_recipe_list_candidates(
+                local_candidates,
+                clients,
+                semaphore,
+            )
+            if search_errors and len(search_errors) == len(ordered_account_keys) and not local_candidates:
+                raise search_errors[0][1]
+
             candidates = [*local_candidates, *remote_resolved]
-            candidates.sort(key=lambda item: _resolved_candidate_rank(query, item))
+            candidates.sort(
+                key=lambda item: (
+                    *_resolved_candidate_rank(query, item),
+                    item.food_source_account_key or "",
+                    item.ingredient.food_id,
+                )
+            )
             deduped_candidates: list[ResolvedRecipeListItem] = []
-            seen_candidates: dict[tuple[str, str], int] = {}
+            seen_exact: dict[tuple[str, str], int] = {}
+            seen_mapped_custom: dict[tuple[tuple[str, str], ...], int] = {}
+            seen_public: dict[str, int] = {}
             for candidate in candidates:
-                key = (candidate.ingredient.food_id, normalize_title(candidate.ingredient.title))
-                existing_index = seen_candidates.get(key)
+                exact_key = (
+                    candidate.ingredient.food_id,
+                    normalize_title(candidate.ingredient.title),
+                )
+                mapped_key = (
+                    tuple(sorted(candidate.custom_food_ids.items()))
+                    if candidate.food_source_account_key is not None and candidate.custom_food_ids
+                    else None
+                )
+                public_key = (
+                    candidate.ingredient.food_id
+                    if candidate.food_source_account_key is None and not candidate.custom_food_ids
+                    else None
+                )
+                existing_index = seen_exact.get(exact_key)
+                if existing_index is None and mapped_key is not None:
+                    existing_index = seen_mapped_custom.get(mapped_key)
+                if existing_index is None and public_key is not None:
+                    existing_index = seen_public.get(public_key)
                 if existing_index is not None:
                     existing = deduped_candidates[existing_index]
                     if (
+                        bool(candidate.custom_food_ids),
                         _macro_field_count(candidate),
                         bool(candidate.brand),
                     ) > (
+                        bool(existing.custom_food_ids),
                         _macro_field_count(existing),
                         bool(existing.brand),
                     ):
                         deduped_candidates[existing_index] = candidate
+                        seen_exact[exact_key] = existing_index
+                        if mapped_key is not None:
+                            seen_mapped_custom[mapped_key] = existing_index
+                        if public_key is not None:
+                            seen_public[public_key] = existing_index
                     continue
-                seen_candidates[key] = len(deduped_candidates)
+                index = len(deduped_candidates)
+                seen_exact[exact_key] = index
+                if mapped_key is not None:
+                    seen_mapped_custom[mapped_key] = index
+                if public_key is not None:
+                    seen_public[public_key] = index
                 deduped_candidates.append(candidate)
             return deduped_candidates[offset : offset + limit]
         finally:
-            if clients is not None:
-                await self._close_clients(clients)
+            await self._close_clients(clients)
+
+    async def _recipe_list_candidates_for_account(
+        self,
+        account_key: str,
+        client: FatSecretClient,
+        query: str,
+        grams: Decimal,
+        remote_limit: int,
+        semaphore: asyncio.Semaphore,
+        account_keys: list[str],
+    ) -> list[ResolvedRecipeListItem]:
+        """Search and hydrate one account without mutating remote FatSecret state."""
+        remote_candidates: list[FoodSearchResult] = []
+        variants = _query_variants(query)
+        search_pages = max(1, (remote_limit // 10) + 1)
+        for page in range(search_pages):
+            async with semaphore:
+                remote_candidates.extend(await client.search_recipes(query, page=page))
+
+        if len(_dedupe_food_results(remote_candidates)) < remote_limit:
+            for variant in variants[1:]:
+                async with semaphore:
+                    remote_candidates.extend(await client.search_recipes(variant, page=0))
+                if len(_dedupe_food_results(remote_candidates)) >= remote_limit:
+                    break
+
+        if not _dedupe_food_results(remote_candidates):
+            for variant in variants:
+                async with semaphore:
+                    remote_candidates.extend(await client.autocomplete_food(variant))
+
+        remote_candidates = [
+            item
+            for item in _dedupe_food_results(remote_candidates)
+            if _matches_requested_food(query, item.title, _food_search_text(item))
+        ]
+        remote_candidates.sort(key=lambda item: _food_result_rank(query, item))
+        resolved: list[ResolvedRecipeListItem] = []
+        for remote in remote_candidates[: remote_limit + 5]:
+            if len(resolved) >= remote_limit:
+                break
+            try:
+                if _food_result_has_detail(remote):
+                    found = remote
+                else:
+                    async with semaphore:
+                        found = await client.resolve_food_detail(remote)
+            except Exception:  # noqa: BLE001 - keep alternative candidates usable.
+                logger.debug(
+                    "recipe list candidate resolve failed account=%s food=%s",
+                    account_key,
+                    remote.title,
+                    exc_info=True,
+                )
+                continue
+            if not _matches_requested_food(query, found.title, _food_search_text(found)):
+                continue
+            protein = found.protein_per_portion
+            fat = found.fat_per_portion
+            carbohydrate = found.carbohydrate_per_portion
+            is_own = remote.is_own or found.is_own
+            custom_food_ids: dict[str, str] = {}
+            if is_own:
+                custom_food_ids[account_key] = found.food_id
+                for target_account_key in account_keys:
+                    if target_account_key == account_key:
+                        continue
+                    mapped_food_id = self.storage.custom_food_mapping(
+                        account_key,
+                        found.food_id,
+                        target_account_key,
+                    )
+                    if mapped_food_id is not None:
+                        custom_food_ids[target_account_key] = mapped_food_id
+            resolved.append(
+                ResolvedRecipeListItem(
+                    requested_query=query,
+                    grams=grams,
+                    ingredient=_ingredient_from_food_result(found, grams),
+                    source="FatSecret",
+                    brand=found.brand,
+                    energy_per_100g=_correct_energy(
+                        found.energy_per_portion,
+                        protein,
+                        fat,
+                        carbohydrate,
+                    ),
+                    protein_per_100g=protein,
+                    fat_per_100g=fat,
+                    carbohydrate_per_100g=carbohydrate,
+                    custom_food_ids=custom_food_ids,
+                    food_source_account_key=account_key if is_own else None,
+                )
+            )
+        return resolved
 
     async def _resolve_food_from_remote(self, client: FatSecretClient, query: str) -> FoodSearchResult | None:
         candidates = await client.search_recipes(query)
@@ -3256,6 +3598,10 @@ class RecipeSyncEngine:
                     ingredient_ids,
                     connected_account_keys,
                 )
+                items[:] = self._with_known_recipe_list_custom_food_mappings(
+                    items,
+                    connected_account_keys,
+                )
                 target_description = recipe_description_with_cooked_weight(
                     cached_source.description,
                     raw_grams,
@@ -3363,34 +3709,41 @@ class RecipeSyncEngine:
                 )
             if not normalize_title(source_transport.title):
                 raise FatSecretError("У выбранного рецепта отсутствует название. Обнови список рецептов.")
+            classified_items: list[ResolvedRecipeListItem] = []
             for item in items:
-                if not item.custom_food_ids:
+                if item.food_source_account_key is not None or item.custom_food_ids:
+                    classified_items.append(item)
                     continue
-                missing_account_keys = connected_account_keys - set(item.custom_food_ids)
-                if missing_account_keys:
-                    raise FatSecretError(
-                        f"Для личного продукта «{item.ingredient.title}» не готовы привязки аккаунтов: "
-                        + ", ".join(sorted(missing_account_keys))
-                        + ". Синхронизация остановлена до создания копий продукта."
+                try:
+                    await source_client.get_custom_food_definition(item.ingredient.food_id)
+                except FatSecretNotCustomFoodError:
+                    classified_items.append(item)
+                    continue
+                classified_items.append(
+                    replace(
+                        item,
+                        custom_food_ids={source_account_key: item.ingredient.food_id},
+                        food_source_account_key=source_account_key,
                     )
+                )
+            items[:] = classified_items
+            if any(
+                item.food_source_account_key is not None
+                or (item.custom_food_ids and set(item.custom_food_ids) != connected_account_keys)
+                for item in items
+            ):
+                await self._materialize_recipe_list_custom_foods(
+                    group_id,
+                    items,
+                    updated_by,
+                    expected_account_keys=connected_account_keys,
+                )
             self.storage.upsert_remote_recipe_snapshot(
                 source_account_key,
                 source_remote_id,
                 source_transport,
                 recipe_fingerprint(source_transport),
             )
-            if len(clients) > 1:
-                for item in items:
-                    if item.custom_food_ids:
-                        continue
-                    try:
-                        await source_client.get_custom_food_definition(item.ingredient.food_id)
-                    except FatSecretNotCustomFoodError:
-                        continue
-                    raise FatSecretError(
-                        f"Для личного продукта «{item.ingredient.title}» не готовы привязки всех аккаунтов. "
-                        "Синхронизация остановлена до создания копий продукта."
-                    )
 
             edited_recipe = _recipe_edit_candidate(
                 live_recipe_id,
@@ -3574,6 +3927,21 @@ class RecipeSyncEngine:
         cooked_weight_grams: Decimal | None = None,
     ) -> RecipeCreateResult:
         """Execute the shared durable create-and-replace implementation."""
+        if any(
+            item.food_source_account_key is not None
+            or (
+                expected_account_keys is not None
+                and item.custom_food_ids
+                and set(item.custom_food_ids) != expected_account_keys
+            )
+            for item in items
+        ):
+            await self._materialize_recipe_list_custom_foods(
+                group_id,
+                items,
+                updated_by,
+                expected_account_keys=expected_account_keys,
+            )
         final_title = title.strip()
         if not final_title:
             raise FatSecretError("Название рецепта не должно быть пустым.")

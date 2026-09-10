@@ -491,11 +491,16 @@ class FakeSearchClient:
         results: list[FoodSearchResult],
         search_results: list[FoodSearchResult] | dict[str, list[FoodSearchResult]] | None = None,
         details: dict[str, FoodSearchResult] | None = None,
+        *,
+        account_key: str = "search",
+        search_error: Exception | None = None,
+        custom_food_definitions: dict[str, CustomFoodDefinition] | None = None,
+        custom_food_error: Exception | None = None,
     ) -> None:
         self.account = FatSecretAccountConfig(
-            key="search",
-            label="search",
-            username="search@example.com",
+            key=account_key,
+            label=account_key,
+            username=f"{account_key}@example.com",
             password="secret",
             market="BY",
             language="ru",
@@ -503,11 +508,23 @@ class FakeSearchClient:
         self.results = results
         self.search_results = search_results if search_results is not None else []
         self.details = details or {}
+        self.search_error = search_error
+        self.custom_food_definitions = custom_food_definitions or {}
+        self.custom_food_error = custom_food_error
+        self.search_calls: list[tuple[str, int]] = []
+        self.autocomplete_calls: list[str] = []
+        self.closed = False
 
     async def autocomplete_food(self, query: str) -> list[FoodSearchResult]:
+        self.autocomplete_calls.append(query)
+        if self.search_error is not None:
+            raise self.search_error
         return list(self.results)
 
     async def search_recipes(self, query: str, page: int = 0) -> list[FoodSearchResult]:
+        self.search_calls.append((query, page))
+        if self.search_error is not None:
+            raise self.search_error
         if isinstance(self.search_results, dict):
             return list(self.search_results.get(query, []))
         return list(self.search_results)
@@ -515,8 +532,18 @@ class FakeSearchClient:
     async def resolve_food_detail(self, result: FoodSearchResult) -> FoodSearchResult:
         return self.details.get(result.food_id, result)
 
+    async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
+        if self.custom_food_error is not None:
+            raise self.custom_food_error
+        definition = self.custom_food_definitions.get(remote_id)
+        if definition is None:
+            raise FatSecretNotCustomFoodError(
+                f"{self.account.label}: food {remote_id} is not a user-created product"
+            )
+        return definition
+
     async def close(self) -> None:
-        return None
+        self.closed = True
 
 
 class FakeFailingCreateClient:
@@ -1924,7 +1951,7 @@ def test_recipe_list_candidates_uses_remote_when_usage_cache_is_empty(tmp_path) 
         "Гэта мяса",
     ],
 )
-def test_recipe_list_candidates_searches_selected_edit_account_for_personal_food(
+def test_recipe_list_candidates_searches_all_accounts_for_personal_food(
     tmp_path,
     query: str,
 ) -> None:
@@ -1934,7 +1961,8 @@ def test_recipe_list_candidates_searches_selected_edit_account_for_personal_food
         engine = RecipeSyncEngine(storage, _device())
         alphabetical_first = FakeSearchClient(
             [],
-            search_results=[FoodSearchResult(food_id="wrong-account-food", title=query)],
+            search_results=[],
+            account_key="alphabetical-first",
         )
         selected_edit_account = FakeSearchClient(
             [],
@@ -1946,6 +1974,7 @@ def test_recipe_list_candidates_searches_selected_edit_account_for_personal_food
                     is_own=True,
                 )
             ],
+            account_key="selected-edit-account",
         )
         engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
             "alphabetical-first": alphabetical_first,
@@ -1965,6 +1994,185 @@ def test_recipe_list_candidates_searches_selected_edit_account_for_personal_food
         assert candidates[0].ingredient.food_id == "116349871"
         assert candidates[0].ingredient.title == expected_title
         assert candidates[0].brand == "Гэта Мяса"
+        assert candidates[0].food_source_account_key == "selected-edit-account"
+        assert candidates[0].custom_food_ids == {"selected-edit-account": "116349871"}
+        assert alphabetical_first.search_calls
+        assert selected_edit_account.search_calls
+        assert alphabetical_first.closed
+        assert selected_edit_account.closed
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_tolerates_one_account_search_failure(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        failed = FakeSearchClient(
+            [],
+            account_key="a1",
+            search_error=RuntimeError("account unavailable"),
+        )
+        working = FakeSearchClient(
+            [],
+            search_results=[FoodSearchResult(food_id="food-2", title="Куриное Филе")],
+            account_key="a2",
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": failed, "a2": working}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(
+            engine.recipe_list_candidates("group", "Куриное филе", Decimal("100"), limit=1)
+        )
+
+        assert [item.ingredient.food_id for item in candidates] == ["food-2"]
+        assert failed.closed and working.closed
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_raises_when_every_account_search_fails(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        first = FakeSearchClient([], account_key="a1", search_error=RuntimeError("first failed"))
+        second = FakeSearchClient([], account_key="a2", search_error=RuntimeError("second failed"))
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a2": second, "a1": first}  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="first failed"):
+            asyncio.run(
+                engine.recipe_list_candidates("group", "Куриное филе", Decimal("100"), limit=1)
+            )
+
+        assert first.closed and second.closed
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_dedupes_public_and_mapped_private_foods(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.set_custom_food_mapping("a1", "private-1", "a2", "private-2")
+        clients = {
+            "a3": FakeSearchClient(
+                [],
+                search_results=[
+                    FoodSearchResult(food_id="public", title="Куриное Филе"),
+                    FoodSearchResult(food_id="private-3", title="Куриное Филе", is_own=True),
+                ],
+                account_key="a3",
+            ),
+            "a2": FakeSearchClient(
+                [],
+                search_results=[
+                    FoodSearchResult(food_id="public", title="Куриное Филе"),
+                    FoodSearchResult(food_id="private-2", title="Куриное Филе", is_own=True),
+                ],
+                account_key="a2",
+            ),
+            "a1": FakeSearchClient(
+                [],
+                search_results=[
+                    FoodSearchResult(food_id="public", title="Куриное Филе"),
+                    FoodSearchResult(food_id="private-1", title="Куриное Филе", is_own=True),
+                ],
+                account_key="a1",
+            ),
+        }
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: clients  # type: ignore[method-assign]
+
+        candidates = asyncio.run(
+            engine.recipe_list_candidates("group", "Куриное филе", Decimal("100"), limit=10)
+        )
+
+        public = [item for item in candidates if item.food_source_account_key is None]
+        private = [item for item in candidates if item.food_source_account_key is not None]
+        assert [item.ingredient.food_id for item in public] == ["public"]
+        assert len(private) == 2
+        assert private[0].food_source_account_key == "a1"
+        assert private[0].custom_food_ids == {"a1": "private-1", "a2": "private-2"}
+        assert private[1].food_source_account_key == "a3"
+        assert private[1].custom_food_ids == {"a3": "private-3"}
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_live_classifies_cached_personal_food_when_owner_search_fails(
+    tmp_path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(
+            storage,
+            group.id,
+            [("116349871", 'Смесь Сухая «для приготовления котлет»', 3)],
+        )
+        definition = replace(
+            _qa_custom_food_definition(),
+            source_recipe_id="116349871",
+            title='Смесь Сухая «для приготовления котлет»',
+            manufacturer_name="Гэта Мяса",
+        )
+        owner = FakeSearchClient(
+            [],
+            account_key="a1",
+            search_error=RuntimeError("owner search failed"),
+            custom_food_definitions={"116349871": definition},
+        )
+        other = FakeSearchClient([], search_results=[], account_key="a2")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": owner, "a2": other}  # type: ignore[method-assign]
+
+        candidates = asyncio.run(
+            engine.recipe_list_candidates(
+                group.id,
+                'Смесь Сухая «для приготовления котлет»',
+                Decimal("100"),
+                limit=1,
+            )
+        )
+
+        assert len(candidates) == 1
+        assert candidates[0].food_source_account_key == "a1"
+        assert candidates[0].custom_food_ids == {"a1": "116349871"}
+        assert candidates[0].brand == "Гэта Мяса"
+    finally:
+        storage.close()
+
+
+def test_recipe_list_candidates_suppresses_ambiguous_cache_when_all_searches_fail(
+    tmp_path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        _cache_foods(storage, group.id, [("116349871", "Личный продукт", 3)])
+        first = FakeSearchClient(
+            [],
+            account_key="a1",
+            search_error=RuntimeError("first search failed"),
+            custom_food_error=RuntimeError("classification failed"),
+        )
+        second = FakeSearchClient(
+            [],
+            account_key="a2",
+            search_error=RuntimeError("second search failed"),
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": first, "a2": second}  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="first search failed"):
+            asyncio.run(
+                engine.recipe_list_candidates(
+                    group.id,
+                    "Личный продукт",
+                    Decimal("100"),
+                    limit=1,
+                )
+            )
     finally:
         storage.close()
 
@@ -3847,14 +4055,125 @@ def test_edit_recipe_from_list_resumes_exact_journal_after_validated_source_was_
         storage.close()
 
 
-def test_edit_recipe_from_list_rejects_unmapped_personal_food_before_recipe_writes(tmp_path) -> None:
+def test_edit_recipe_from_list_resumes_personal_food_journal_with_fresh_partial_item(
+    tmp_path,
+) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        source_key = storage.create_fatsecret_account(
+            11, "One", "one@example.com", "secret", "BY", "ru", group_id=group.id
+        )
+        target_key = storage.create_fatsecret_account(
+            11, "Two", "two@example.com", "secret", "BY", "ru", group_id=group.id
+        )
+        source_recipe = Recipe(id="source-1", title="Личный рецепт")
+        definition = replace(
+            _qa_custom_food_definition(),
+            source_recipe_id="116349871",
+            title='Смесь Сухая «для приготовления котлет»',
+            manufacturer_name="Гэта Мяса",
+        )
+        source = FakeGroupCustomFoodClient(source_key)
+        source.recipes[source_recipe.id] = source_recipe
+        source.custom_foods["116349871"] = definition
+        target = FakeGroupCustomFoodClient(target_key)
+        clients = {source_key: source, target_key: target}
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: clients  # type: ignore[method-assign]
+        engine._build_client = lambda account: clients[account.key]  # type: ignore[method-assign]
+        original_finalize = storage.finalize_recipe_list_run
+        finalize_calls = 0
+
+        def fail_once(run_id, recipe, remote_ids):
+            nonlocal finalize_calls
+            finalize_calls += 1
+            if finalize_calls == 1:
+                raise RuntimeError("injected finalization failure")
+            return original_finalize(run_id, recipe, remote_ids)
+
+        storage.finalize_recipe_list_run = fail_once  # type: ignore[method-assign]
+
+        def fresh_partial_item() -> ResolvedRecipeListItem:
+            return ResolvedRecipeListItem(
+                requested_query="Гэта Мяса",
+                grams=Decimal("100"),
+                ingredient=Ingredient(
+                    "personal-ingredient",
+                    source_recipe.id,
+                    "116349871",
+                    definition.title,
+                    "0",
+                    Decimal("1"),
+                    "100г",
+                    grams=Decimal("100"),
+                ),
+                source="FatSecret",
+                brand="Гэта Мяса",
+                custom_food_ids={source_key: "116349871"},
+                food_source_account_key=source_key,
+            )
+
+        with pytest.raises(FatSecretError, match="remote ID сохранены"):
+            asyncio.run(
+                engine.edit_recipe_from_list(
+                    group.id,
+                    source_key,
+                    source_recipe.id,
+                    recipe_fingerprint(source_recipe).digest,
+                    [fresh_partial_item()],
+                    updated_by=11,
+                    portions=Decimal("1"),
+                    steps=[],
+                )
+            )
+
+        assert source_recipe.id not in source.recipes
+        assert storage.custom_food_mapping(source_key, "116349871", target_key) is not None
+        assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "recovery_pending"
+        saved_ingredient_counts = (
+            len(source.saved_ingredients),
+            len(target.saved_ingredients),
+        )
+
+        resumed = asyncio.run(
+            engine.edit_recipe_from_list(
+                group.id,
+                source_key,
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                [fresh_partial_item()],
+                updated_by=11,
+                portions=Decimal("1"),
+                steps=[],
+            )
+        )
+
+        assert all(result.ok for result in resumed.results)
+        assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "completed"
+        assert (len(source.saved_ingredients), len(target.saved_ingredients)) == saved_ingredient_counts
+        assert len(target.created_custom_foods) == 1
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_propagates_discovered_personal_food_before_recipe_write(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        source_key = storage.create_fatsecret_account(
+            11, "One", "one@example.com", "secret", "BY", "ru", group_id=group.id
+        )
+        target_key = storage.create_fatsecret_account(
+            11, "Two", "two@example.com", "secret", "BY", "ru", group_id=group.id
+        )
         personal_ingredient = Ingredient(
             "personal-ingredient",
             "source-1",
-            "source-personal-food",
-            "Личный продукт",
+            "116349871",
+            'Смесь Сухая «для приготовления котлет»',
             "0",
             Decimal("1"),
             "100г",
@@ -3865,79 +4184,115 @@ def test_edit_recipe_from_list_rejects_unmapped_personal_food_before_recipe_writ
             title="Личный рецепт",
             ingredients=[personal_ingredient],
         )
-        definition = CustomFoodDefinition(
-            source_recipe_id=personal_ingredient.food_id,
+        definition = replace(
+            _qa_custom_food_definition(barcode="4006381333931"),
+            source_recipe_id="116349871",
             title=personal_ingredient.title,
-            manufacturer_name="Домашний",
-            serving_type="Per100g",
-            serving_size="",
-            metric_serving_size="100g",
-            nutrients={"calories": Decimal("100")},
+            manufacturer_name="Гэта Мяса",
         )
-        source = FakeCustomFoodSourceClient(source_recipe, definition, account_key="tg11")
-        target = FakeCreateClient("tg22")
+        source = FakeGroupCustomFoodClient(source_key)
+        source.recipes[source_recipe.id] = source_recipe
+        source.custom_foods["116349871"] = definition
+        source.barcode_food_ids[definition.barcode] = "116349871"
+        target = FakeGroupCustomFoodClient(target_key)
+        clients = {source_key: source, target_key: target}
         engine = RecipeSyncEngine(storage, _device())
-        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
-            "tg11": source,
-            "tg22": target,
-        }
+        engine._build_clients = lambda group_id=None: clients  # type: ignore[method-assign]
+        engine._build_client = lambda account: clients[account.key]  # type: ignore[method-assign]
+        item = ResolvedRecipeListItem(
+            requested_query="Гэта Мяса",
+            grams=Decimal("100"),
+            ingredient=personal_ingredient,
+            source="FatSecret",
+            brand="Гэта Мяса",
+            custom_food_ids={source_key: "116349871"},
+            food_source_account_key=source_key,
+        )
 
-        with pytest.raises(FatSecretError, match="не готовы привязки всех аккаунтов"):
-            asyncio.run(
-                engine.edit_recipe_from_list(
-                    "group",
-                    "tg11",
-                    source_recipe.id,
-                    recipe_fingerprint(source_recipe).digest,
-                    [_resolved_recipe_item(personal_ingredient)],
-                    updated_by=11,
-                    portions=Decimal("1"),
-                    steps=[],
-                )
+        edited = asyncio.run(
+            engine.edit_recipe_from_list(
+                group.id,
+                source_key,
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                [item],
+                updated_by=11,
+                portions=Decimal("1"),
+                steps=[],
             )
+        )
 
-        assert list(source.recipes) == [source_recipe.id]
-        assert source.deleted_recipe_ids == []
-        assert target.create_calls == 0
-        assert target.deleted_recipe_ids == []
+        target_food_id = storage.custom_food_mapping(source_key, "116349871", target_key)
+        assert target_food_id is not None
+        assert all(result.ok for result in edited.results)
+        assert [ingredient.food_id for ingredient in source.saved_ingredients] == ["116349871"]
+        assert [ingredient.food_id for ingredient in target.saved_ingredients] == [target_food_id]
+        assert source.created_custom_foods == []
+        assert len(target.created_custom_foods) == 1
+        assert target.created_custom_foods[0].barcode == ""
+        assert target.created_custom_foods[0].barcode_type == ""
+        assert source.barcode_food_ids[definition.barcode] == "116349871"
+        assert source.remap_calls == target.remap_calls == []
     finally:
         storage.close()
 
 
-def test_edit_recipe_from_list_rejects_partial_custom_food_mapping_before_remote_writes(tmp_path) -> None:
+def test_edit_recipe_from_list_stops_before_recipe_writes_when_food_propagation_fails(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
+        storage.register_user(11, "One")
+        group = storage.create_group(11, "Семья")
+        source_key = storage.create_fatsecret_account(
+            11, "One", "one@example.com", "secret", "BY", "ru", group_id=group.id
+        )
+        target_key = storage.create_fatsecret_account(
+            11, "Two", "two@example.com", "secret", "BY", "ru", group_id=group.id
+        )
         source_recipe = Recipe(id="source-1", title="Личный рецепт")
-        source = FakeCreateClient("tg11")
-        target = FakeCreateClient("tg22")
+        definition = replace(
+            _qa_custom_food_definition(),
+            source_recipe_id="116349871",
+            title='Смесь Сухая «для приготовления котлет»',
+            manufacturer_name="Гэта Мяса",
+        )
+        source = FakeGroupCustomFoodClient(source_key)
         source.recipes[source_recipe.id] = source_recipe
+        source.custom_foods["116349871"] = definition
+        target = FakeGroupCustomFoodClient(target_key)
+        successful_custom_food_create = target.create_custom_food
+
+        async def fail_custom_food_create(definition: CustomFoodDefinition) -> str:
+            del definition
+            raise RuntimeError("target custom-food create failed")
+
+        target.create_custom_food = fail_custom_food_create  # type: ignore[method-assign]
+        clients = {source_key: source, target_key: target}
         engine = RecipeSyncEngine(storage, _device())
-        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
-            "tg11": source,
-            "tg22": target,
-        }
+        engine._build_clients = lambda group_id=None: clients  # type: ignore[method-assign]
+        engine._build_client = lambda account: clients[account.key]  # type: ignore[method-assign]
         personal = ResolvedRecipeListItem(
-            requested_query="Личный продукт",
+            requested_query="Гэта Мяса",
             grams=Decimal("100"),
             ingredient=Ingredient(
                 "personal-ingredient",
                 source_recipe.id,
-                "source-personal-food",
-                "Личный продукт",
+                "116349871",
+                definition.title,
                 "0",
                 Decimal("1"),
                 "100г",
                 grams=Decimal("100"),
             ),
             source="FatSecret",
-            custom_food_ids={"tg11": "source-personal-food"},
+            custom_food_ids={source_key: "116349871"},
+            food_source_account_key=source_key,
         )
 
-        with pytest.raises(FatSecretError, match="не готовы привязки аккаунтов: tg22"):
+        with pytest.raises(FatSecretError, match="Продукт создан не во всех аккаунтах"):
             asyncio.run(
                 engine.edit_recipe_from_list(
-                    "group",
-                    "tg11",
+                    group.id,
+                    source_key,
                     source_recipe.id,
                     recipe_fingerprint(source_recipe).digest,
                     [personal],
@@ -3947,8 +4302,31 @@ def test_edit_recipe_from_list_rejects_partial_custom_food_mapping_before_remote
                 )
             )
 
-        assert source.create_calls == target.create_calls == 0
+        assert set(source.recipes) == {f"{source_key}-seed", source_recipe.id}
+        assert set(target.recipes) == {f"{target_key}-seed"}
         assert source.deleted_recipe_ids == target.deleted_recipe_ids == []
+        run = storage._conn.execute("SELECT status FROM custom_food_runs").fetchone()
+        assert run is not None and run["status"] == "recovery_pending"
+        assert storage._conn.execute("SELECT COUNT(*) FROM recipe_list_runs").fetchone()[0] == 0
+
+        target.create_custom_food = successful_custom_food_create  # type: ignore[method-assign]
+        resumed = asyncio.run(
+            engine.edit_recipe_from_list(
+                group.id,
+                source_key,
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                [personal],
+                updated_by=11,
+                portions=Decimal("1"),
+                steps=[],
+            )
+        )
+
+        assert all(result.ok for result in resumed.results)
+        assert len(target.created_custom_foods) == 1
+        assert storage._conn.execute("SELECT status FROM custom_food_runs").fetchone()[0] == "completed"
+        assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "completed"
     finally:
         storage.close()
 
