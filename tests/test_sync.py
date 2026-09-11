@@ -9,6 +9,8 @@ from decimal import Decimal
 import httpx
 import pytest
 
+import fatsecret_bot.sync as sync_module
+
 from fatsecret_bot.fatsecret_client import (
     FatSecretActionError,
     FatSecretNotCustomFoodError,
@@ -28,6 +30,7 @@ from fatsecret_bot.storage import Storage
 from fatsecret_bot.sync import (
     COOKED_WEIGHT_DESCRIPTION_PREFIX,
     INGREDIENT_NORMALIZE_CONCURRENCY,
+    LAST_UPDATE_DESCRIPTION_PREFIX,
     FatSecretError,
     RecipeSyncEngine,
     ResolvedRecipeListItem,
@@ -37,6 +40,7 @@ from fatsecret_bot.sync import (
     cooked_weight_coefficient,
     recipe_cooked_weight_from_description,
     recipe_description_with_cooked_weight,
+    recipe_description_with_last_update,
 )
 
 
@@ -2740,6 +2744,32 @@ def test_sync_description_uses_configured_timezone() -> None:
     assert value == "Последняя синхронизация: 17.06.2026 15:50"
 
 
+def test_last_update_description_replaces_exact_lines_and_preserves_other_text() -> None:
+    old_line = "Последняя синхронизация: 01.01.2026 00:00"
+    new_line = "Последняя синхронизация: 17.06.2026 15:50"
+    human_line = "Последняя синхронизация: когда будет готово"
+    now = dt.datetime(2026, 6, 17, 12, 50, tzinfo=dt.UTC)
+
+    assert LAST_UPDATE_DESCRIPTION_PREFIX == "Последняя синхронизация:"
+    assert recipe_description_with_last_update("", now) == new_line
+    assert recipe_description_with_last_update(
+        f"До\r\n{old_line}\r\nПосле\r\n{old_line}",
+        now,
+    ) == f"До\r\n{new_line}\r\nПосле"
+    assert recipe_description_with_last_update(
+        f"До\n{old_line}\n\n{old_line}",
+        now,
+    ) == f"До\n{new_line}\n\n"
+    assert recipe_description_with_last_update(
+        "До\rПосле",
+        now,
+    ) == f"До\rПосле\r{new_line}"
+    assert recipe_description_with_last_update(
+        human_line,
+        now,
+    ) == f"{human_line}\n{new_line}"
+
+
 @pytest.mark.parametrize(
     ("raw_grams", "cooked_grams", "expected"),
     [
@@ -2841,7 +2871,7 @@ def test_recipe_list_fingerprint_distinguishes_cooked_weight_and_target_descript
         [],
         items,
         cooked_weight_grams=Decimal("415"),
-        target_description="Описание A",
+        target_description="Описание A\nПоследняя синхронизация: 01.01.2026 00:00",
     )
     same = _recipe_list_request_fingerprint(
         "Тест",
@@ -2849,7 +2879,7 @@ def test_recipe_list_fingerprint_distinguishes_cooked_weight_and_target_descript
         [],
         items,
         cooked_weight_grams=Decimal("415.0"),
-        target_description="Описание A",
+        target_description="Описание A\nПоследняя синхронизация: 01.01.2026 00:01",
     )
     changed_weight = _recipe_list_request_fingerprint(
         "Тест",
@@ -2857,7 +2887,7 @@ def test_recipe_list_fingerprint_distinguishes_cooked_weight_and_target_descript
         [],
         items,
         cooked_weight_grams=Decimal("416"),
-        target_description="Описание A",
+        target_description="Описание A\nПоследняя синхронизация: 01.01.2026 00:00",
     )
     changed_description = _recipe_list_request_fingerprint(
         "Тест",
@@ -2865,11 +2895,21 @@ def test_recipe_list_fingerprint_distinguishes_cooked_weight_and_target_descript
         [],
         items,
         cooked_weight_grams=Decimal("415"),
-        target_description="Описание B",
+        target_description="Описание B\nПоследняя синхронизация: 01.01.2026 00:00",
     )
 
     assert first == same
     assert len({first, changed_weight, changed_description}) == 3
+
+    changed_timestamp = _recipe_list_request_fingerprint(
+        "Тест",
+        Decimal("1"),
+        [],
+        items,
+        cooked_weight_grams=Decimal("415"),
+        target_description="Описание A\nПоследняя синхронизация: 02.01.2026 00:01",
+    )
+    assert changed_timestamp == first
 
 
 def test_storage_next_available_recipe_title_skips_existing_titles(tmp_path) -> None:
@@ -3486,7 +3526,10 @@ def test_edit_recipe_from_list_preserves_metadata_and_replaces_all_account_versi
         source_recipe = Recipe(
             id="source-1",
             title="Семейный омлет",
-            description="Описание из FatSecret",
+            description=(
+                "Описание из FatSecret\n"
+                "Последняя синхронизация: 01.01.2026 00:00"
+            ),
             portions=Decimal("2"),
             prep_time=12,
             cook_time=34,
@@ -3557,7 +3600,10 @@ def test_edit_recipe_from_list_preserves_metadata_and_replaces_all_account_versi
             assert len(client.recipes) == 1
             remote = next(iter(client.recipes.values()))
             assert remote.title == source_recipe.title
-            assert remote.description == source_recipe.description
+            assert remote.description.startswith(
+                "Описание из FatSecret\nПоследняя синхронизация: "
+            )
+            assert "01.01.2026 00:00" not in remote.description
             assert remote.prep_time == source_recipe.prep_time
             assert remote.cook_time == source_recipe.cook_time
             assert remote.portions == Decimal("4")
@@ -3565,7 +3611,10 @@ def test_edit_recipe_from_list_preserves_metadata_and_replaces_all_account_versi
             assert [ingredient.title for ingredient in remote.ingredients] == ["Яйцо", "Сыр"]
         stored = storage.get_recipe(result.recipe_id)
         assert stored is not None
-        assert stored.description == source_recipe.description
+        assert stored.description.startswith(
+            "Описание из FatSecret\nПоследняя синхронизация: "
+        )
+        assert "01.01.2026 00:00" not in stored.description
         assert stored.prep_time == source_recipe.prep_time
         assert stored.cook_time == source_recipe.cook_time
         assert [ingredient.id for ingredient in stored.ingredients] == [
@@ -3708,7 +3757,9 @@ def test_edit_recipe_from_list_propagates_and_removes_cooked_description_then_no
         for client in (source, target):
             assert client.create_calls == 2
             remote = next(iter(client.recipes.values()))
-            assert remote.description == "Примечание"
+            assert remote.description.startswith(
+                "Примечание\nПоследняя синхронизация: "
+            )
             assert recipe_cooked_weight_from_description(remote.description) is None
 
         plain_source = next(iter(source.recipes.values()))
@@ -3974,7 +4025,10 @@ def test_edit_recipe_from_list_scopes_idempotency_to_source_and_replacement_iden
         storage.close()
 
 
-def test_edit_recipe_from_list_resumes_exact_journal_after_validated_source_was_replaced(tmp_path) -> None:
+def test_edit_recipe_from_list_resumes_journal_after_source_was_replaced(
+    tmp_path,
+    monkeypatch,
+) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         ingredient = Ingredient(
@@ -3999,6 +4053,26 @@ def test_edit_recipe_from_list_resumes_exact_journal_after_validated_source_was_
         client.recipes[source_recipe.id] = source_recipe
         engine = RecipeSyncEngine(storage, _device())
         engine._build_clients = lambda group_id=None: {"tg11": client}  # type: ignore[method-assign]
+        original_last_update = recipe_description_with_last_update
+        update_calls = 0
+
+        def advancing_last_update(
+            description,
+            now=None,
+            timezone="Europe/Minsk",
+        ):  # noqa: ANN001
+            nonlocal update_calls
+            update_calls += 1
+            effective_now = dt.datetime(2026, 9, 10, 20, 15, tzinfo=dt.UTC)
+            if update_calls > 1:
+                effective_now = dt.datetime(2026, 9, 10, 20, 17, tzinfo=dt.UTC)
+            return original_last_update(description, effective_now, timezone)
+
+        monkeypatch.setattr(
+            sync_module,
+            "recipe_description_with_last_update",
+            advancing_last_update,
+        )
         original_finalize = storage.finalize_recipe_list_run
         finalize_calls = 0
 
@@ -4051,6 +4125,9 @@ def test_edit_recipe_from_list_resumes_exact_journal_after_validated_source_was_
         assert stored.portions == Decimal("3")
         assert stored.steps == ["Взбить", "Запечь"]
         assert recipe_cooked_weight_from_description(stored.description) == Decimal("80")
+        assert "Проверенный источник" in stored.description
+        assert "Последняя синхронизация: 10.09.2026 23:15" in stored.description
+        assert "23:17" not in stored.description
     finally:
         storage.close()
 
@@ -5317,9 +5394,26 @@ def test_rename_live_recipe_everywhere_updates_and_verifies_every_remote_identit
             remote_ids={"tg11": "111", "tg22": "222"},
             remote_ids_by_account={"tg11": ["111", "112"], "tg22": ["222"]},
         )
-        first = FakeFatSecretClient(Recipe(id="111", title="Омлет"), account_key="tg11")
-        first.recipes["112"] = Recipe(id="112", title="Омлет")
-        second = FakeFatSecretClient(Recipe(id="222", title="Омлет"), account_key="tg22")
+        old_description = (
+            "Мой текст\n"
+            "Последняя синхронизация: 01.01.2026 00:00\n"
+            "⚖️ Готовый вес: 80 г; вес ингредиентов: 100 г; коэффициент: 1.250. "
+            "Вес готовой порции × 1.250 = эквивалентный вес рецепта; "
+            "результат округлить до целых граммов."
+        )
+        first = FakeFatSecretClient(
+            Recipe(id="111", title="Омлет", description=old_description),
+            account_key="tg11",
+        )
+        first.recipes["112"] = Recipe(
+            id="112",
+            title="Омлет",
+            description=old_description,
+        )
+        second = FakeFatSecretClient(
+            Recipe(id="222", title="Омлет", description=old_description),
+            account_key="tg22",
+        )
         engine = RecipeSyncEngine(storage, _device())
         engine._build_clients = lambda group_id=None: {"tg11": first, "tg22": second}  # type: ignore[method-assign]
 
@@ -5333,6 +5427,17 @@ def test_rename_live_recipe_everywhere_updates_and_verifies_every_remote_identit
         assert {recipe.title for recipe in first.recipes.values()} == {"Омлет новый"}
         assert second.recipes["222"].title == "Омлет новый"
         assert storage.remote_recipe_snapshot("tg11", "112")[0].title == "Омлет новый"
+        renamed_recipes = [*first.recipes.values(), second.recipes["222"]]
+        descriptions = {recipe.description for recipe in renamed_recipes}
+        assert len(descriptions) == 1
+        updated_description = descriptions.pop()
+        assert updated_description.startswith(
+            "Мой текст\nПоследняя синхронизация: "
+        )
+        assert "01.01.2026 00:00" not in updated_description
+        assert recipe_cooked_weight_from_description(updated_description) == Decimal(
+            "80"
+        )
     finally:
         storage.close()
 

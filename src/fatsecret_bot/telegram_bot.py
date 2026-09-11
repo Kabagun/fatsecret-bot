@@ -3050,7 +3050,11 @@ class TelegramRecipeBot:
     async def _edit_recipe_rename_status(self, target, text: str, **kwargs) -> None:
         """Edit either a callback query message or a status Message."""
         edit = target.edit_message_text if hasattr(target, "edit_message_text") else target.edit_text
-        await edit(text, **kwargs)
+        try:
+            await edit(text, **kwargs)
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).casefold():
+                raise
 
     def _recipe_rename_back_callback(self, context: ContextTypes.DEFAULT_TYPE, recipe_id: str) -> str:
         page = max(0, int(context.user_data.get("recipe_list_page") or 0))

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
+from telegram.error import BadRequest
 
 from fatsecret_bot.models import (
     DiaryCopyPreview,
@@ -2709,8 +2710,12 @@ def test_recipe_rename_replaces_duplicate_only_after_selected_recipe_is_renamed(
     class FakeTarget:
         def __init__(self) -> None:
             self.messages: list[str] = []
+            self.rejected_identical_status = False
 
         async def edit_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
+            if not self.rejected_identical_status:
+                self.rejected_identical_status = True
+                raise BadRequest("Message is not modified")
             self.messages.append(text)
 
     class FakeEngine:
@@ -2753,10 +2758,22 @@ def test_recipe_rename_replaces_duplicate_only_after_selected_recipe_is_renamed(
             ("rename", {("tg11", "111")}),
             ("delete", {("tg11", "222")}),
         ]
+        assert bot.sync_engine.loads == 2
+        assert target.rejected_identical_status is True
         assert "Прежний одноимённый рецепт удалён" in target.messages[-1]
         assert context.user_data["current_recipe_id"] == "renamed"
     finally:
         storage.close()
+
+
+def test_recipe_rename_status_reraises_other_bad_requests() -> None:
+    bot = object.__new__(TelegramRecipeBot)
+    target = SimpleNamespace(
+        edit_text=AsyncMock(side_effect=BadRequest("Chat not found"))
+    )
+
+    with pytest.raises(BadRequest, match="Chat not found"):
+        asyncio.run(bot._edit_recipe_rename_status(target, "status"))
 
 
 def test_accounts_keyboard_and_lookup_allow_only_owner_account_actions(tmp_path) -> None:

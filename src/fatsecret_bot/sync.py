@@ -53,6 +53,7 @@ RECIPE_LIST_SEARCH_CONCURRENCY = 4
 MAX_DIARY_COPY_DAYS = 7
 CUSTOM_FOOD_BRAND_CATALOG_TTL = dt.timedelta(hours=24)
 COOKED_WEIGHT_DESCRIPTION_PREFIX = "⚖️ Готовый вес:"
+LAST_UPDATE_DESCRIPTION_PREFIX = "Последняя синхронизация:"
 _COOKED_WEIGHT_QUANTUM = Decimal("0.001")
 _COOKED_WEIGHT_DESCRIPTION_RE = re.compile(
     rf"^{re.escape(COOKED_WEIGHT_DESCRIPTION_PREFIX)} "
@@ -61,6 +62,10 @@ _COOKED_WEIGHT_DESCRIPTION_RE = re.compile(
     r"коэффициент: (?P<coefficient>[0-9]+\.[0-9]{3})\. "
     r"Вес готовой порции × (?P=coefficient) = эквивалентный вес рецепта; "
     r"результат округлить до целых граммов\.$"
+)
+_LAST_UPDATE_DESCRIPTION_RE = re.compile(
+    rf"^{re.escape(LAST_UPDATE_DESCRIPTION_PREFIX)} "
+    r"(?P<updated_at>[0-9]{2}\.[0-9]{2}\.[0-9]{4} [0-9]{2}:[0-9]{2})$"
 )
 
 
@@ -119,6 +124,71 @@ def _description_line_parts(description: str) -> list[tuple[str, str]]:
     if description and not parts:
         parts.append((description, ""))
     return parts
+
+
+def _managed_last_update(match_text: str) -> bool:
+    match = _LAST_UPDATE_DESCRIPTION_RE.fullmatch(match_text)
+    if match is None:
+        return False
+    try:
+        dt.datetime.strptime(match.group("updated_at"), "%d.%m.%Y %H:%M")
+    except ValueError:
+        return False
+    return True
+
+
+def _description_last_update_key(description: str) -> str:
+    """Normalize exact managed timestamps for durable operation identity."""
+    return "".join(
+        (
+            f"{LAST_UPDATE_DESCRIPTION_PREFIX} <managed>"
+            if _managed_last_update(content)
+            else content
+        )
+        + ending
+        for content, ending in _description_line_parts(description)
+    )
+
+
+def recipe_description_with_last_update(
+    description: str,
+    now: dt.datetime | None = None,
+    timezone: str = "Europe/Minsk",
+) -> str:
+    """Replace or append one managed update line while preserving all other text."""
+    lines = _description_line_parts(description)
+    managed_indexes = {
+        index
+        for index, (content, _) in enumerate(lines)
+        if _managed_last_update(content)
+    }
+    managed_line = _sync_description(now, timezone)
+    if managed_indexes:
+        first_managed = min(managed_indexes)
+        replaced: list[tuple[str, str]] = []
+        for index, part in enumerate(lines):
+            if index == first_managed:
+                replaced.append((managed_line, part[1]))
+            elif index not in managed_indexes:
+                replaced.append(part)
+        if (
+            max(managed_indexes) == len(lines) - 1
+            and first_managed != len(lines) - 1
+            and replaced[-1][0]
+        ):
+            replaced[-1] = (replaced[-1][0], "")
+        return "".join(content + ending for content, ending in replaced)
+
+    if not description:
+        return managed_line
+    if "\r\n" in description:
+        newline = "\r\n"
+    elif "\r" in description:
+        newline = "\r"
+    else:
+        newline = "\n"
+    separator = "" if description.endswith(("\n", "\r")) else newline
+    return f"{description}{separator}{managed_line}"
 
 
 def recipe_description_with_cooked_weight(
@@ -324,7 +394,7 @@ def _recipe_list_request_fingerprint(
             else None
         ),
         "target_description": (
-            target_description
+            _description_last_update_key(target_description)
             if target_description is not None
             else {"mode": "generated_sync_timestamp"}
         ),
@@ -3603,7 +3673,10 @@ class RecipeSyncEngine:
                     connected_account_keys,
                 )
                 target_description = recipe_description_with_cooked_weight(
-                    cached_source.description,
+                    recipe_description_with_last_update(
+                        cached_source.description,
+                        timezone=self.timezone,
+                    ),
                     raw_grams,
                     cooked_weight_grams,
                 )
@@ -3649,7 +3722,8 @@ class RecipeSyncEngine:
                 if (
                     normalize_title(str(recovery_run["requested_title"]))
                     != normalize_title(cached_source.title)
-                    or journal_recipe.description != target_description
+                    or _description_last_update_key(journal_recipe.description)
+                    != _description_last_update_key(target_description)
                     or journal_recipe.prep_time != cached_source.prep_time
                     or journal_recipe.cook_time != cached_source.cook_time
                     or journal_recipe.portions != portions
@@ -3672,7 +3746,14 @@ class RecipeSyncEngine:
                     remote_ids={source_account_key: source_remote_id},
                     remote_ids_by_account={source_account_key: [source_remote_id]},
                 )
-                source_metadata = cached_source
+                source_metadata = _copy_recipe_from_remote(
+                    live_recipe_id,
+                    cached_source,
+                )
+                source_metadata.description = recipe_description_with_last_update(
+                    cached_source.description,
+                    timezone=self.timezone,
+                )
                 await self._close_clients(clients)
                 clients = {}
                 return await self._create_recipe_from_list(
@@ -3854,7 +3935,11 @@ class RecipeSyncEngine:
                     if remote_ids
                 },
             )
-            source_metadata = source_transport
+            source_metadata = _copy_recipe_from_remote(live_recipe_id, source_transport)
+            source_metadata.description = recipe_description_with_last_update(
+                source_transport.description,
+                timezone=self.timezone,
+            )
             operation_identity = _recipe_edit_operation_identity(
                 source_account_key,
                 source_remote_id,
@@ -4972,6 +5057,7 @@ class RecipeSyncEngine:
 
         clients = self._build_clients(recipe_ref.group_id)
         results: list[AccountSyncResult] = []
+        updated_at = dt.datetime.now(dt.UTC)
         try:
             account_keys = set(recipe_ref.remote_ids) | set(recipe_ref.remote_ids_by_account)
             for account_key in sorted(account_keys):
@@ -4992,11 +5078,26 @@ class RecipeSyncEngine:
                     try:
                         expected = await client.get_recipe(remote_id)
                         expected.title = final_title
+                        expected.description = recipe_description_with_last_update(
+                            expected.description,
+                            updated_at,
+                            self.timezone,
+                        )
                         await self._save_recipe_meta_with_readback(client, expected, remote_id)
                         actual = await client.get_recipe(remote_id)
                         if normalize_title(actual.title) != normalize_title(final_title):
                             raise FatSecretError(
                                 f"{client.account.label}: после переименования FatSecret вернул «{actual.title}»"
+                            )
+                        differences = recipe_fingerprint_diff(
+                            recipe_fingerprint(expected),
+                            recipe_fingerprint(actual),
+                        )
+                        if differences:
+                            raise FatSecretError(
+                                f"{client.account.label}: после переименования "
+                                "FatSecret изменил рецепт: "
+                                + "; ".join(differences)
                             )
                         self.storage.upsert_remote_recipe_snapshot(
                             account_key,
