@@ -3625,7 +3625,7 @@ def test_edit_recipe_from_list_preserves_metadata_and_replaces_all_account_versi
         storage.close()
 
 
-def test_edit_recipe_from_list_is_noop_only_when_every_account_has_one_identical_version(tmp_path) -> None:
+def test_edit_recipe_from_list_treats_mapped_personal_food_ids_as_idempotent(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         source_recipe = Recipe(
@@ -3663,13 +3663,22 @@ def test_edit_recipe_from_list_is_noop_only_when_every_account_has_one_identical
             "tg22": target,
         }
 
+        item = _resolved_recipe_item(source_recipe.ingredients[0])
+        item = replace(
+            item,
+            custom_food_ids={
+                "tg11": "source-food-egg",
+                "tg22": "target-food-egg",
+            },
+        )
+
         result = asyncio.run(
             engine.edit_recipe_from_list(
                 "group",
                 "tg11",
                 source_recipe.id,
                 recipe_fingerprint(source_recipe).digest,
-                [_resolved_recipe_item(source_recipe.ingredients[0])],
+                [item],
                 updated_by=11,
                 portions=source_recipe.portions,
                 steps=source_recipe.steps,
@@ -3681,6 +3690,78 @@ def test_edit_recipe_from_list_is_noop_only_when_every_account_has_one_identical
         assert source.saved_meta == target.saved_meta == []
         assert source.deleted_recipe_ids == target.deleted_recipe_ids == []
         assert storage._conn.execute("SELECT COUNT(*) FROM recipe_list_runs").fetchone()[0] == 0
+    finally:
+        storage.close()
+
+
+def test_edit_recipe_from_list_replaces_public_food_with_same_content_but_different_id(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        source_recipe = Recipe(
+            id="source-1",
+            title="Отбивная",
+            description="Без изменений",
+            portions=Decimal("2"),
+            prep_time=3,
+            cook_time=7,
+            steps=["Запечь"],
+            ingredients=[
+                Ingredient(
+                    "ingredient-breadcrumbs",
+                    "source-1",
+                    "22626016",
+                    "Сухари Панировочные",
+                    "source-portion",
+                    Decimal("0.4"),
+                    "100г",
+                    grams=Decimal("40"),
+                )
+            ],
+        )
+        target_recipe = copy.deepcopy(source_recipe)
+        target_recipe.id = "target-1"
+        target_recipe.ingredients[0].recipe_id = target_recipe.id
+        source = FakeCreateClient("tg11")
+        target = FakeCreateClient("tg22")
+        source.recipes[source_recipe.id] = source_recipe
+        target.recipes[target_recipe.id] = target_recipe
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {  # type: ignore[method-assign]
+            "tg11": source,
+            "tg22": target,
+        }
+        selected = Ingredient(
+            "ingredient-breadcrumbs",
+            "source-1",
+            "79504025",
+            "Сухари Панировочные",
+            "selected-portion",
+            Decimal("40"),
+            "г",
+            grams=Decimal("40"),
+        )
+
+        result = asyncio.run(
+            engine.edit_recipe_from_list(
+                "group",
+                "tg11",
+                source_recipe.id,
+                recipe_fingerprint(source_recipe).digest,
+                [_resolved_recipe_item(selected)],
+                updated_by=11,
+                portions=source_recipe.portions,
+                steps=source_recipe.steps,
+            )
+        )
+
+        assert all(item.message != "без изменений" for item in result.results)
+        assert [source.create_calls, target.create_calls] == [1, 1]
+        assert source.deleted_recipe_ids == [source_recipe.id]
+        assert target.deleted_recipe_ids == [target_recipe.id]
+        assert [
+            next(iter(client.recipes.values())).ingredients[0].food_id
+            for client in (source, target)
+        ] == ["79504025", "79504025"]
     finally:
         storage.close()
 

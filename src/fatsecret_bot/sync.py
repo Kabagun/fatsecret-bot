@@ -3886,12 +3886,29 @@ class RecipeSyncEngine:
                     )
                     current_recipes[(account_key, remote_id)] = comparison_recipe
 
+            expected_custom_food_ids = {
+                item.ingredient.id: dict(item.custom_food_ids)
+                for item in items
+                if item.custom_food_ids
+            }
+            expected_recipes_by_account = {
+                account_key: _recipe_for_account(
+                    edited_recipe,
+                    account_key,
+                    expected_custom_food_ids,
+                )
+                for account_key in clients
+            }
             all_accounts_identical = all(
                 len(remote_ids_by_account[account_key]) == 1
                 and recipe_content_fingerprint(
                     current_recipes[(account_key, remote_ids_by_account[account_key][0])]
                 ).digest
                 == expected_content_digest
+                and not _recipe_ingredient_membership_differences(
+                    expected_recipes_by_account[account_key],
+                    current_recipes[(account_key, remote_ids_by_account[account_key][0])],
+                )
                 for account_key in clients
             )
             if all_accounts_identical:
