@@ -3941,6 +3941,20 @@ class TelegramRecipeBot:
                 ),
             )
             return
+        logger.info(
+            "Recipe edit confirmation ingredients count=%d items=%s",
+            len(items),
+            [
+                {
+                    "index": index,
+                    "food_id": item.ingredient.food_id,
+                    "title": item.ingredient.title,
+                    "brand": item.brand,
+                    "custom_food_ids": dict(sorted(item.custom_food_ids.items())),
+                }
+                for index, item in enumerate(items)
+            ],
+        )
         await query.edit_message_text("Проверяю исходную версию и сохраняю рецепт во всех аккаунтах…")
         try:
             edited = await self.sync_engine.edit_recipe_from_list(
@@ -6301,6 +6315,29 @@ class TelegramRecipeBot:
                 parse_mode=ParseMode.HTML,
             )
             return
+        logger.info(
+            "Recipe candidate page displayed query=%r grams=%s page=%d count=%d",
+            search_query,
+            grams,
+            page,
+            len(visible_candidates),
+        )
+        for visible_index, candidate in enumerate(visible_candidates):
+            logger.info(
+                "Recipe candidate displayed query=%r grams=%s page=%d visible_index=%d absolute_index=%d "
+                "food_id=%s title=%r brand=%r source=%r usage_count=%d food_source_account_key=%s",
+                search_query,
+                grams,
+                page,
+                visible_index,
+                start + visible_index,
+                candidate.ingredient.food_id,
+                candidate.ingredient.title,
+                candidate.brand,
+                candidate.source,
+                candidate.usage_count,
+                candidate.food_source_account_key or "-",
+            )
         context.user_data["mode"] = "recipe_list_replace_query"
         context.user_data["recipe_list_replace_page"] = page
         context.user_data["recipe_list_candidates"] = visible_candidates
@@ -6368,6 +6405,29 @@ class TelegramRecipeBot:
                 ),
             )
             return
+        selected = candidates[candidate_index]
+        old_draft = (
+            draft_items[replace_index]
+            if replace_kind != "unresolved" and 0 <= replace_index < len(draft_items)
+            else None
+        )
+        logger.info(
+            "Recipe candidate picked edit_flow=%s replace_kind=%s replace_index=%d selected_index=%d "
+            "food_id=%s title=%r brand=%r source=%r usage_count=%d food_source_account_key=%s "
+            "old_food_id=%s old_title=%r",
+            self._recipe_edit_is_active(context),
+            replace_kind,
+            replace_index,
+            candidate_index,
+            selected.ingredient.food_id,
+            selected.ingredient.title,
+            selected.brand,
+            selected.source,
+            selected.usage_count,
+            selected.food_source_account_key or "-",
+            old_draft.ingredient.food_id if old_draft is not None else "-",
+            old_draft.ingredient.title if old_draft is not None else "",
+        )
         if replace_kind == "unresolved":
             if not isinstance(unresolved, list) or replace_index < 0 or replace_index >= len(unresolved):
                 await query.edit_message_text(
@@ -6377,9 +6437,10 @@ class TelegramRecipeBot:
                     ),
                 )
                 return
-            draft_items.append(candidates[candidate_index])
+            draft_items.append(selected)
             unresolved.pop(replace_index)
             context.user_data["recipe_list_unresolved"] = unresolved
+            result_index = len(draft_items) - 1
         else:
             if replace_index < 0 or replace_index >= len(draft_items):
                 await query.edit_message_text(
@@ -6389,7 +6450,19 @@ class TelegramRecipeBot:
                     ),
                 )
                 return
-            draft_items[replace_index] = candidates[candidate_index]
+            draft_items[replace_index] = selected
+            result_index = replace_index
+        result_item = draft_items[result_index]
+        logger.info(
+            "Recipe draft candidate replaced edit_flow=%s replace_kind=%s draft_index=%d "
+            "food_id=%s title=%r brand=%r",
+            self._recipe_edit_is_active(context),
+            replace_kind,
+            result_index,
+            result_item.ingredient.food_id,
+            result_item.ingredient.title,
+            result_item.brand,
+        )
         context.user_data["recipe_list_draft"] = draft_items
         await self._edit_recipe_list_draft(query, context)
 

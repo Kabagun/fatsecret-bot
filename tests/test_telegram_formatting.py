@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
 import time
 from decimal import Decimal
 from types import SimpleNamespace
@@ -1234,7 +1235,7 @@ def test_on_text_dispatches_cooked_weight_mode() -> None:
     bot._handle_recipe_list_cooked_weight.assert_awaited_once_with(update, context, "415 г")
 
 
-def test_recipe_edit_confirmation_passes_approved_source_and_refreshes_cache(tmp_path) -> None:
+def test_recipe_edit_confirmation_passes_approved_source_and_refreshes_cache(tmp_path, caplog) -> None:
     storage, group, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
     try:
         source = _flow_variant(recipe_ref, "tg11", "111", grams="100")
@@ -1252,6 +1253,8 @@ def test_recipe_edit_confirmation_passes_approved_source_and_refreshes_cache(tmp
                 grams=Decimal("125"),
             ),
             source="recipe-edit",
+            brand="Санта",
+            custom_food_ids={"tg11": "food-egg"},
         )
         context.user_data.update(
             {
@@ -1285,7 +1288,8 @@ def test_recipe_edit_confirmation_passes_approved_source_and_refreshes_cache(tmp
             load_remote_recipe_index=AsyncMock(return_value=[recipe_ref]),
         )
 
-        asyncio.run(bot._confirm_recipe_edit(query, context, 11, "edit-token"))
+        with caplog.at_level(logging.INFO, logger="fatsecret_bot.telegram_bot"):
+            asyncio.run(bot._confirm_recipe_edit(query, context, 11, "edit-token"))
 
         edit_recipe.assert_awaited_once_with(
             group.id,
@@ -1302,6 +1306,16 @@ def test_recipe_edit_confirmation_passes_approved_source_and_refreshes_cache(tmp
         assert context.chat_data["recipe_cache"] == [recipe_ref]
         assert "recipe_edit_source_digest" not in context.user_data
         assert "recipe_variants" not in context.user_data
+        diagnostic = next(
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Recipe edit confirmation ingredients")
+        )
+        assert f"'food_id': '{source.recipe.ingredients[0].food_id}'" in diagnostic
+        assert "'title': 'Яйцо'" in diagnostic
+        assert "'brand': 'Санта'" in diagnostic
+        assert "'custom_food_ids': {'tg11': 'food-egg'}" in diagnostic
+        assert "edit-token" not in diagnostic
     finally:
         storage.close()
 
@@ -1497,6 +1511,87 @@ def test_recipe_edit_replacement_error_keeps_mode_without_inline_cancel(tmp_path
         assert bot.sync_engine.recipe_list_candidates.await_args.kwargs["preferred_account_key"] == "tg11"
     finally:
         storage.close()
+
+
+def test_recipe_edit_candidate_diagnostics_log_displayed_and_picked_ids(caplog) -> None:
+    old_item = ResolvedRecipeListItem(
+        requested_query="сухари",
+        grams=Decimal("40"),
+        ingredient=Ingredient(
+            id="old-ingredient",
+            recipe_id="recipe-cutlet",
+            food_id="old-breadcrumbs",
+            title="Сухари Панировочные",
+            portion_id="0",
+            amount=Decimal("0.4"),
+            portion_description="100г",
+            grams=Decimal("40"),
+        ),
+        source="recipe-edit",
+    )
+    selected = ResolvedRecipeListItem(
+        requested_query="сухари",
+        grams=Decimal("40"),
+        ingredient=Ingredient(
+            id="selected-ingredient",
+            recipe_id="",
+            food_id="santa-breadcrumbs",
+            title="Сухари Панировочные",
+            portion_id="portion-100g",
+            amount=Decimal("0.4"),
+            portion_description="100г",
+            grams=Decimal("40"),
+        ),
+        source="FatSecret",
+        brand="Санта",
+        usage_count=7,
+        food_source_account_key="source-account",
+        custom_food_ids={"source-account": "santa-breadcrumbs"},
+    )
+    context = SimpleNamespace(
+        user_data={
+            "group_id": "group",
+            "recipe_edit_source_account_key": "source-account",
+            "recipe_edit_source_remote_id": "remote-cutlet",
+            "recipe_edit_source_digest": "source-digest",
+            "recipe_edit_token": "opaque-edit-token",
+            "recipe_list_draft": [old_item],
+            "recipe_list_unresolved": [],
+            "recipe_list_replace_index": 0,
+            "recipe_list_replace_kind": "resolved",
+            "recipe_list_replace_query": "сухари",
+            "recipe_list_candidates_cache": [],
+            "recipe_list_candidates_exhausted": False,
+        }
+    )
+    query = SimpleNamespace(edit_message_text=AsyncMock())
+    bot = object.__new__(TelegramRecipeBot)
+    bot.sync_engine = SimpleNamespace(recipe_list_candidates=AsyncMock(return_value=[selected]))
+    bot._edit_recipe_list_draft = AsyncMock()
+
+    with caplog.at_level(logging.INFO, logger="fatsecret_bot.telegram_bot"):
+        asyncio.run(bot._show_recipe_list_replacements(query, context, page=0))
+        asyncio.run(bot._pick_recipe_list_candidate(query, context, candidate_index=0))
+
+    diagnostics = "\n".join(record.getMessage() for record in caplog.records)
+    assert (
+        "Recipe candidate displayed query='сухари' grams=40 page=0 visible_index=0 absolute_index=0 "
+        "food_id=santa-breadcrumbs title='Сухари Панировочные' brand='Санта' source='FatSecret' "
+        "usage_count=7 food_source_account_key=source-account"
+    ) in diagnostics
+    assert (
+        "Recipe candidate picked edit_flow=True replace_kind=resolved replace_index=0 selected_index=0 "
+        "food_id=santa-breadcrumbs title='Сухари Панировочные' brand='Санта' source='FatSecret' "
+        "usage_count=7 food_source_account_key=source-account old_food_id=old-breadcrumbs "
+        "old_title='Сухари Панировочные'"
+    ) in diagnostics
+    assert (
+        "Recipe draft candidate replaced edit_flow=True replace_kind=resolved draft_index=0 "
+        "food_id=santa-breadcrumbs title='Сухари Панировочные' brand='Санта'"
+    ) in diagnostics
+    assert "opaque-edit-token" not in diagnostics
+    assert context.user_data["recipe_list_draft"][0] is selected
+    bot._edit_recipe_list_draft.assert_awaited_once_with(query, context)
 
 
 def test_recipe_edit_start_ignores_variant_index_for_another_recipe(tmp_path) -> None:
