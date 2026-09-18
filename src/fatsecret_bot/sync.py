@@ -4244,6 +4244,10 @@ class RecipeSyncEngine:
                     account["status"] = "old_deleted"
 
                 recipe.title = str(run["requested_title"])
+                recipe.description = recipe_description_with_last_update(
+                    recipe.description,
+                    timezone=self.timezone,
+                )
                 self.storage.update_recipe_list_run_payload(
                     str(run["id"]),
                     _recipe_list_payload_json(recipe, requested_queries, custom_food_ids),
@@ -4251,8 +4255,6 @@ class RecipeSyncEngine:
                 for account_key, client in clients.items():
                     active_account_key = account_key
                     account = account_rows[account_key]
-                    if str(account["status"]) in {"renamed", "completed"}:
-                        continue
                     remote_id = str(account["new_remote_id"])
                     account_recipe = _recipe_for_account(recipe, account_key, custom_food_ids)
                     await self._save_recipe_meta_with_readback(client, account_recipe, remote_id)

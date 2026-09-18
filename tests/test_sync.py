@@ -4187,6 +4187,9 @@ def test_edit_recipe_from_list_resumes_journal_after_source_was_replaced(
         assert source_recipe.id not in client.recipes
         assert client.create_calls == 1
         assert storage._conn.execute("SELECT status FROM recipe_list_runs").fetchone()[0] == "recovery_pending"
+        saved_remote = next(iter(client.recipes.values()))
+        assert "Последняя синхронизация: 10.09.2026 23:17" in saved_remote.description
+        assert "23:15" not in saved_remote.description
 
         resumed = asyncio.run(
             engine.edit_recipe_from_list(
@@ -4207,8 +4210,8 @@ def test_edit_recipe_from_list_resumes_journal_after_source_was_replaced(
         assert stored.steps == ["Взбить", "Запечь"]
         assert recipe_cooked_weight_from_description(stored.description) == Decimal("80")
         assert "Проверенный источник" in stored.description
-        assert "Последняя синхронизация: 10.09.2026 23:15" in stored.description
-        assert "23:17" not in stored.description
+        assert "Последняя синхронизация: 10.09.2026 23:17" in stored.description
+        assert "23:15" not in stored.description
     finally:
         storage.close()
 
