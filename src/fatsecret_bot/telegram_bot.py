@@ -222,13 +222,23 @@ def _format_recipe(recipe: Recipe) -> str:
     )
     if not ingredients:
         ingredients = "Ингредиентов пока нет."
-    description = f"\n\n{html.escape(recipe.description)}" if recipe.description else ""
+    weight_lines = []
+    description_lines = []
+    for line in recipe.description.splitlines():
+        if recipe_cooked_weight_from_description(line) is not None:
+            weight_lines.append(line)
+        else:
+            description_lines.append(line)
+    weight_text = "".join(f"\n{html.escape(line)}" for line in weight_lines)
+    description_body = "\n".join(description_lines).strip()
+    description = f"\n\n{html.escape(description_body)}" if description_body else ""
     steps = "\n".join(_format_steps_lines(recipe.steps))
     steps_text = f"\n\n<b>Шаги</b>\n{steps}" if steps else ""
     return (
         f"<b>{html.escape(recipe.title)}</b>\n"
-        f"Порций: {_format_decimal_plain(recipe.portions)}; "
-        f"подготовка: {recipe.prep_time} мин; готовка: {recipe.cook_time} мин"
+        f"Порций: {_format_decimal_plain(recipe.portions)}"
+        f"{weight_text}\n"
+        f"Подготовка: {recipe.prep_time} мин; готовка: {recipe.cook_time} мин"
         f"{description}\n\n"
         f"<b>Ингредиенты</b>\n{ingredients}"
         f"{steps_text}"
@@ -603,6 +613,20 @@ def _recipe_versions_differ(
     return len({variant.fingerprint.digest for variant in variants}) > 1
 
 
+def _recipe_needs_sync(
+    variants: list[RemoteRecipeVariant],
+    connected_account_keys: set[str],
+) -> bool:
+    """Return whether a recipe can be synchronized across multiple connected accounts."""
+    if len(connected_account_keys) <= 1 or not variants:
+        return False
+    present_account_keys = {variant.account_key for variant in variants}
+    return bool(connected_account_keys - present_account_keys) or _recipe_versions_differ(
+        variants,
+        connected_account_keys,
+    )
+
+
 def _recipe_variant_strict_digest(variant: RemoteRecipeVariant) -> str:
     """Return the raw account-specific digest coupled to one hydrated display variant."""
     return (variant.strict_fingerprint or recipe_fingerprint(variant.recipe)).digest
@@ -691,31 +715,35 @@ def _recipe_actions_keyboard(
     *,
     can_sync: bool = False,
     export_variant_index: int = -1,
+    sync_variant_index: int = -1,
 ) -> InlineKeyboardMarkup:
     page_action = page_action if page_action in {"list", "searchpage"} else "list"
     page = max(0, page)
     buttons = [
+        [InlineKeyboardButton("✏️ Изменить название", callback_data=f"recipe_rename:{recipe_id}")],
         [
             InlineKeyboardButton(
                 "✏️ Изменить рецепт",
                 callback_data=f"recipe_edit:{recipe_id}:{export_variant_index}",
             )
         ],
-        [
-            InlineKeyboardButton(
-                "📤 Экспортировать рецепт",
-                callback_data=f"recipe_export:{recipe_id}:{export_variant_index}",
-            )
-        ]
     ]
     if can_sync:
         buttons.append(
-            [InlineKeyboardButton("🔄 Применить эту версию везде", callback_data=f"sync:{recipe_id}")]
+            [InlineKeyboardButton(
+                "🔄 Синхронизировать",
+                callback_data=(
+                    f"syncvariant:{sync_variant_index}" if sync_variant_index >= 0 else f"sync:{recipe_id}"
+                ),
+            )]
         )
     buttons.extend(
         [
-            [InlineKeyboardButton("✏️ Изменить название", callback_data=f"recipe_rename:{recipe_id}")],
             [InlineKeyboardButton("🗑️ Удалить рецепт", callback_data=f"delete:{recipe_id}")],
+            [InlineKeyboardButton(
+                "📤 Экспортировать",
+                callback_data=f"recipe_export:{recipe_id}:{export_variant_index}",
+            )],
             [InlineKeyboardButton("⬅️ Все рецепты", callback_data=f"{page_action}:{page}")],
         ]
     )
@@ -3454,8 +3482,10 @@ class TelegramRecipeBot:
         accounts = self.storage.list_fatsecret_accounts(recipe.group_id)
         connected_account_keys = {account.key for account in accounts}
         versions_differ = bool(variants) and _recipe_versions_differ(variants, connected_account_keys)
+        needs_sync = bool(variants) and _recipe_needs_sync(variants, connected_account_keys)
         context.user_data["recipe_variants"] = variants
         context.user_data["recipe_versions_differ"] = versions_differ
+        context.user_data["recipe_needs_sync"] = needs_sync
         context.user_data.pop("current_recipe_variant_index", None)
         if recipe_ref is not None and group is not None:
             recipe.remote_ids = dict(recipe_ref.remote_ids)
@@ -3479,6 +3509,7 @@ class TelegramRecipeBot:
                 page,
                 page_action,
                 total_pages,
+                can_sync=needs_sync,
                 export_variant_index=0 if variants else -1,
             ),
             parse_mode=ParseMode.HTML,
@@ -3561,26 +3592,13 @@ class TelegramRecipeBot:
         page_action = str(context.user_data.get("recipe_page_action") or "list")
         await query.edit_message_text(
             f"<b>Версия: {html.escape(label)}</b>\n\n{_format_recipe(variant.recipe)}",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✏️ Изменить рецепт",
-                            callback_data=f"recipe_edit:{variant.recipe.id}:{index}",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "📤 Экспортировать рецепт",
-                            callback_data=f"recipe_export:{variant.recipe.id}:{index}",
-                        )
-                    ],
-                    [InlineKeyboardButton("🔄 Применить эту версию везде", callback_data=f"syncvariant:{index}")],
-                    [InlineKeyboardButton("✏️ Изменить название", callback_data=f"recipe_rename:{variant.recipe.id}")],
-                    [InlineKeyboardButton("🗑️ Удалить рецепт", callback_data=f"delete:{variant.recipe.id}")],
-                    [InlineKeyboardButton("👤 Выбрать другую версию", callback_data=f"open:{variant.recipe.id}")],
-                    [InlineKeyboardButton("⬅️ Все рецепты", callback_data=f"{page_action}:{page}")],
-                ]
+            reply_markup=_recipe_actions_keyboard(
+                variant.recipe.id,
+                page,
+                page_action,
+                can_sync=_recipe_needs_sync(variants, set(labels)),
+                export_variant_index=index,
+                sync_variant_index=index,
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -3669,6 +3687,7 @@ class TelegramRecipeBot:
             "recipe_variants",
             "current_recipe_variant_index",
             "recipe_versions_differ",
+            "recipe_needs_sync",
             "recipe_sync_preview",
         ):
             context.user_data.pop(key, None)
@@ -4153,9 +4172,11 @@ class TelegramRecipeBot:
             await query.edit_message_text("Не удалось найти живую версию рецепта в подключённых аккаунтах.")
             return
         versions_differ = _recipe_versions_differ(variants, connected_account_keys)
+        needs_sync = _recipe_needs_sync(variants, connected_account_keys)
         context.user_data["recipe_variants"] = variants
         context.user_data["recipe_versions_differ"] = versions_differ
-        if not versions_differ:
+        context.user_data["recipe_needs_sync"] = needs_sync
+        if not needs_sync:
             context.user_data.pop("recipe_sync_preview", None)
             display = variants[0].recipe
             display.remote_ids = dict(recipe_ref.remote_ids)
@@ -4197,7 +4218,10 @@ class TelegramRecipeBot:
         index: int,
     ) -> None:
         variant = self._recipe_variant(context, index)
-        if variant is None or not context.user_data.get("recipe_versions_differ"):
+        sync_allowed = context.user_data.get("recipe_needs_sync")
+        if sync_allowed is None:
+            sync_allowed = context.user_data.get("recipe_versions_differ")
+        if variant is None or not sync_allowed:
             await query.edit_message_text("Версии изменились. Открой рецепт и проверь их заново.")
             return
         variants = context.user_data.get("recipe_variants")
@@ -4207,6 +4231,23 @@ class TelegramRecipeBot:
             for account in self.storage.list_fatsecret_accounts(variant.recipe.group_id)
         }
         label = self._variant_button_label(variant, variants, labels)
+        missing_labels = [
+            account_label
+            for account_key, account_label in labels.items()
+            if account_key not in {item.account_key for item in variants}
+        ]
+        if missing_labels and context.user_data.get("recipe_versions_differ"):
+            sync_effect = (
+                "После подтверждения эта версия заменит отличающиеся версии и создаст отсутствующие "
+                f"копии в аккаунтах: {', '.join(html.escape(item) for item in missing_labels)}."
+            )
+        elif missing_labels:
+            sync_effect = (
+                "После подтверждения эта версия будет создана в аккаунтах, где рецепта ещё нет: "
+                f"{', '.join(html.escape(item) for item in missing_labels)}."
+            )
+        else:
+            sync_effect = "После подтверждения эта версия заменит отличающиеся версии в остальных подключённых аккаунтах."
         context.user_data["recipe_sync_preview"] = {
             "recipe_id": variant.recipe.id,
             "group_id": variant.recipe.group_id,
@@ -4219,7 +4260,7 @@ class TelegramRecipeBot:
         await query.edit_message_text(
             f"<b>Оригинал из аккаунта: {html.escape(label)}</b>\n\n"
             f"{_format_recipe(variant.recipe)}\n\n"
-            "После подтверждения эта версия заменит отличающиеся версии в остальных подключённых аккаунтах. "
+            f"{sync_effect} "
             "Оригинал не изменится.",
             reply_markup=InlineKeyboardMarkup(
                 [
@@ -4246,8 +4287,23 @@ class TelegramRecipeBot:
         accounts = self.storage.list_fatsecret_accounts(group.id)
         connected_account_keys = {account.key for account in accounts}
         context.user_data["recipe_variants"] = fresh_variants
-        if not _recipe_versions_differ(fresh_variants, connected_account_keys):
-            context.user_data["recipe_versions_differ"] = False
+        fresh_versions_differ = bool(fresh_variants) and _recipe_versions_differ(
+            fresh_variants,
+            connected_account_keys,
+        )
+        fresh_needs_sync = bool(fresh_variants) and _recipe_needs_sync(
+            fresh_variants,
+            connected_account_keys,
+        )
+        context.user_data["recipe_versions_differ"] = fresh_versions_differ
+        context.user_data["recipe_needs_sync"] = fresh_needs_sync
+        if not fresh_variants:
+            context.user_data.pop("recipe_sync_preview", None)
+            await query.edit_message_text(
+                "Не удалось найти живую версию рецепта в подключённых аккаунтах. Открой рецепт заново."
+            )
+            return
+        if not fresh_needs_sync:
             context.user_data.pop("recipe_sync_preview", None)
             display = fresh_variants[0].recipe
             display.remote_ids = dict(recipe_ref.remote_ids)
@@ -4281,6 +4337,7 @@ class TelegramRecipeBot:
             or _recipe_variant_strict_digest(selected) != preview.get("strict_digest")
         ):
             context.user_data["recipe_versions_differ"] = True
+            context.user_data["recipe_needs_sync"] = True
             context.user_data.pop("recipe_sync_preview", None)
             await self._show_recipe_variant_picker(
                 query,
@@ -4358,6 +4415,7 @@ class TelegramRecipeBot:
             return
         context.user_data.pop("recipe_sync_preview", None)
         context.user_data["recipe_versions_differ"] = False
+        context.user_data["recipe_needs_sync"] = False
         self._recipe_product_difference_cache(context).pop(recipe_id, None)
         lines = [
             f"{account_labels.get(result.account_key, result.account_key)}: {'OK' if result.ok else 'ERROR'}"

@@ -43,6 +43,7 @@ from fatsecret_bot.telegram_bot import (
     _recipe_export_payload,
     _recipe_list_button_text,
     _recipe_list_message,
+    _recipe_needs_sync,
     _recipe_versions_differ,
 )
 
@@ -436,10 +437,13 @@ def test_typed_or_stale_diary_flow_is_rejected_for_ordinary_user(tmp_path, mode:
 
 
 def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
+    description = recipe_description_with_cooked_weight(
+        "Описание <рецепта>", Decimal("500"), Decimal("415")
+    )
     recipe = Recipe(
         id="local",
         title="Завтрак",
-        description="Описание",
+        description=description,
         portions=Decimal("2.0"),
         prep_time=30,
         cook_time=10,
@@ -480,7 +484,11 @@ def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:
     text = _format_recipe(recipe)
 
     assert "Remote:" not in text
-    assert "Порций: 2;" in text
+    assert text.startswith("<b>Завтрак</b>\nПорций: 2\n⚖️ Готовый вес: 415 г;")
+    assert text.count("Готовый вес:") == 1
+    assert "коэффициент: 1.205" in text
+    assert "Описание &lt;рецепта&gt;" in text
+    assert recipe.description == description
     assert "- Яичный Белок: 125.25г" in text
     assert "- Соус: 6г" in text
     assert "- Кетчуп: 300г" in text
@@ -672,13 +680,13 @@ def test_recipe_actions_keyboard_keeps_only_recipe_actions_and_list_return() -> 
     keyboard = _recipe_actions_keyboard("recipe-1", page=1, page_action="list", total_pages=3)
     rows = keyboard.inline_keyboard
 
-    assert [button.text for button in rows[0]] == ["✏️ Изменить рецепт"]
-    assert rows[0][0].callback_data == "recipe_edit:recipe-1:-1"
-    assert [button.text for button in rows[1]] == ["📤 Экспортировать рецепт"]
-    assert rows[1][0].callback_data == "recipe_export:recipe-1:-1"
-    assert [button.text for button in rows[2]] == ["✏️ Изменить название"]
-    assert rows[2][0].callback_data == "recipe_rename:recipe-1"
-    assert [button.text for button in rows[3]] == ["🗑️ Удалить рецепт"]
+    assert [button.text for button in rows[0]] == ["✏️ Изменить название"]
+    assert rows[0][0].callback_data == "recipe_rename:recipe-1"
+    assert [button.text for button in rows[1]] == ["✏️ Изменить рецепт"]
+    assert rows[1][0].callback_data == "recipe_edit:recipe-1:-1"
+    assert [button.text for button in rows[2]] == ["🗑️ Удалить рецепт"]
+    assert [button.text for button in rows[3]] == ["📤 Экспортировать"]
+    assert rows[3][0].callback_data == "recipe_export:recipe-1:-1"
     assert [button.text for button in rows[4]] == ["⬅️ Все рецепты"]
     assert rows[4][0].callback_data == "list:1"
     flat_texts = [button.text for row in rows for button in row]
@@ -699,12 +707,15 @@ def test_recipe_actions_keyboard_keeps_actions_without_navigation() -> None:
     )
     flat_texts = [button.text for row in keyboard.inline_keyboard for button in row]
 
-    assert "Назад" not in flat_texts
-    assert "Дальше" not in flat_texts
-    assert "✏️ Изменить рецепт" in flat_texts
-    assert "📤 Экспортировать рецепт" in flat_texts
-    assert "🔄 Применить эту версию везде" in flat_texts
-    assert "🗑️ Удалить рецепт" in flat_texts
+    assert flat_texts == [
+        "✏️ Изменить название",
+        "✏️ Изменить рецепт",
+        "🔄 Синхронизировать",
+        "🗑️ Удалить рецепт",
+        "📤 Экспортировать",
+        "⬅️ Все рецепты",
+    ]
+    assert keyboard.inline_keyboard[2][0].callback_data == "sync:recipe-1"
 
 
 def test_recipe_export_round_trips_through_real_import_parser_with_special_characters() -> None:
@@ -1234,9 +1245,12 @@ def test_recipe_portions_text_updates_only_portions_and_preserves_draft() -> Non
         }
     )
     message = SimpleNamespace(reply_text=AsyncMock())
+    form = SimpleNamespace(edit_text=AsyncMock())
+    query = SimpleNamespace(edit_message_text=AsyncMock(), message=form)
     update = SimpleNamespace(effective_message=message)
     bot = object.__new__(TelegramRecipeBot)
 
+    asyncio.run(bot._start_recipe_list_portions(query, context))
     asyncio.run(bot._handle_recipe_list_portions(update, context, "3,5 порции"))
 
     assert context.user_data["recipe_list_portions"] == Decimal("3.5")
@@ -1244,9 +1258,16 @@ def test_recipe_portions_text_updates_only_portions_and_preserves_draft() -> Non
     assert context.user_data["recipe_list_steps"] == ["Запечь"]
     assert context.user_data["recipe_list_cooked_weight"] == Decimal("415")
     assert context.user_data["mode"] == "recipe_list_confirm"
-    rendered = message.reply_text.await_args.args[0]
+    message.reply_text.assert_not_awaited()
+    form.edit_text.assert_awaited_once()
+    rendered = form.edit_text.await_args.args[0]
+    assert rendered.startswith("<b>Рецепт: Омлет</b>")
     assert "Порций: 3.5" in rendered
     assert "Готовый вес: 415 г" in rendered
+    assert "Итого ккал/Б/Ж/У: 715/65/50/5" in rendered
+    assert "1. Яйцо | 100г: 143/13/10/1 | масса: 500г" in rendered
+    assert "<b>Шаги</b>\n1. Запечь" in rendered
+    assert form.edit_text.await_args.kwargs["reply_markup"].inline_keyboard[-1][0].text == "✅ Создать"
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "не число"])
@@ -1301,15 +1322,18 @@ def test_recipe_mass_text_updates_ingredient_grams_and_preserves_metadata() -> N
             "recipe_list_unresolved": [],
             "recipe_list_mass_index": 0,
             "recipe_list_portions": Decimal("2"),
-            "recipe_list_steps": [],
+            "recipe_list_steps": ["Запечь"],
             "recipe_list_cooked_weight": Decimal("415"),
             "mode": "recipe_list_mass",
         }
     )
     message = SimpleNamespace(reply_text=AsyncMock())
+    form = SimpleNamespace(edit_text=AsyncMock())
+    query = SimpleNamespace(edit_message_text=AsyncMock(), message=form)
     update = SimpleNamespace(effective_message=message)
     bot = object.__new__(TelegramRecipeBot)
 
+    asyncio.run(bot._start_recipe_list_mass(query, context, 0))
     asyncio.run(bot._handle_recipe_list_mass(update, context, "250,5 г"))
 
     updated = context.user_data["recipe_list_draft"][0]
@@ -1324,6 +1348,15 @@ def test_recipe_mass_text_updates_ingredient_grams_and_preserves_metadata() -> N
     assert context.user_data["recipe_list_portions"] == Decimal("2")
     assert context.user_data["recipe_list_cooked_weight"] == Decimal("415")
     assert context.user_data["mode"] == "recipe_list_confirm"
+    message.reply_text.assert_not_awaited()
+    form.edit_text.assert_awaited_once()
+    rendered = form.edit_text.await_args.args[0]
+    assert rendered.startswith("<b>Рецепт: Омлет</b>\nПорций: 2")
+    assert "Готовый вес: 415 г" in rendered
+    assert "Итого ккал/Б/Ж/У: 358/32.6/25/2.5" in rendered
+    assert "1. Яйцо (Бренд) | 100г: 143/13/10/1 | масса: 250.5г" in rendered
+    assert "<b>Шаги</b>\n1. Запечь" in rendered
+    assert form.edit_text.await_args.kwargs["reply_markup"].inline_keyboard[-1][0].text == "✅ Создать"
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "не число"])
@@ -1803,6 +1836,8 @@ def test_recipe_version_difference_compares_existing_versions_and_ignores_missin
     assert _recipe_versions_differ([same_a, same_b, duplicate_b], {"tg11", "tg22"}) is True
     assert _recipe_versions_differ([same_a, metadata_b], {"tg11", "tg22"}) is True
     assert _recipe_versions_differ([same_a, ingredient_b], {"tg11", "tg22"}) is True
+    assert _recipe_needs_sync([same_a], {"tg11", "tg22"}) is True
+    assert _recipe_needs_sync([same_a], {"tg11"}) is False
 
 
 def _two_account_recipe_flow(tmp_path):  # noqa: ANN001, ANN202
@@ -1895,9 +1930,9 @@ def test_open_identical_recipe_versions_renders_one_shared_card_without_sync(tmp
             for row in rendered.kwargs["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert "📤 Экспортировать рецепт" in buttons
+        assert "📤 Экспортировать" in buttons
         assert "✏️ Изменить рецепт" in buttons
-        assert "🔄 Применить эту версию везде" not in buttons
+        assert "🔄 Синхронизировать" not in buttons
         assert "Первый" not in rendered.args[0]
         assert context.user_data["recipe_versions_differ"] is False
     finally:
@@ -1905,8 +1940,9 @@ def test_open_identical_recipe_versions_renders_one_shared_card_without_sync(tmp
 
 
 def test_open_single_account_recipe_renders_shared_card_without_warning_or_sync(tmp_path) -> None:
-    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    storage, group, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
     try:
+        assert storage.detach_fatsecret_account_from_group("tg22", group.id, 11) is True
         variants = [_flow_variant(recipe_ref, "tg11", "111")]
         bot = object.__new__(TelegramRecipeBot)
         bot.storage = storage
@@ -1924,10 +1960,36 @@ def test_open_single_account_recipe_renders_shared_card_without_warning_or_sync(
             for row in rendered.kwargs["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert "📤 Экспортировать рецепт" in buttons
+        assert "📤 Экспортировать" in buttons
         assert "✏️ Изменить рецепт" in buttons
-        assert "🔄 Применить эту версию везде" not in buttons
+        assert "🔄 Синхронизировать" not in buttons
         assert context.user_data["recipe_versions_differ"] is False
+    finally:
+        storage.close()
+
+
+def test_recipe_needs_sync_when_one_of_two_connected_accounts_has_no_copy(tmp_path) -> None:
+    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        variants = [_flow_variant(recipe_ref, "tg11", "111")]
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=variants),
+        )
+
+        asyncio.run(bot._open_recipe(query, context, f"{recipe_ref.id}:0:list"))
+
+        rendered = query.edit_message_text.await_args
+        assert "Версии рецепта различаются" not in rendered.args[0]
+        buttons = [
+            (button.text, button.callback_data)
+            for row in rendered.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert ("🔄 Синхронизировать", f"sync:{recipe_ref.id}") in buttons
+        assert context.user_data["recipe_versions_differ"] is False
+        assert context.user_data["recipe_needs_sync"] is True
     finally:
         storage.close()
 
@@ -1986,7 +2048,7 @@ def test_selected_variant_sync_opens_its_confirmation_preview_directly(tmp_path)
             button
             for row in variant_keyboard.inline_keyboard
             for button in row
-                if button.text == "🔄 Применить эту версию везде"
+                if button.text == "🔄 Синхронизировать"
         )
         assert sync_button.callback_data == "syncvariant:1"
 
@@ -2067,6 +2129,101 @@ def test_sync_source_preview_requires_confirmation_and_passes_approval_fingerpri
             expected_source_strict_digest=recipe_fingerprint(source.recipe).digest,
         )
         assert "Синхронизация завершена" in query.edit_message_text.await_args.args[0]
+    finally:
+        storage.close()
+
+
+def test_sync_missing_target_preview_and_confirmation_remain_actionable(tmp_path) -> None:
+    storage, group, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        recipe_ref.remote_ids.pop("tg22", None)
+        recipe_ref.remote_ids_by_account.pop("tg22", None)
+        source = _flow_variant(recipe_ref, "tg11", "111", grams="100")
+        context.user_data.update(
+            {
+                "recipe_variants": [source],
+                "recipe_versions_differ": False,
+                "recipe_needs_sync": True,
+                "current_recipe_id": recipe_ref.id,
+            }
+        )
+        synced = Recipe(
+            id=recipe_ref.id,
+            title=recipe_ref.title,
+            group_id=group.id,
+            remote_ids={"tg11": "111", "tg22": "333"},
+            remote_ids_by_account={"tg11": ["111"], "tg22": ["333"]},
+        )
+        sync_live = AsyncMock(
+            return_value=(
+                synced,
+                [
+                    AccountSyncResult("tg11", "111", True, "источник"),
+                    AccountSyncResult("tg22", "333", True, "создан"),
+                ],
+            )
+        )
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=[source]),
+            sync_live_recipe_from_source=sync_live,
+        )
+
+        asyncio.run(bot._open_sync_menu(query, context, recipe_ref.id))
+        source_buttons = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
+        assert source_buttons[0][0].callback_data == "syncpreview:0"
+        asyncio.run(bot._show_sync_preview(query, context, 0))
+
+        preview = query.edit_message_text.await_args
+        assert "где рецепта ещё нет" in preview.args[0]
+
+        asyncio.run(bot._confirm_sync_preview(query, context))
+
+        sync_live.assert_awaited_once_with(
+            recipe_ref,
+            "tg11",
+            expected_source_remote_id="111",
+            expected_source_content_digest=source.fingerprint.digest,
+            expected_source_strict_digest=recipe_fingerprint(source.recipe).digest,
+        )
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("source_disappeared", [False, True])
+def test_sync_confirmation_skips_write_when_target_appears_or_source_disappears(
+    tmp_path, source_disappeared: bool
+) -> None:
+    storage, _, recipe_ref, context, query = _two_account_recipe_flow(tmp_path)
+    try:
+        recipe_ref.remote_ids.pop("tg22", None)
+        recipe_ref.remote_ids_by_account.pop("tg22", None)
+        source = _flow_variant(recipe_ref, "tg11", "111", grams="100")
+        target = _flow_variant(recipe_ref, "tg22", "222", grams="100")
+        context.user_data.update(
+            {
+                "recipe_variants": [source],
+                "recipe_versions_differ": False,
+                "recipe_needs_sync": True,
+            }
+        )
+        sync_live = AsyncMock()
+        bot = object.__new__(TelegramRecipeBot)
+        bot.storage = storage
+        bot.sync_engine = SimpleNamespace(
+            hydrate_live_recipe_variants=AsyncMock(return_value=[] if source_disappeared else [source, target]),
+            sync_live_recipe_from_source=sync_live,
+        )
+
+        asyncio.run(bot._show_sync_preview(query, context, 0))
+        asyncio.run(bot._confirm_sync_preview(query, context))
+
+        sync_live.assert_not_awaited()
+        expected = "не удалось найти живую версию" if source_disappeared else "синхронизация не нужна"
+        assert expected in query.edit_message_text.await_args.args[0].casefold()
+        assert context.user_data["recipe_needs_sync"] is False
+        assert "recipe_sync_preview" not in context.user_data
     finally:
         storage.close()
 
