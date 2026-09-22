@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from .portions import portion_unit_size
+
 
 MAX_RECIPE_STEPS = 100
 
@@ -214,6 +216,20 @@ class CustomFoodDefinition:
     nutrients: dict[str, Decimal]
     barcode: str = ""
     barcode_type: str = ""
+
+    @property
+    def nutrition_grams(self) -> Decimal | None:
+        """Return the gram amount the entered nutrients describe, when known."""
+        if self.serving_type == "Per100g":
+            return Decimal("100")
+        return portion_unit_size(self.metric_serving_size)
+
+    def nutrients_per_100g(self) -> dict[str, Decimal]:
+        """Normalize known serving weights without inventing grams for a serving."""
+        grams = self.nutrition_grams
+        if grams is None or not grams.is_finite() or grams <= 0:
+            raise ValueError("Для пересчёта в граммы нужен вес одной порции.")
+        return {key: value * Decimal("100") / grams for key, value in self.nutrients.items()}
 
 
 @dataclass(frozen=True)

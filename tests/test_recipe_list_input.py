@@ -563,13 +563,16 @@ def test_recipe_list_draft_keyboard_keeps_every_object_and_action_on_a_wide_row(
     keyboard = _recipe_list_draft_keyboard(items)
     rows = keyboard.inline_keyboard
 
-    assert [len(row) for row in rows] == [1] * len(rows)
+    assert [len(row) for row in rows[:5]] == [2] * 5
     assert [button.callback_data for row in rows[:5] for button in row] == [
-        f"recipe_list_replace:{index}" for index in range(5)
+        value
+        for index in range(5)
+        for value in (f"recipe_list_replace:{index}", f"recipe_list_mass:{index}")
     ]
     assert all(len(button.text) <= 24 for row in rows[:5] for button in row)
     assert [button.text for button in rows[5]] == ["✏️ Изменить название"]
     assert [button.text for button in rows[6]] == ["✏️ Изменить шаги"]
+    assert [button.callback_data for button in rows[7]] == ["recipe_list_portions:0"]
     assert [(button.text, button.callback_data) for button in rows[-1]] == [
         ("✅ Создать", "recipe_list_confirm:0")
     ]
@@ -619,3 +622,29 @@ def test_recipe_list_draft_keyboard_labels_absent_and_present_cooked_weight() ->
     assert ("⚖️ Готовый вес: 415 г", "recipe_list_cooked_weight:0") in [
         (button.text, button.callback_data) for button in present_buttons
     ]
+
+
+def test_recipe_list_draft_keyboard_exposes_portion_and_mass_actions() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="филе",
+        grams=Decimal("125"),
+        ingredient=Ingredient(
+            id="i1",
+            recipe_id="",
+            food_id="f1",
+            title="Филе",
+            portion_id="0",
+            amount=Decimal("1.25"),
+            portion_description="100г",
+        ),
+        source="FatSecret",
+    )
+
+    rows = _recipe_list_draft_keyboard(
+        [item],
+        portions=Decimal("2.5"),
+    ).inline_keyboard
+    buttons = [(button.text, button.callback_data) for row in rows for button in row]
+
+    assert ("⚖️ 125 г", "recipe_list_mass:0") in buttons
+    assert ("🍽️ Порции: 2.5", "recipe_list_portions:0") in buttons

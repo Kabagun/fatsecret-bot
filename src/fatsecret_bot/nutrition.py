@@ -19,13 +19,15 @@ def custom_food_macro_error(
     protein: Decimal,
     fat: Decimal,
     carbohydrate: Decimal,
+    *,
+    grams: Decimal | None = Decimal("100"),
 ) -> str | None:
-    """Describe only gross per-100g КБЖУ contradictions, allowing normal label variance."""
+    """Check КБЖУ for the entered amount, checking mass only when it is known."""
     macro_total = protein + fat + carbohydrate
-    if macro_total > MAX_MACRO_TOTAL_PER_100G:
+    if grams is not None and macro_total > grams * MAX_MACRO_TOTAL_PER_100G / Decimal("100"):
         return (
             "КБЖУ выглядят несогласованно: сумма белков, жиров и углеводов "
-            f"равна {_format_decimal(macro_total)} г на 100 г. Проверь значения и их порядок: "
+            f"равна {_format_decimal(macro_total)} г на {_format_decimal(grams)} г. Проверь значения и их порядок: "
             "ккал, белки, жиры, углеводы."
         )
 

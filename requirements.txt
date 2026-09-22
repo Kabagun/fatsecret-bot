@@ -3,3 +3,4 @@ Pillow>=11,<13
 python-dotenv>=1,<2
 python-telegram-bot>=21,<23
 zxing-cpp>=2.3,<3
+tzdata>=2025.1; sys_platform == "win32"

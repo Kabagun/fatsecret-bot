@@ -1220,6 +1220,169 @@ def test_cooked_weight_text_rejects_invalid_input_without_changing_draft(value: 
     )
 
 
+def test_recipe_portions_text_updates_only_portions_and_preserves_draft() -> None:
+    item = _cooked_weight_draft_item()
+    context = SimpleNamespace(
+        user_data={
+            "recipe_list_title": "Омлет",
+            "recipe_list_draft": [item],
+            "recipe_list_unresolved": [],
+            "recipe_list_portions": Decimal("2"),
+            "recipe_list_steps": ["Запечь"],
+            "recipe_list_cooked_weight": Decimal("415"),
+            "mode": "recipe_list_portions",
+        }
+    )
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._handle_recipe_list_portions(update, context, "3,5 порции"))
+
+    assert context.user_data["recipe_list_portions"] == Decimal("3.5")
+    assert context.user_data["recipe_list_draft"] == [item]
+    assert context.user_data["recipe_list_steps"] == ["Запечь"]
+    assert context.user_data["recipe_list_cooked_weight"] == Decimal("415")
+    assert context.user_data["mode"] == "recipe_list_confirm"
+    rendered = message.reply_text.await_args.args[0]
+    assert "Порций: 3.5" in rendered
+    assert "Готовый вес: 415 г" in rendered
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "не число"])
+def test_recipe_portions_text_rejects_nonpositive_or_nonfinite(value: str) -> None:
+    context = SimpleNamespace(
+        user_data={
+            "recipe_list_title": "Омлет",
+            "recipe_list_draft": [_cooked_weight_draft_item()],
+            "recipe_list_portions": Decimal("2"),
+            "mode": "recipe_list_portions",
+        }
+    )
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._handle_recipe_list_portions(update, context, value))
+
+    assert context.user_data["recipe_list_portions"] == Decimal("2")
+    assert context.user_data["mode"] == "recipe_list_portions"
+    assert "положительным конечным числом" in message.reply_text.await_args.args[0]
+
+
+def test_recipe_mass_text_updates_ingredient_grams_and_preserves_metadata() -> None:
+    item = ResolvedRecipeListItem(
+        requested_query="Яйцо",
+        grams=Decimal("500"),
+        ingredient=Ingredient(
+            id="egg-id",
+            recipe_id="",
+            food_id="egg-food",
+            title="Яйцо",
+            portion_id="0",
+            amount=Decimal("5"),
+            portion_description="100г",
+            grams=Decimal("500"),
+        ),
+        source="recipe-edit",
+        brand="Бренд",
+        usage_count=7,
+        energy_per_100g=Decimal("143"),
+        protein_per_100g=Decimal("13"),
+        fat_per_100g=Decimal("10"),
+        carbohydrate_per_100g=Decimal("1"),
+        custom_food_ids={"tg11": "personal-egg"},
+        food_source_account_key="tg11",
+    )
+    context = SimpleNamespace(
+        user_data={
+            "recipe_list_title": "Омлет",
+            "recipe_list_draft": [item],
+            "recipe_list_unresolved": [],
+            "recipe_list_mass_index": 0,
+            "recipe_list_portions": Decimal("2"),
+            "recipe_list_steps": [],
+            "recipe_list_cooked_weight": Decimal("415"),
+            "mode": "recipe_list_mass",
+        }
+    )
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._handle_recipe_list_mass(update, context, "250,5 г"))
+
+    updated = context.user_data["recipe_list_draft"][0]
+    assert updated.grams == Decimal("250.5")
+    assert updated.ingredient.amount == Decimal("2.505")
+    assert updated.ingredient.id == "egg-id"
+    assert updated.ingredient.food_id == "egg-food"
+    assert updated.brand == "Бренд"
+    assert updated.usage_count == 7
+    assert updated.energy_per_100g == Decimal("143")
+    assert updated.custom_food_ids == {"tg11": "personal-egg"}
+    assert context.user_data["recipe_list_portions"] == Decimal("2")
+    assert context.user_data["recipe_list_cooked_weight"] == Decimal("415")
+    assert context.user_data["mode"] == "recipe_list_confirm"
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "не число"])
+def test_recipe_mass_text_rejects_nonpositive_or_nonfinite(value: str) -> None:
+    context = SimpleNamespace(
+        user_data={
+            "recipe_list_title": "Омлет",
+            "recipe_list_draft": [_cooked_weight_draft_item()],
+            "recipe_list_mass_index": 0,
+            "mode": "recipe_list_mass",
+        }
+    )
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    bot = object.__new__(TelegramRecipeBot)
+
+    asyncio.run(bot._handle_recipe_list_mass(update, context, value))
+
+    assert context.user_data["recipe_list_draft"][0].grams == Decimal("500")
+    assert context.user_data["mode"] == "recipe_list_mass"
+    assert "положительным конечным числом" in message.reply_text.await_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("recipe_list_title", "Создание рецепта отменено."),
+        ("recipe_list_confirm", "Создание рецепта отменено."),
+        ("recipe_list_mass", "Создание рецепта отменено."),
+        ("recipe_list_portions", "Создание рецепта отменено."),
+        ("group_create", "Ок, отменил."),
+        ("fatsecret_login", "Ок, отменил."),
+    ],
+)
+def test_cancel_clears_draft_and_uses_text_for_current_mode(mode: str, expected: str) -> None:
+    reply_text = AsyncMock()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=11),
+        effective_message=SimpleNamespace(reply_text=reply_text),
+    )
+    context = SimpleNamespace(
+        user_data={
+            "mode": mode,
+            "recipe_list_title": "Омлет",
+            "recipe_list_draft": [_cooked_weight_draft_item()],
+            "recipe_list_portions": Decimal("2"),
+        },
+        chat_data={"reply_keyboard": "mode"},
+    )
+    bot = object.__new__(TelegramRecipeBot)
+    bot.admin_user_id = None
+
+    asyncio.run(bot._cancel_mode(update, context))
+
+    assert context.user_data == {}
+    assert reply_text.await_args.args[0] == expected
+    assert context.chat_data["reply_keyboard"] == "main"
+
+
 def test_on_text_dispatches_cooked_weight_mode() -> None:
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=11),
@@ -2531,7 +2694,7 @@ def test_custom_food_skip_buttons_advance_optional_steps() -> None:
 
     asyncio.run(bot._skip_custom_food_brand(query, context))
 
-    assert context.user_data["mode"] == "custom_food_macros"
+    assert context.user_data["mode"] == "custom_food_basis"
     assert "custom_food_manufacturer_name" not in context.user_data
     assert "custom_food_brand_query" not in context.user_data
     assert "custom_food_brand_suggestions" not in context.user_data
@@ -2572,6 +2735,8 @@ def test_custom_food_brand_is_normalized_and_added_to_definition() -> None:
     asyncio.run(bot._pick_custom_food_brand(query, context, f"{choice_token}:0"))
 
     assert context.user_data["custom_food_manufacturer_name"] == "Burger King"
+    assert context.user_data["mode"] == "custom_food_basis"
+    asyncio.run(bot._pick_custom_food_basis(query, context, "grams"))
     assert context.user_data["mode"] == "custom_food_macros"
 
     asyncio.run(bot._handle_custom_food_macros(update, context, "250 12 8 30"))
@@ -2605,7 +2770,7 @@ def test_custom_food_brand_allows_explicit_new_free_text_when_catalog_has_no_mat
     asyncio.run(bot._use_custom_food_brand_text(query, context, choice_token))
 
     assert context.user_data["custom_food_manufacturer_name"] == "Новый Бренд"
-    assert context.user_data["mode"] == "custom_food_macros"
+    assert context.user_data["mode"] == "custom_food_basis"
 
 
 def test_custom_food_brand_rejects_stale_suggestion_without_changing_current_choice() -> None:

@@ -25,6 +25,7 @@ from fatsecret_bot.models import (
     FoodDiaryDay,
     FoodDiaryEntry,
     FoodDiaryWriteEntry,
+    FoodSearchResult,
     Recipe,
     RecipeSummary,
 )
@@ -59,6 +60,7 @@ class FakeDiaryClient:
         self.recipes: dict[str, Recipe] = {}
         self.created_recipe_id = "202"
         self.bulk_result: FoodDiaryBulkResult | None = None
+        self.food_details: dict[str, FoodSearchResult] = {}
 
     async def get_food_diary_day(self, date: dt.date) -> FoodDiaryDay:
         assert self.source_day is not None
@@ -111,7 +113,7 @@ class FakeDiaryClient:
         return None
 
     async def resolve_food_detail(self, result):  # noqa: ANN001, ANN201
-        return result
+        return self.food_details.get(result.food_id, result)
 
     async def close(self) -> None:
         return None
@@ -311,6 +313,217 @@ def test_diary_copy_clones_custom_food_once_and_reuses_mapping(tmp_path) -> None
         assert storage.custom_food_mapping("tg11", "95638540", "tg22") == "777"
         target_writes = [entry for _, entries in target.bulk_calls for entry in entries]
         assert {(entry.recipe_id, entry.recipe_portion_id) for entry in target_writes} == {("777", "-1")}
+    finally:
+        storage.close()
+
+
+def test_diary_copy_preserves_custom_units_and_maps_named_portion_ids(tmp_path) -> None:
+    storage, group_id = _storage_with_group(tmp_path)
+    try:
+        entries = [
+            FoodDiaryEntry(
+                entry_id="1",
+                recipe_id="95638540",
+                meal=1,
+                name="Экспонента Кефирная",
+                recipe_source="Facebook",
+                recipe_portion_id="0",
+                portion_amount=Decimal("1"),
+                serving_description="порция",
+            ),
+            FoodDiaryEntry(
+                entry_id="2",
+                recipe_id="95638540",
+                meal=1,
+                name="Экспонента Кефирная",
+                recipe_source="Facebook",
+                recipe_portion_id="-1",
+                portion_amount=Decimal("75"),
+                serving_description="75 г",
+            ),
+            FoodDiaryEntry(
+                entry_id="3",
+                recipe_id="95638540",
+                meal=1,
+                name="Экспонента Кефирная",
+                recipe_source="Facebook",
+                recipe_portion_id="7",
+                portion_amount=Decimal("1.5"),
+                serving_description="1.5 порции",
+            ),
+        ]
+        source = FakeDiaryClient(
+            _account("tg11"),
+            FoodDiaryDay(dt.date(2026, 7, 14), "source-guid", entries),
+        )
+        source.custom_definition = CustomFoodDefinition(
+            source_recipe_id="95638540",
+            title="Экспонента Кефирная",
+            manufacturer_name="",
+            serving_type="PerServing",
+            serving_size="порция",
+            metric_serving_size="50g",
+            nutrients={"calories": Decimal("45")},
+        )
+        source.food_details["95638540"] = FoodSearchResult(
+            food_id="95638540",
+            title="Экспонента Кефирная",
+            is_own=True,
+            raw={
+                "_recipe_portions": [
+                    {
+                        "id": "7",
+                        "description": "порция",
+                        "gramWeight": "50",
+                        "defaultAmount": "1",
+                    }
+                ]
+            },
+        )
+        target = FakeDiaryClient(_account("tg22"))
+        target.food_details["777"] = FoodSearchResult(
+            food_id="777",
+            title="Экспонента Кефирная",
+            is_own=True,
+            raw={
+                "_recipe_portions": [
+                    {
+                        "id": "88",
+                        "description": "порция",
+                        "gramWeight": "50.0",
+                        "defaultAmount": "1",
+                    }
+                ]
+            },
+        )
+        clients = {"tg11": source, "tg22": target}
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_client = lambda account: clients[account.key]  # type: ignore[method-assign]
+        engine._build_clients = lambda group_id=None: clients  # type: ignore[method-assign]
+
+        preview = asyncio.run(
+            engine.prepare_diary_copy(
+                group_id,
+                11,
+                "tg11",
+                dt.date(2026, 7, 14),
+                dt.date(2026, 7, 14),
+                dt.date(2026, 7, 14),
+            )
+        )
+        result = asyncio.run(engine.execute_diary_copy(preview.run_id))
+
+        assert result.status == "completed"
+        assert len(target.created_custom_foods) == 1
+        writes = target.bulk_calls[0][1]
+        assert [(write.recipe_id, write.recipe_portion_id) for write in writes] == [
+            ("777", "0"),
+            ("777", "-1"),
+            ("777", "88"),
+        ]
+        assert [write.portion_amount for write in writes] == [
+            Decimal("1"),
+            Decimal("75"),
+            Decimal("1.5"),
+        ]
+    finally:
+        storage.close()
+
+
+def test_diary_copy_matches_weightless_named_custom_portion_by_default_amount(tmp_path) -> None:
+    storage, group_id = _storage_with_group(tmp_path)
+    try:
+        source = FakeDiaryClient(_account("tg11"))
+        source.custom_definition = CustomFoodDefinition(
+            source_recipe_id="95638540",
+            title="Каша",
+            manufacturer_name="",
+            serving_type="PerServing",
+            serving_size="порция",
+            metric_serving_size="",
+            nutrients={"calories": Decimal("100")},
+        )
+        source.food_details["95638540"] = FoodSearchResult(
+            food_id="95638540",
+            title="Каша",
+            is_own=True,
+            raw={"_recipe_portions": [{"id": "12", "description": "порция", "defaultAmount": "1"}]},
+        )
+        target = FakeDiaryClient(_account("tg22"))
+        target.food_details["777"] = FoodSearchResult(
+            food_id="777",
+            title="Каша",
+            is_own=True,
+            raw={"_recipe_portions": [{"id": "42", "description": "порция", "defaultAmount": "1.0"}]},
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        entry = FoodDiaryEntry(
+            entry_id="1",
+            recipe_id="95638540",
+            meal=1,
+            name="Каша",
+            recipe_source="Facebook",
+            recipe_portion_id="12",
+            portion_amount=Decimal("0.5"),
+            serving_description="0.5 порции",
+        )
+
+        mapped = asyncio.run(
+            engine._map_diary_entry("tg11", "tg22", entry, source, target, {})
+        )
+
+        assert mapped == ("777", "42")
+    finally:
+        storage.close()
+
+
+def test_diary_copy_rejects_named_custom_portion_without_reliable_match(tmp_path) -> None:
+    storage, group_id = _storage_with_group(tmp_path)
+    try:
+        source = FakeDiaryClient(_account("tg11"))
+        source.custom_definition = CustomFoodDefinition(
+            source_recipe_id="95638540",
+            title="Каша",
+            manufacturer_name="",
+            serving_type="PerServing",
+            serving_size="порция",
+            metric_serving_size="50g",
+            nutrients={"calories": Decimal("100")},
+        )
+        source.food_details["95638540"] = FoodSearchResult(
+            food_id="95638540",
+            title="Каша",
+            is_own=True,
+            raw={
+                "_recipe_portions": [
+                    {"id": "12", "description": "порция", "gramWeight": "50", "defaultAmount": "1"}
+                ]
+            },
+        )
+        target = FakeDiaryClient(_account("tg22"))
+        target.food_details["777"] = FoodSearchResult(
+            food_id="777",
+            title="Каша",
+            is_own=True,
+            raw={
+                "_recipe_portions": [
+                    {"id": "42", "description": "большая порция", "gramWeight": "50", "defaultAmount": "1"}
+                ]
+            },
+        )
+        engine = RecipeSyncEngine(storage, _device())
+        entry = FoodDiaryEntry(
+            entry_id="1",
+            recipe_id="95638540",
+            meal=1,
+            name="Каша",
+            recipe_source="Facebook",
+            recipe_portion_id="12",
+            portion_amount=Decimal("1"),
+        )
+
+        with pytest.raises(FatSecretError, match="сопоставить"):
+            asyncio.run(engine._map_diary_entry("tg11", "tg22", entry, source, target, {}))
     finally:
         storage.close()
 

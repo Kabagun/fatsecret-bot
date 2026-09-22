@@ -975,6 +975,10 @@ def _ingredient_from_food_result(
     title: str | None = None,
     remote_ingredient_id: str | None = None,
 ) -> Ingredient:
+    if result.raw.get("_serving_only"):
+        raise FatSecretError(
+            f"У продукта «{result.title}» не указан вес порции. Для добавления в граммах укажи вес порции в FatSecret."
+        )
     gram_portion_id = str(result.raw.get("_gram_portion_id") or "").strip()
     if gram_portion_id:
         gram_portion_description = str(result.raw.get("_gram_portion_description") or "г").strip()
@@ -1000,6 +1004,18 @@ def _ingredient_from_food_result(
             portion_id=portion_id,
             amount=_amount_for_grams(grams, portion_description),
             portion_description=portion_description,
+            remote_ingredient_id=remote_ingredient_id,
+            grams=grams,
+        )
+    if result.is_own and result.grams_per_portion is not None and result.grams_per_portion > 0:
+        return Ingredient(
+            id=id or str(uuid.uuid4()),
+            recipe_id=recipe_id,
+            food_id=food_id or result.food_id,
+            title=title or result.title,
+            portion_id=portion_id,
+            amount=grams / result.grams_per_portion,
+            portion_description=portion_description or "порция",
             remote_ingredient_id=remote_ingredient_id,
             grams=grams,
         )
@@ -1435,7 +1451,7 @@ class RecipeSyncEngine:
 
         clients: dict[str, FatSecretClient] = {}
         date_results: list[DiaryCopyDateResult] = []
-        mapping_cache: dict[tuple[str, str], tuple[str, str]] = {}
+        mapping_cache: dict[tuple[str, str, str], tuple[str, str]] = {}
         try:
             clients = self._build_clients(str(run["group_id"]))
             if not target_account_keys or not set(target_account_keys).issubset(clients):
@@ -1533,9 +1549,9 @@ class RecipeSyncEngine:
         entry: FoodDiaryEntry,
         source_client: FatSecretClient,
         target_client: FatSecretClient,
-        cache: dict[tuple[str, str], tuple[str, str]],
+        cache: dict[tuple[str, str, str], tuple[str, str]],
     ) -> tuple[str, str]:
-        cache_key = (target_account_key, entry.recipe_id)
+        cache_key = (target_account_key, entry.recipe_id, entry.recipe_portion_id)
         if cache_key in cache:
             return cache[cache_key]
         if target_account_key == source_account_key:
@@ -1544,6 +1560,7 @@ class RecipeSyncEngine:
             return mapped
 
         if entry.recipe_source.casefold() == "facebook" or entry.recipe_portion_id == "-1":
+            source_portion_id = entry.recipe_portion_id
             target_food_id = self.storage.custom_food_mapping(
                 source_account_key,
                 entry.recipe_id,
@@ -1559,7 +1576,114 @@ class RecipeSyncEngine:
                     target_food_id,
                     _custom_food_content_hash(definition),
                 )
-            mapped = (target_food_id, "-1")
+            if source_portion_id in {"0", "-1"}:
+                mapped = (target_food_id, source_portion_id)
+                cache[cache_key] = mapped
+                return mapped
+
+            source_detail = await source_client.resolve_food_detail(
+                FoodSearchResult(
+                    food_id=entry.recipe_id,
+                    title=entry.name,
+                    source=entry.recipe_source,
+                    is_own=True,
+                )
+            )
+            target_detail = await target_client.resolve_food_detail(
+                FoodSearchResult(
+                    food_id=target_food_id,
+                    title=entry.name,
+                    source=entry.recipe_source,
+                    is_own=True,
+                )
+            )
+            source_portions = source_detail.raw.get("_recipe_portions")
+            target_portions = target_detail.raw.get("_recipe_portions")
+            if not isinstance(source_portions, list):
+                raise FatSecretError(
+                    f"Не удалось сопоставить порцию личного продукта «{entry.name}»: "
+                    "источник не вернул данные порций."
+                )
+            if not isinstance(target_portions, list):
+                raise FatSecretError(
+                    f"Не удалось сопоставить порцию личного продукта «{entry.name}»: "
+                    "целевой аккаунт не вернул данные порций."
+                )
+
+            source_portion = next(
+                (
+                    portion
+                    for portion in source_portions
+                    if isinstance(portion, dict) and str(portion.get("id", "")) == source_portion_id
+                ),
+                None,
+            )
+            if source_portion is None:
+                raise FatSecretError(
+                    f"Не удалось сопоставить порцию личного продукта «{entry.name}» "
+                    f"({source_portion_id}): источник не содержит эту порцию."
+                )
+
+            def _positive_decimal(value: object) -> Decimal | None:
+                if value is None:
+                    return None
+                try:
+                    parsed = Decimal(str(value).strip().replace(",", "."))
+                except (InvalidOperation, TypeError, ValueError):
+                    return None
+                if not parsed.is_finite() or parsed <= 0:
+                    return None
+                return parsed
+
+            source_gram_weight = _positive_decimal(source_portion.get("gramWeight"))
+            source_default_amount = _positive_decimal(source_portion.get("defaultAmount"))
+            if source_gram_weight is None and source_default_amount is None:
+                raise FatSecretError(
+                    f"Не удалось сопоставить порцию личного продукта «{entry.name}» "
+                    f"({source_portion_id}): нет надежного gramWeight/defaultAmount."
+                )
+            source_description = " ".join(str(source_portion.get("description", "")).split()).casefold()
+            if not source_description:
+                raise FatSecretError(
+                    f"Не удалось сопоставить порцию личного продукта «{entry.name}» "
+                    f"({source_portion_id}): у порции нет описания."
+                )
+
+            candidate_target_portion_ids: set[str] = set()
+            for target_portion in target_portions:
+                if not isinstance(target_portion, dict):
+                    continue
+                target_description = " ".join(
+                    str(target_portion.get("description", "")).split()
+                ).casefold()
+                if target_description != source_description:
+                    continue
+                target_gram_weight = _positive_decimal(target_portion.get("gramWeight"))
+                target_default_amount = _positive_decimal(target_portion.get("defaultAmount"))
+                if source_gram_weight is not None:
+                    if target_gram_weight is None or target_gram_weight != source_gram_weight:
+                        continue
+                elif target_gram_weight is not None:
+                    continue
+                if source_default_amount is not None and (
+                    target_default_amount is None or target_default_amount != source_default_amount
+                ):
+                    continue
+                target_portion_id = str(target_portion.get("id", "")).strip()
+                if target_portion_id:
+                    candidate_target_portion_ids.add(target_portion_id)
+            if not candidate_target_portion_ids:
+                raise FatSecretError(
+                    f"Не удалось сопоставить порцию личного продукта «{entry.name}» "
+                    f"({source_portion_id}) в целевом аккаунте."
+                )
+            if len(candidate_target_portion_ids) > 1:
+                raise FatSecretError(
+                    f"Не удалось однозначно сопоставить порцию личного продукта «{entry.name}» "
+                    f"({source_portion_id}) в целевом аккаунте."
+                )
+
+            mapped = (target_food_id, next(iter(candidate_target_portion_ids)))
             cache[cache_key] = mapped
             return mapped
 
@@ -1732,8 +1856,19 @@ class RecipeSyncEngine:
             raise FatSecretError("Название продукта слишком длинное.")
         if len(definition.manufacturer_name.strip()) > 200:
             raise FatSecretError("Название бренда слишком длинное.")
-        if definition.serving_type != "Per100g":
-            raise FatSecretError("Сейчас поддерживаются только значения на 100 г.")
+        if definition.serving_type not in {"Per100g", "PerServing"}:
+            raise FatSecretError("Выбери значения на 100 г или на 1 порцию.")
+        if definition.serving_type == "Per100g" and definition.metric_serving_size not in {"100g", "100г"}:
+            raise FatSecretError("Для значений на 100 г размер должен быть 100 г.")
+        if definition.serving_type == "PerServing":
+            if not definition.serving_size.strip():
+                raise FatSecretError("Укажи название порции.")
+            if definition.metric_serving_size and (
+                not re.fullmatch(r"\d+(?:\.\d+)?\s*[gг]", definition.metric_serving_size)
+                or definition.nutrition_grams is None
+                or not Decimal("0") < definition.nutrition_grams <= Decimal("100000")
+            ):
+                raise FatSecretError("Вес порции должен быть больше 0 и не больше 100000 г.")
         required = {
             "calories": Decimal("10000"),
             "protein": Decimal("1000"),
@@ -1749,6 +1884,7 @@ class RecipeSyncEngine:
             definition.nutrients["protein"],
             definition.nutrients["totalFat"],
             definition.nutrients["carbohydrate"],
+            grams=definition.nutrition_grams,
         ):
             raise FatSecretError(error)
         if definition.barcode and definition.barcode_type not in {
@@ -2063,6 +2199,10 @@ class RecipeSyncEngine:
             raise FatSecretError("У созданного продукта нет подтвержденных FatSecret ID.")
         canonical_account_key = sorted(created.food_ids)[0]
         canonical_food_id = created.food_ids[canonical_account_key]
+        try:
+            nutrients = definition.nutrients_per_100g()
+        except ValueError as exc:
+            raise FatSecretError(str(exc)) from exc
         return ResolvedRecipeListItem(
             requested_query=requested_query,
             grams=grams,
@@ -2072,15 +2212,15 @@ class RecipeSyncEngine:
                 food_id=canonical_food_id,
                 title=definition.title,
                 portion_id="0",
-                amount=_gram_portion_amount(grams),
-                portion_description="100г",
+                amount=grams / definition.nutrition_grams,
+                portion_description=definition.serving_size or "100г",
                 grams=grams,
             ),
             source="создан в группе",
-            energy_per_100g=definition.nutrients.get("calories"),
-            protein_per_100g=definition.nutrients.get("protein"),
-            fat_per_100g=definition.nutrients.get("totalFat"),
-            carbohydrate_per_100g=definition.nutrients.get("carbohydrate"),
+            energy_per_100g=nutrients.get("calories"),
+            protein_per_100g=nutrients.get("protein"),
+            fat_per_100g=nutrients.get("totalFat"),
+            carbohydrate_per_100g=nutrients.get("carbohydrate"),
             custom_food_ids=dict(created.food_ids),
         )
 

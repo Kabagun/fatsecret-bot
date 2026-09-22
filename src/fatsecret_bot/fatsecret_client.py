@@ -395,9 +395,25 @@ def _stable_device_key(device_identifier: str, account_key: str) -> str:
 def _localized_metric_serving_size(value: str, language: str) -> str:
     compact = value.replace(" ", "").casefold()
     primary_language = re.split(r"[-_]", language.casefold(), maxsplit=1)[0]
-    if compact in {"100g", "100г"} and primary_language in {"be", "ru", "uk"}:
-        return "100г"
+    if re.fullmatch(r"\d+(?:\.\d+)?[gг]", compact) and primary_language in {"be", "ru", "uk"}:
+        return compact[:-1] + "г"
     return value
+
+
+def _custom_food_grams(root: ET.Element) -> Decimal | None:
+    """Read custom-food serving mass, excluding FatSecret's unknown-weight sentinel."""
+    if _text(root, "servingAmountUnit").casefold() in {"g", "г"}:
+        value = _decimal(_text(root, "servingAmount"), None)
+        if value is not None and value.is_finite() and value > 0:
+            return value
+    value = _decimal(_text(root, "gramsPerPortion"), None)
+    if value is not None and value.is_finite() and value > 0:
+        return value
+    for portion in _recipe_portions(root):
+        weight = _decimal(portion.get("gramWeight", ""), None)
+        if weight is not None and weight.is_finite() and weight > 0:
+            return weight
+    return None
 
 
 class FatSecretClient:
@@ -589,7 +605,7 @@ class FatSecretClient:
         await self._post_app_json(DIARY_BULK_UPDATE_URL, payload, "diary bulk delete")
 
     async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
-        """Read a user-created food as a portable per-100g definition."""
+        """Read a portable food definition preserving its gram or serving nutrition basis."""
         response = await self._post_android(
             "RecipeAndroidPage.aspx",
             {"rid": remote_id, "images": "true", "fl": "7"},
@@ -1200,14 +1216,14 @@ class FatSecretClient:
         headers = {"User-Agent": self.device.user_agent}
         if content_type:
             headers["Content-Type"] = content_type
-        if self.device.authorization:
-            headers["Authorization"] = self.device.authorization
+        # This is the Android protocol name, not a credential or bearer token.
+        headers["Authorization"] = self.device.authorization or "FatSecret"
         if device_key:
             headers["c_d"] = device_key
         elif self._session:
             headers["c_d"] = self._session.device_key
-        if self.device.c_desc:
-            headers["c_desc"] = self.device.c_desc
+        if self.device.c_desc or headers.get("c_d"):
+            headers["c_desc"] = self.device.c_desc or headers["c_d"]
         return headers
 
     def _app_headers(
@@ -1351,8 +1367,14 @@ class FatSecretClient:
             raise FatSecretNotCustomFoodError(
                 f"{self.account.label}: food {remote_id} is not a user-created product"
             )
-        grams = _decimal(_text(root, "gramsPerPortion"), Decimal("100")) or Decimal("100")
-        scale = Decimal("100") / grams if grams > 0 else Decimal("1")
+        raw_serving_size = _text(root, "servingSize")
+        has_named_serving = any(
+            portion["id"].isdecimal() and int(portion["id"]) > 0
+            for portion in _recipe_portions(root)
+        )
+        per_serving = has_named_serving and raw_serving_size.replace(" ", "").casefold() not in {"", "100g", "100г"}
+        grams = _custom_food_grams(root)
+        scale = Decimal("100") / grams if not per_serving and grams is not None else Decimal("1")
         source_tags = {
             "calories": "energyPerPortion",
             "totalFat": "fatPerPortion",
@@ -1382,11 +1404,6 @@ class FatSecretClient:
         if not nutrients:
             raise FatSecretError(f"{self.account.label}: custom food {remote_id} has no nutrition data")
         short_description = _text(root, "shortDescription")
-        raw_serving_size = _text(root, "servingSize")
-        has_named_serving = any(
-            portion["id"].isdecimal() and int(portion["id"]) > 0
-            for portion in _recipe_portions(root)
-        )
         return CustomFoodDefinition(
             source_recipe_id=remote_id,
             title=_text(root, "title"),
@@ -1395,14 +1412,14 @@ class FatSecretClient:
                 or _text(root, "manufacturer")
                 or _metadata_value(short_description, "mname")
             ),
-            serving_type="Per100g",
+            serving_type="PerServing" if per_serving else "Per100g",
             serving_size=(
                 ""
                 if not has_named_serving
                 and raw_serving_size.replace(" ", "").casefold() in {"100g", "100г"}
                 else raw_serving_size
             ),
-            metric_serving_size="100g",
+            metric_serving_size=(f"{_form_decimal(grams)}g" if grams is not None else "") if per_serving else "100g",
             nutrients=nutrients,
         )
 
@@ -1632,6 +1649,10 @@ class FatSecretClient:
                     break
 
         grams_per_portion = _decimal(_text(root, "gramsPerPortion"), fallback.grams_per_portion)
+        is_own = _bool_value(_text(root, "isOwn")) or fallback.is_own
+        if is_own:
+            grams_per_portion = _custom_food_grams(root)
+            raw["_serving_only"] = grams_per_portion is None
         return FoodSearchResult(
             food_id=fallback.food_id,
             title=_text(root, "title") or fallback.title,
@@ -1644,7 +1665,7 @@ class FatSecretClient:
             ),
             default_portion_description=detail_portion_description or fallback.default_portion_description,
             source=fallback.source or _text(root, "source"),
-            is_own=fallback.is_own,
+            is_own=is_own,
             grams_per_portion=grams_per_portion,
             energy_per_portion=_scale_per_100g(
                 _decimal(_text(root, "energyPerPortion"), fallback.energy_per_portion),
