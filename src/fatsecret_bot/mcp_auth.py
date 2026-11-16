@@ -76,6 +76,16 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _consent_headers(redirect_uri: str) -> dict[str, str]:
+    callback = urlsplit(redirect_uri)
+    # Chromium applies form-action to the POST's redirect chain as well. Allow
+    # the registered callback origin; the SDK still requires the exact URI.
+    target = f"{callback.scheme}://{callback.netloc}"
+    return {**SAFE_HEADERS, "Content-Security-Policy": SAFE_HEADERS["Content-Security-Policy"].replace(
+        "form-action 'self';", f"form-action 'self' {target};",
+    )}
+
+
 class GroupClientAuthenticator(ClientAuthenticator):
     """Use the SDK's client authentication methods with hashed client secrets."""
 
@@ -366,7 +376,7 @@ class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
                 "<label>Ключ подключения <input type='password' name='group_key' required maxlength='1024' "
                 "autocomplete='off'></label><p><button type='submit' name='action' value='approve'>Разрешить доступ</button> "
                 "<button type='submit' name='action' value='deny' formnovalidate>Отказаться</button></p></form></html>",
-                headers=SAFE_HEADERS,
+                headers=_consent_headers(str(params.redirect_uri)),
             )
             response.set_cookie(COOKIE, cookie, max_age=AUTH_SECONDS, httponly=True,
                                 secure=self.config.issuer_url.startswith("https:"), samesite="lax", path="/consent")
@@ -407,7 +417,7 @@ class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
                 target = construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
             else:
                 target = construct_redirect_uri(str(params.redirect_uri), error="access_denied", state=params.state)
-        response = RedirectResponse(target, status_code=303, headers=SAFE_HEADERS)
+        response = RedirectResponse(target, status_code=303, headers=_consent_headers(str(params.redirect_uri)))
         response.delete_cookie(COOKIE, path="/consent")
         return response
 

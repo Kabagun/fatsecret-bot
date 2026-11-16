@@ -74,6 +74,8 @@ async def consent_form(http, client, config=CONFIG):
     assert "https://client.example.test" in page.text
     assert "no-store" in page.headers["cache-control"]
     assert page.headers["referrer-policy"] == "strict-origin"
+    assert "form-action 'self' https://client.example.test;" in page.headers["content-security-policy"]
+    assert CALLBACK not in page.headers["content-security-policy"]
     assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
     return {
         "request": re.search(r"name='request' value='([^']+)'", page.text)[1],
@@ -86,6 +88,7 @@ async def code(http, client, config=CONFIG):
     form = await consent_form(http, client, config)
     response = await http.post("/consent", data=form, headers={"Origin": CONFIG.issuer_url})
     assert response.status_code == 303, response.text
+    assert "form-action 'self' https://client.example.test;" in response.headers["content-security-policy"]
     query = parse_qs(urlsplit(response.headers["location"]).query)
     assert query["state"] == ["synthetic-state"]
     return query["code"][0], form
