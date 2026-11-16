@@ -8,9 +8,11 @@ import logging
 import re
 import uuid
 from collections import Counter
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Awaitable, Callable
+from functools import wraps
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -1188,11 +1190,21 @@ def _is_ambiguous_mutation_error(exc: Exception) -> bool:
     return isinstance(exc, FatSecretActionError) and 500 <= exc.status_code < 600
 
 
+def _serialized_operation(method):
+    @wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        async with self.operation():
+            return await method(self, *args, **kwargs)
+    return wrapped
+
+
 class RecipeSyncEngine:
     def __init__(self, storage: Storage, device: FatSecretDeviceConfig, timezone: str = "Europe/Minsk") -> None:
         self.storage = storage
         self.device = device
         self.timezone = timezone
+        self._operation_lock = asyncio.Lock()
+        self._operation_owner: asyncio.Task | None = None
         self._custom_food_brand_catalogs: dict[
             tuple[str, str],
             tuple[dt.datetime, tuple[str, ...]],
@@ -1200,6 +1212,20 @@ class RecipeSyncEngine:
 
     async def close(self) -> None:
         return None
+
+    @asynccontextmanager
+    async def operation(self):
+        """Serialize Telegram and MCP work; only the owning task may reenter."""
+        task = asyncio.current_task()
+        if self._operation_owner is task:
+            yield
+            return
+        async with self._operation_lock:
+            self._operation_owner = task
+            try:
+                yield
+            finally:
+                self._operation_owner = None
 
     def _current_date(self) -> dt.date:
         """Return today's date in the configured timezone for generic FatSecret fields."""
@@ -1244,6 +1270,7 @@ class RecipeSyncEngine:
         display.ingredients = _copy_remote_ingredients(local_id, normalized_ingredients)
         return _RecipeSourceSnapshot(transport=transport, display=display)
 
+    @_serialized_operation
     async def validate_account(self, account: FatSecretAccountConfig) -> None:
         """Verify FatSecret credentials by performing a real mobile API login."""
         client = self._build_client(account)
@@ -1252,6 +1279,7 @@ class RecipeSyncEngine:
         finally:
             await client.close()
 
+    @_serialized_operation
     async def suggest_custom_food_brands(
         self,
         group_id: str,
@@ -1293,6 +1321,7 @@ class RecipeSyncEngine:
         matches = [brand for brand in catalog if normalized_query in normalize_title(brand)]
         return sorted(matches, key=rank)[:limit]
 
+    @_serialized_operation
     async def refresh_account_recipes(self, account: FatSecretAccountConfig, group_id: str | None = None) -> int:
         """Import cookbook recipes for one connected FatSecret account."""
         client = self._build_client(account)
@@ -1311,6 +1340,7 @@ class RecipeSyncEngine:
             await client.close()
         return imported
 
+    @_serialized_operation
     async def refresh_remote_recipes(self, group_id: str | None = None) -> int:
         imported = 0
         clients = self._build_clients(group_id)
@@ -1324,6 +1354,7 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return imported
 
+    @_serialized_operation
     async def refresh_food_usage_cache(self, group_id: str) -> int:
         """Refresh frequently used foods from live FatSecret recipe ingredients for one group."""
         clients = self._build_clients(group_id)
@@ -1353,6 +1384,7 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return self.storage.replace_food_usage_cache(group_id, ingredients)
 
+    @_serialized_operation
     async def refresh_food_usage_cache_for_all_groups(self) -> dict[str, int]:
         """Refresh frequently used foods for every group that has connected FatSecret accounts."""
         refreshed: dict[str, int] = {}
@@ -1365,6 +1397,7 @@ class RecipeSyncEngine:
                 logger.exception("food usage cache refresh failed for group %s", group_id)
         return refreshed
 
+    @_serialized_operation
     async def ensure_food_usage_cache(self, group_id: str) -> None:
         """Refresh the FatSecret-derived food usage cache at most once per day."""
         if self.storage.food_usage_cache_is_fresh(group_id):
@@ -1373,6 +1406,7 @@ class RecipeSyncEngine:
             return
         await self.refresh_food_usage_cache(group_id)
 
+    @_serialized_operation
     async def lookup_barcode(self, group_id: str, barcode: str) -> BarcodeLookupResult:
         """Look up a barcode with one connected account because mappings are global."""
         clients = self._build_clients(group_id)
@@ -1381,6 +1415,7 @@ class RecipeSyncEngine:
         finally:
             await self._close_clients(clients)
 
+    @_serialized_operation
     async def barcode_recipe_list_item(
         self,
         group_id: str,
@@ -1554,6 +1589,7 @@ class RecipeSyncEngine:
                 return True
         return False
 
+    @_serialized_operation
     async def create_custom_food_for_group(
         self,
         group_id: str,
@@ -2034,6 +2070,7 @@ class RecipeSyncEngine:
             grams=grams,
         )
 
+    @_serialized_operation
     async def load_remote_recipe_index(self, group_id: str) -> list[Recipe]:
         """Load and merge current cookbook recipe summaries from all FatSecret accounts in a group."""
         clients = self._build_clients(group_id)
@@ -2095,6 +2132,7 @@ class RecipeSyncEngine:
         )
         return recipes
 
+    @_serialized_operation
     async def hydrate_live_recipe_variants_batch(
         self,
         recipe_refs: list[Recipe],
@@ -2176,10 +2214,12 @@ class RecipeSyncEngine:
         )
         return result
 
+    @_serialized_operation
     async def hydrate_live_recipe_variants(self, recipe_ref: Recipe) -> list[RemoteRecipeVariant]:
         """Load and persist every account-specific live version represented by a merged recipe card."""
         return (await self.hydrate_live_recipe_variants_batch([recipe_ref])).get(recipe_ref.id, [])
 
+    @_serialized_operation
     async def hydrate_live_recipe(self, recipe_ref: Recipe) -> Recipe | None:
         """Load current recipe details from FatSecret for an in-memory recipe reference."""
         variants = await self.hydrate_live_recipe_variants(recipe_ref)
@@ -2193,6 +2233,7 @@ class RecipeSyncEngine:
         }
         return recipe
 
+    @_serialized_operation
     async def resolve_recipe_list_items(
         self,
         group_id: str,
@@ -2217,6 +2258,7 @@ class RecipeSyncEngine:
             resolved.append(candidates[0])
         return RecipeListDraft(items=resolved, unresolved=unresolved)
 
+    @_serialized_operation
     async def hydrate_recipe_edit_source_items(
         self,
         group_id: str,
@@ -2524,6 +2566,7 @@ class RecipeSyncEngine:
             )
         return classified
 
+    @_serialized_operation
     async def recipe_list_candidates(
         self,
         group_id: str,
@@ -3306,6 +3349,7 @@ class RecipeSyncEngine:
             if not await client.save_recipe_meta(recipe, remote_id):
                 raise FatSecretError(f"{client.account.label}: recipe metadata retry returned false")
 
+    @_serialized_operation
     async def edit_recipe_from_list(
         self,
         group_id: str,
@@ -3696,6 +3740,7 @@ class RecipeSyncEngine:
             cooked_weight_grams=cooked_weight_grams,
         )
 
+    @_serialized_operation
     async def create_recipe_from_list(
         self,
         group_id: str,
@@ -4363,6 +4408,7 @@ class RecipeSyncEngine:
             raise first_error
         raise FatSecretError(f"{client.account.label}: рецепт {remote_id} остался после удаления и проверки")
 
+    @_serialized_operation
     async def hydrate_recipe_from_remote(self, recipe_id: str) -> Recipe | None:
         recipe = self.storage.get_recipe(recipe_id)
         if recipe is None:
@@ -4394,6 +4440,7 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return recipe
 
+    @_serialized_operation
     async def sync_recipe(self, recipe_id: str) -> list[AccountSyncResult]:
         recipe = self.storage.get_recipe(recipe_id)
         if recipe is None:
@@ -4402,6 +4449,7 @@ class RecipeSyncEngine:
             raise FatSecretError("У рецепта нет привязки к FatSecret. Нажми «Обновить» и попробуй снова.")
         return await self.sync_recipe_from_source(recipe_id, next(iter(recipe.remote_ids)))
 
+    @_serialized_operation
     async def sync_recipe_from_source(
         self,
         recipe_id: str,
@@ -4576,6 +4624,7 @@ class RecipeSyncEngine:
             )
         return results
 
+    @_serialized_operation
     async def sync_live_recipe_from_source(
         self,
         recipe_ref: Recipe,
@@ -4739,6 +4788,7 @@ class RecipeSyncEngine:
             )
         return recipe, results
 
+    @_serialized_operation
     async def delete_recipe_everywhere(self, recipe_id: str) -> list[AccountSyncResult]:
         """Delete one recipe from every FatSecret account where it is mapped."""
         recipe = self.storage.get_recipe(recipe_id)
@@ -4750,6 +4800,7 @@ class RecipeSyncEngine:
         finally:
             await self._close_clients(clients)
 
+    @_serialized_operation
     async def delete_recipes_everywhere(self, recipe_ids: list[str]) -> dict[str, list[AccountSyncResult]]:
         """Delete several recipes from all mapped FatSecret accounts."""
         recipe = self.storage.get_recipe(recipe_ids[0]) if recipe_ids else None
@@ -4767,6 +4818,7 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return results
 
+    @_serialized_operation
     async def delete_live_recipe_everywhere(self, recipe_ref: Recipe) -> list[AccountSyncResult]:
         """Delete one in-memory recipe reference from every mapped FatSecret account."""
         clients = self._build_clients(recipe_ref.group_id)
@@ -4775,6 +4827,7 @@ class RecipeSyncEngine:
         finally:
             await self._close_clients(clients)
 
+    @_serialized_operation
     async def rename_live_recipe_everywhere(
         self,
         recipe_ref: Recipe,
@@ -4855,6 +4908,7 @@ class RecipeSyncEngine:
             await self._close_clients(clients)
         return results
 
+    @_serialized_operation
     async def delete_live_recipes_everywhere(self, recipe_refs: list[Recipe]) -> dict[str, list[AccountSyncResult]]:
         """Delete several in-memory recipe references from FatSecret."""
         results: dict[str, list[AccountSyncResult]] = {}

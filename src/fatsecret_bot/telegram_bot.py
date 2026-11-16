@@ -11,6 +11,7 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import (
@@ -50,6 +51,7 @@ from .models import (
 from .nutrition import custom_food_macro_error
 from .portions import grams_from_portion
 from .recipe_compare import recipe_fingerprint
+from .recipe_text import recipe_export_payload as _recipe_export_payload
 from .storage import GroupMemberLimitError, Storage, normalize_title
 from .sync import (
     RecipeListItem,
@@ -206,39 +208,6 @@ def _format_recipe(recipe: Recipe) -> str:
         f"<b>Ингредиенты</b>\n{ingredients}"
         f"{steps_text}"
     )
-
-
-def _recipe_export_payload(recipe: Recipe) -> str:
-    """Render the part of a recipe accepted by the existing list importer."""
-    ingredient_lines: list[str] = []
-    missing_weights: list[str] = []
-    for ingredient in recipe.ingredients:
-        grams = grams_from_portion(
-            ingredient.amount,
-            ingredient.portion_description,
-            explicit_grams=ingredient.grams,
-        )
-        if grams is None or grams <= 0:
-            missing_weights.append(ingredient.title.strip() or "Без названия")
-            continue
-        ingredient_lines.append(
-            f"{ingredient.title.strip() or 'Без названия'} {_format_decimal_plain(grams)}"
-        )
-    if missing_weights:
-        names = ", ".join(missing_weights)
-        raise ValueError(f"Не удалось определить массу в граммах: {names}.")
-    if not ingredient_lines:
-        raise ValueError("В рецепте нет ингредиентов для экспорта.")
-    lines = [f"Порций: {_format_decimal_plain(recipe.portions)}"]
-    cooked_weight_grams = recipe_cooked_weight_from_description(recipe.description)
-    if cooked_weight_grams is not None:
-        lines.append(f"Готовый вес: {_format_decimal_plain(cooked_weight_grams)}")
-    lines.extend(ingredient_lines)
-    steps = [step.strip() for step in recipe.steps if step.strip()]
-    if steps:
-        lines.extend(["", "Шаги:"])
-        lines.extend(steps)
-    return "\n".join(lines)
 
 
 def _format_recipe_conflict(
@@ -1265,15 +1234,24 @@ class TelegramRecipeBot:
             .post_shutdown(self._post_shutdown)
             .build()
         )
-        app.add_handler(CommandHandler("start", self.start))
-        app.add_handler(CommandHandler("accounts", self.accounts))
-        app.add_handler(CommandHandler("recipes", self.recipes))
-        app.add_handler(CommandHandler("refresh", self.refresh))
-        app.add_handler(CommandHandler("groups", self.groups))
-        app.add_handler(CallbackQueryHandler(self.on_callback))
-        app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
+        app.add_handler(CommandHandler("start", self._serialized_handler(self.start)))
+        app.add_handler(CommandHandler("accounts", self._serialized_handler(self.accounts)))
+        app.add_handler(CommandHandler("recipes", self._serialized_handler(self.recipes)))
+        app.add_handler(CommandHandler("refresh", self._serialized_handler(self.refresh)))
+        app.add_handler(CommandHandler("groups", self._serialized_handler(self.groups)))
+        app.add_handler(CallbackQueryHandler(self._serialized_handler(self.on_callback)))
+        app.add_handler(MessageHandler(filters.PHOTO, self._serialized_handler(self.on_photo)))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._serialized_handler(self.on_text)))
         return app
+
+    def _serialized_handler(self, callback):
+        @wraps(callback)
+        async def handle(update, context):
+            # Account/group changes use Storage directly, so the whole update
+            # shares the engine lock with MCP writes, including preflight reads.
+            async with self.sync_engine.operation():
+                return await callback(update, context)
+        return handle
 
     def _refresh_timezone(self) -> dt.tzinfo:
         try:

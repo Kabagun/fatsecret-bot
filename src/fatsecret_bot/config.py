@@ -57,7 +57,7 @@ def _optional_positive_int(name: str) -> int | None:
     return parsed
 
 
-def load_config(env_file: str | Path = ".env") -> BotConfig:
+def load_config(env_file: str | Path = ".env", *, require_telegram: bool = True) -> BotConfig:
     load_dotenv(env_file)
 
     default_market = _getenv("FATSECRET_MKT", "BY")
@@ -82,7 +82,7 @@ def load_config(env_file: str | Path = ".env") -> BotConfig:
     )
 
     return BotConfig(
-        telegram_token=_required("TELEGRAM_BOT_TOKEN"),
+        telegram_token=_required("TELEGRAM_BOT_TOKEN") if require_telegram else _getenv("TELEGRAM_BOT_TOKEN"),
         telegram_admin_user_id=_optional_positive_int("TELEGRAM_ADMIN_USER_ID"),
         db_path=db_path,
         default_market=default_market,
