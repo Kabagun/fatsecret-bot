@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import re
+import time
 from dataclasses import replace
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 from mcp.server.auth.routes import create_auth_routes
+from mcp.shared.auth import OAuthClientInformationFull
 from starlette.applications import Starlette
 
 from fatsecret_bot.mcp_auth import COOKIE, MCP_SCOPE, GroupOAuthProvider, auth_settings
@@ -59,7 +62,7 @@ async def begin(http, client, **changes):
     return await http.get("/authorize", params=params)
 
 
-async def consent_form(http, client):
+async def consent_form(http, client, config=CONFIG):
     response = await begin(http, client)
     assert response.status_code == 302, response.text
     page = await http.get(response.headers["location"])
@@ -74,12 +77,12 @@ async def consent_form(http, client):
     return {
         "request": re.search(r"name='request' value='([^']+)'", page.text)[1],
         "csrf": re.search(r"name='csrf' value='([^']+)'", page.text)[1],
-        "action": "approve", "group_key": CONFIG.group_key,
+        "action": "approve", "group_key": config.group_key,
     }
 
 
-async def code(http, client):
-    form = await consent_form(http, client)
+async def code(http, client, config=CONFIG):
+    form = await consent_form(http, client, config)
     response = await http.post("/consent", data=form, headers={"Origin": CONFIG.issuer_url})
     assert response.status_code == 303, response.text
     query = parse_qs(urlsplit(response.headers["location"]).query)
@@ -127,9 +130,10 @@ def test_full_http_flow_pkce_audience_rotation_revocation_and_persistence(setup)
             assert token.scopes == [MCP_SCOPE]
             assert token.subject and str(CONFIG.group_id) != token.subject
             assert (await http.post("/token", data=request)).json()["error"] == "invalid_grant"
-            # A fresh provider reconstructs client auth and loads hashed credentials.
+            # A fresh provider verifies hashed client credentials and loads tokens.
             restarted = GroupOAuthProvider(storage, CONFIG)
-            assert (await restarted.get_client(client["client_id"])).client_secret == client["client_secret"]
+            assert (await restarted.get_client(client["client_id"])).client_secret is None
+            assert restarted.verify_client_secret(client["client_id"], client["client_secret"])
             assert await restarted.load_access_token(tokens["access_token"]) is not None
             persisted = "\n".join(storage._conn.iterdump())
             for secret in [CONFIG.group_key, client["client_secret"], authorization_code,
@@ -202,10 +206,103 @@ def test_group_key_issuer_and_client_isolation(setup):
             for config in [replace(CONFIG, group_id="00000000-0000-4000-8000-000000000042"), replace(CONFIG, group_key="another-synthetic-connection-key-1234567890"),
                            replace(CONFIG, issuer_url="https://other.example.test")]:
                 isolated = GroupOAuthProvider(storage, config)
-                assert await isolated.get_client(first["client_id"]) is None
+                assert (await isolated.get_client(first["client_id"]) is not None) == (config.issuer_url == CONFIG.issuer_url)
                 assert await isolated.load_access_token(issued["access_token"]) is None
                 assert await isolated.load_refresh_token(await provider.get_client(first["client_id"]), issued["refresh_token"]) is None
             assert await provider.load_access_token(issued["access_token"]) is not None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["none", "client_secret_post", "client_secret_basic"])
+@pytest.mark.parametrize("changes", [
+    {"group_id": "00000000-0000-4000-8000-000000000042"},
+    {"group_key": "another-synthetic-connection-key-1234567890"},
+    {"group_id": "00000000-0000-4000-8000-000000000042", "group_key": "another-synthetic-connection-key-1234567890"},
+])
+def test_registered_client_survives_group_or_key_change_but_requires_fresh_consent(setup, method, changes):
+    storage, _, app = setup
+    changed = replace(CONFIG, **changes)
+
+    async def exchange(http, client, authorization_code):
+        data, headers = token_data(client, authorization_code), {}
+        if method == "client_secret_basic":
+            data.pop("client_secret")
+            credentials = base64.b64encode(f"{client['client_id']}:{client['client_secret']}".encode()).decode()
+            headers["Authorization"] = f"Basic {credentials}"
+        return await http.post("/token", data=data, headers=headers)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=CONFIG.issuer_url) as http:
+            client = await register(http, method)
+            previous_code, _ = await code(http, client)
+            issued = (await exchange(http, client, previous_code)).json()
+            unused_code, _ = await code(http, client)
+            pending = await consent_form(http, client)
+        restarted = GroupOAuthProvider(storage, changed)
+        assert await restarted.load_access_token(issued["access_token"]) is None
+        registered = await restarted.get_client(client["client_id"])
+        assert registered is not None and [str(uri) for uri in registered.redirect_uris] == [CALLBACK]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=make_app(restarted)), base_url=CONFIG.issuer_url) as http:
+            assert (await http.post("/consent", data=pending, headers={"Origin": CONFIG.issuer_url})).status_code == 400
+            assert (await exchange(http, client, unused_code)).json()["error"] == "invalid_grant"
+            assert await restarted.load_refresh_token(registered, issued["refresh_token"]) is None
+            # A cached client cannot redirect consent to a newly supplied callback.
+            invalid = await begin(http, client, redirect_uri="https://other.example.test/callback")
+            assert invalid.status_code == 400 and "location" not in invalid.headers
+            if "group_key" in changes:
+                old_key_form = await consent_form(http, client)
+                assert (await http.post("/consent", data=old_key_form, headers={"Origin": CONFIG.issuer_url})).status_code == 403
+            new_code, _ = await code(http, client, changed)
+            response = await exchange(http, client, new_code)
+            assert response.status_code == 200, response.text
+            assert await restarted.load_access_token(response.json()["access_token"]) is not None
+            # Registered clients have no arbitrary 90-day expiry.
+            with storage._conn:
+                storage._conn.execute("UPDATE mcp_oauth_records SET expires=0")
+            again = GroupOAuthProvider(storage, changed)
+            assert await again.get_client(client["client_id"]) is not None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["none", "client_secret_post", "client_secret_basic"])
+def test_legacy_client_migration_preserves_original_secret_and_redirects(setup, method):
+    storage, provider, _ = setup
+    client = OAuthClientInformationFull(
+        client_id="synthetic-legacy-client", redirect_uris=[CALLBACK],
+        token_endpoint_auth_method=method, grant_types=["authorization_code", "refresh_token"],
+        scope=MCP_SCOPE, client_name="Synthetic client",
+    )
+    secret = provider._mac(f"client:{provider._binding}:{client.client_id}") if method != "none" else None
+    with storage._conn:
+        provider._put("client", client.client_id, client.model_dump(mode="json", exclude={"client_secret"}), time.time()+86400)
+    # Run the one-time migration with the old configuration, then use the new one.
+    GroupOAuthProvider(storage, CONFIG)
+    changed = replace(CONFIG, group_id="00000000-0000-4000-8000-000000000042", group_key="another-synthetic-connection-key-1234567890")
+    migrated = GroupOAuthProvider(storage, changed)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=make_app(migrated)), base_url=CONFIG.issuer_url) as http:
+            metadata = json.loads(client.model_dump_json())
+            if secret:
+                metadata["client_secret"] = secret
+            authorization_code, _ = await code(http, metadata, changed)
+            data, headers = token_data(metadata, authorization_code), {}
+            if method == "client_secret_basic":
+                data.pop("client_secret")
+                basic = base64.b64encode(f"{client.client_id}:{secret}".encode()).decode()
+                headers["Authorization"] = f"Basic {basic}"
+            if secret:
+                invalid_data = {**data, "client_secret": "wrong"}
+                invalid_headers = {"Authorization": "Basic " + base64.b64encode(f"{client.client_id}:wrong".encode()).decode()} if method == "client_secret_basic" else {}
+                assert (await http.post("/token", data=invalid_data, headers=invalid_headers)).status_code == 401
+            response = await http.post("/token", data=data, headers=headers)
+            assert response.status_code == 200, response.text
+            assert await migrated.load_access_token(response.json()["access_token"]) is not None
+            if secret:
+                assert secret not in "\n".join(storage._conn.iterdump())
+            assert storage._conn.execute("SELECT COUNT(*) FROM mcp_oauth_records WHERE kind='client'").fetchone()[0] == 0
 
     asyncio.run(scenario())
 

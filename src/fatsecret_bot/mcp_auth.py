@@ -1,13 +1,16 @@
 """Private group OAuth using the official MCP SDK authorization/PKCE handlers.
 
 All SQLite operations are synchronous on Storage's owning event-loop thread. Only
-digests of random credentials are persisted; client secrets are derived HMACs.
+digests of random credentials are persisted. Client registrations belong to the
+issuer; authorizations and tokens remain bound to the group and connection key.
 Mount ``routes()`` before SDK routes: its token guard closes the SDK's currently
 unchecked token-request resource parameter without replacing its PKCE handling.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import html
@@ -16,7 +19,7 @@ import re
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
 from mcp.server.auth.handlers.token import TokenHandler
 from mcp.server.auth.middleware.client_auth import AuthenticationError, ClientAuthenticator
@@ -71,6 +74,42 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+class GroupClientAuthenticator(ClientAuthenticator):
+    """Use the SDK's client authentication methods with hashed client secrets."""
+
+    async def authenticate_request(self, request: Request) -> OAuthClientInformationFull:
+        form = await request.form()
+        client_id = form.get("client_id")
+        if not isinstance(client_id, str) or not client_id:
+            raise AuthenticationError("Missing client_id")
+        client = await self.provider.get_client(client_id)
+        if client is None:
+            raise AuthenticationError("Invalid client_id")
+        method = client.token_endpoint_auth_method
+        if method == "none":
+            return client
+        if method == "client_secret_basic":
+            header = request.headers.get("Authorization", "")
+            if not header.startswith("Basic "):
+                raise AuthenticationError("Missing Basic authentication")
+            try:
+                credentials = base64.b64decode(header[6:], validate=True).decode("utf-8")
+                basic_id, secret = (unquote(part) for part in credentials.split(":", 1))
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                raise AuthenticationError("Invalid Basic authentication") from None
+            if basic_id != client_id:
+                raise AuthenticationError("Client ID mismatch")
+        elif method == "client_secret_post":
+            secret = form.get("client_secret")
+        else:
+            raise AuthenticationError("Unsupported authentication method")
+        if not isinstance(secret, str) or not self.provider.verify_client_secret(client_id, secret):
+            raise AuthenticationError("Invalid client_secret")
+        if client.client_secret_expires_at and client.client_secret_expires_at < int(time.time()):
+            raise AuthenticationError("Client secret has expired")
+        return client
+
+
 class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
     def __init__(self, storage: Storage, config: MCPConfig) -> None:
         self.config = config
@@ -85,9 +124,14 @@ class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
             );
             CREATE INDEX IF NOT EXISTS idx_mcp_oauth_expiry ON mcp_oauth_records(expires);
             CREATE INDEX IF NOT EXISTS idx_mcp_oauth_family ON mcp_oauth_records(binding, family);
+            CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+                issuer TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL,
+                secret_digest TEXT, PRIMARY KEY(issuer, digest)
+            );
         """)
         with self._conn:
             self._prune()
+            self._migrate_legacy_clients()
 
     def _mac(self, value: str) -> str:
         return hmac.new(self._key, value.encode(), hashlib.sha256).hexdigest()
@@ -95,9 +139,32 @@ class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
     def _prune(self) -> None:
         self._conn.execute("DELETE FROM mcp_oauth_records WHERE expires <= ?", (time.time(),))
 
+    def _migrate_legacy_clients(self) -> None:
+        # An old configuration may be used once for migration after a key change.
+        # Recover only client metadata and a secret digest, never old grants.
+        rows = self._conn.execute(
+            "SELECT payload FROM mcp_oauth_records WHERE binding=? AND kind='client'", (self._binding,),
+        ).fetchall()
+        for row in rows:
+            client = OAuthClientInformationFull.model_validate_json(row["payload"])
+            secret = self._mac(f"client:{self._binding}:{client.client_id}") if client.token_endpoint_auth_method != "none" else None
+            self._store_client(client, secret, legacy=True)
+        self._conn.execute("DELETE FROM mcp_oauth_records WHERE binding=? AND kind='client'", (self._binding,))
+
+    def _store_client(self, client: OAuthClientInformationFull, secret: str | None, *, legacy: bool = False) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO mcp_oauth_clients VALUES (?, ?, ?, ?)" if legacy else
+            "INSERT INTO mcp_oauth_clients VALUES (?, ?, ?, ?)",
+            (self.config.issuer_url, _digest(str(client.client_id)),
+             client.model_dump_json(exclude={"client_secret"}), _digest(secret) if secret else None),
+        )
+
     def _count(self, kind: str | None = None) -> int:
+        clients = self._conn.execute("SELECT COUNT(*) FROM mcp_oauth_clients").fetchone()[0]
         if kind is None:
-            return self._conn.execute("SELECT COUNT(*) FROM mcp_oauth_records").fetchone()[0]
+            return clients + self._conn.execute("SELECT COUNT(*) FROM mcp_oauth_records").fetchone()[0]
+        if kind == "client":
+            return clients
         return self._conn.execute("SELECT COUNT(*) FROM mcp_oauth_records WHERE kind = ?", (kind,)).fetchone()[0]
 
     def _put(self, kind: str, raw: str, payload: dict[str, Any], expires: float, family: str | None = None) -> None:
@@ -134,13 +201,22 @@ class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
         return True
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        row = self._read("client", client_id)
+        if not client_id or len(client_id) > 4096:
+            return None
+        row = self._conn.execute(
+            "SELECT payload FROM mcp_oauth_clients WHERE issuer=? AND digest=?",
+            (self.config.issuer_url, _digest(client_id)),
+        ).fetchone()
         if row is None:
             return None
-        client = OAuthClientInformationFull.model_validate_json(row["payload"])
-        if client.token_endpoint_auth_method != "none":
-            client.client_secret = self._mac(f"client:{self._binding}:{client_id}")
-        return client
+        return OAuthClientInformationFull.model_validate_json(row["payload"])
+
+    def verify_client_secret(self, client_id: str, secret: str) -> bool:
+        row = self._conn.execute(
+            "SELECT secret_digest FROM mcp_oauth_clients WHERE issuer=? AND digest=?",
+            (self.config.issuer_url, _digest(client_id)),
+        ).fetchone()
+        return bool(row and row["secret_digest"] and hmac.compare_digest(row["secret_digest"], _digest(secret)))
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if not self._budget("register", 32, 600):
@@ -161,14 +237,11 @@ class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
                 raise RegistrationError("invalid_redirect_uri", "A web callback without credentials or fragment is required")
             if uri.scheme == "http" and uri.host not in {"localhost", "127.0.0.1", "[::1]", "::1"}:
                 raise RegistrationError("invalid_redirect_uri", "Remote callbacks require HTTPS")
-        if client_info.token_endpoint_auth_method != "none":
-            client_info.client_secret = self._mac(f"client:{self._binding}:{client_info.client_id}")
         with self._conn:
             self._prune()
             if self._count("client") >= MAX_CLIENTS or self._count() >= MAX_RECORDS:
                 raise RegistrationError("invalid_client_metadata", "Registration temporarily unavailable")
-            self._put("client", client_info.client_id,
-                      client_info.model_dump(mode="json", exclude={"client_secret"}), time.time() + 90 * 24 * 3600)
+            self._store_client(client_info, client_info.client_secret)
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         if params.resource != self.config.resource_url:
@@ -220,7 +293,7 @@ class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
         if any(len(form.getlist(k)) != 1 for k in form) or not isinstance(form.get("token"), str):
             return JSONResponse({"error": "invalid_request"}, status_code=400, headers=SAFE_HEADERS)
         try:
-            client = await ClientAuthenticator(self).authenticate_request(request)
+            client = await GroupClientAuthenticator(self).authenticate_request(request)
         except AuthenticationError:
             return JSONResponse({"error": "unauthorized_client"}, status_code=401, headers=SAFE_HEADERS)
         raw = str(form["token"])
@@ -240,7 +313,7 @@ class GroupOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
             r"[A-Za-z0-9._~-]{43,128}", str(form.get("code_verifier", "")),
         ):
             return JSONResponse({"error": "invalid_grant"}, status_code=400, headers=SAFE_HEADERS)
-        return await TokenHandler(self, ClientAuthenticator(self)).handle(request)
+        return await TokenHandler(self, GroupClientAuthenticator(self)).handle(request)
 
     def _failure(self, status: int = 400) -> Response:
         return HTMLResponse("<html lang='ru'><meta charset='utf-8'><title>Подключение</title>"
