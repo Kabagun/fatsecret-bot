@@ -1090,7 +1090,10 @@ def _custom_food_content_hash(definition: CustomFoodDefinition) -> str:
                 "title": normalize_title(definition.title),
                 "manufacturer": normalize_title(definition.manufacturer_name),
                 "serving_type": definition.serving_type,
-                "serving_size": definition.serving_size,
+                # FatSecret lowercases serving labels on authoritative readback.
+                # Treat that cosmetic normalization like product/brand casing;
+                # retain exact serving basis, weight and nutrient verification.
+                "serving_size": normalize_title(definition.serving_size),
                 "metric_serving_size": definition.metric_serving_size,
                 "nutrients": {
                     key: format(value.normalize(), "f")

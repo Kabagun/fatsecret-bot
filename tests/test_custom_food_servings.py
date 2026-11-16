@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -24,6 +25,15 @@ def serving(weight: str = "50g") -> CustomFoodDefinition:
         {"calories": Decimal("120"), "protein": Decimal("4"),
          "totalFat": Decimal("4"), "carbohydrate": Decimal("17")},
     )
+
+
+def test_food_readback_allows_server_casing_of_serving_name_only() -> None:
+    expected = replace(serving(), serving_size="QA Порция")
+    actual = replace(expected, serving_size="qa порция")
+    assert _custom_food_definition_matches(expected, actual)
+    assert not _custom_food_definition_matches(expected, replace(actual, serving_size="другая порция"))
+    assert not _custom_food_definition_matches(expected, replace(actual, metric_serving_size="100g"))
+    assert not _custom_food_definition_matches(expected, replace(actual, nutrients={**actual.nutrients, "protein": Decimal("8")}))
 
 
 def test_only_100g_and_one_serving_are_offered() -> None:

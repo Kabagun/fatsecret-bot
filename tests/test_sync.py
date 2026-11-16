@@ -5707,6 +5707,29 @@ def test_create_custom_food_for_group_journals_verifies_maps_and_reuses(tmp_path
         storage.close()
 
 
+def test_custom_food_recovers_saved_id_after_serving_label_casing(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        client = FakeGroupCustomFoodClient("a1")
+        definition = CustomFoodDefinition("0", "QA Food", "QA Brand", "PerServing", "QA Порция", "50g",
+            {"calories": Decimal("60"), "protein": Decimal("5"), "totalFat": Decimal("2"), "carbohydrate": Decimal("5.5")})
+        client.custom_foods["existing-food"] = replace(definition, title="Qa Food", manufacturer_name="Qa Brand", serving_size="qa порция")
+        run = storage.create_custom_food_run("group", 11, definition.title,
+            sync_module._custom_food_definition_json(definition), sync_module._custom_food_request_fingerprint(definition),
+            "legacy-case-sensitive-serving-hash", ["a1"])
+        storage.update_custom_food_run_account(run, "a1", "error", remote_food_id="existing-food")
+        engine = RecipeSyncEngine(storage, _device())
+        engine._build_clients = lambda group_id=None: {"a1": client}
+
+        created = asyncio.run(engine.create_custom_food_for_group("group", definition, 11))
+        assert created.run_id == run
+        assert created.food_ids == {"a1": "existing-food"}
+        assert client.created_custom_foods == []
+        assert storage.custom_food_run(run)["status"] == "completed"
+    finally:
+        storage.close()
+
+
 def test_create_custom_food_for_group_recovers_timeout_from_exact_readback(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
