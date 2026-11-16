@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 exec ./temp/mcp-gateway-venv/bin/python -m fatsecret_bot.mcp_gateway
