@@ -73,6 +73,7 @@ async def consent_form(http, client, config=CONFIG):
     assert "Synthetic client" in page.text
     assert "https://client.example.test" in page.text
     assert "no-store" in page.headers["cache-control"]
+    assert page.headers["referrer-policy"] == "strict-origin"
     assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
     return {
         "request": re.search(r"name='request' value='([^']+)'", page.text)[1],
@@ -170,6 +171,7 @@ def test_csrf_browser_binding_origin_denial_and_failed_key_budget(setup):
             client = await register(http)
             form = await consent_form(http, client)
             assert (await http.post("/consent", data=form)).status_code == 403
+            assert (await http.post("/consent", data=form, headers={"Origin": "null"})).status_code == 403
             assert (await http.post("/consent", data=form, headers={"Origin": "https://evil.example.test"})).status_code == 403
             assert (await http.post("/consent", data={**form, "csrf": "wrong"}, headers={"Origin": CONFIG.issuer_url})).status_code == 403
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=CONFIG.issuer_url) as other:

@@ -51,7 +51,9 @@ COOKIE = "fatsecret_mcp_consent"
 SAFE_HEADERS = {
     "Cache-Control": "no-store",
     "Pragma": "no-cache",
-    "Referrer-Policy": "no-referrer",
+    # no-referrer makes browser form POSTs send Origin: null, breaking the
+    # exact-origin consent check. strict-origin still hides paths and queries.
+    "Referrer-Policy": "strict-origin",
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
 }
