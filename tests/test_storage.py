@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
 import os
 import sqlite3
 from decimal import Decimal
@@ -275,6 +274,82 @@ def test_leaving_only_group_detaches_owned_accounts_without_deleting_credentials
         storage.close()
 
 
+def test_new_database_omits_retired_diary_schema(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    try:
+        assert storage._conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN (?, ?)",
+            ("diary_copy_runs", "idx_diary_copy_runs_group_created"),
+        ).fetchall() == []
+    finally:
+        storage.close()
+
+
+def test_group_account_moves_preserve_legacy_diary_history(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    storage = Storage(db_path)
+    try:
+        storage.register_user(11, "One")
+        original_group = storage.create_group(11, "Старая")
+        account_key = storage.create_fatsecret_account(
+            11, "One FS", "one@example.com", "secret", "BY", "ru", group_id=original_group.id
+        )
+        session = FatSecretSession("server", "device", "secret")
+        storage.update_fatsecret_session(account_key, session)
+        storage._conn.executescript(
+            """
+            CREATE TABLE diary_copy_runs (
+                id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                initiated_by INTEGER NOT NULL,
+                source_account_key TEXT NOT NULL,
+                source_date TEXT NOT NULL,
+                target_start TEXT NOT NULL,
+                target_end TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_diary_copy_runs_group_created
+            ON diary_copy_runs(group_id, created_at DESC);
+            """
+        )
+        history = (
+            "legacy-run", original_group.id, 11, account_key, "2026-07-14",
+            "2026-07-15", "2026-07-15", '{"entries":[]}', "running", None,
+            "2026-07-14T10:00:00+00:00", "2026-07-14T10:00:00+00:00",
+        )
+        storage._conn.execute(
+            "INSERT INTO diary_copy_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            history,
+        )
+        storage._conn.commit()
+    finally:
+        storage.close()
+
+    storage = Storage(db_path)
+    try:
+        destination = storage.create_group(11, "Новая")
+        assert storage.fatsecret_account_group_id(account_key) == destination.id
+        assert storage.set_active_group_for_user(11, original_group.id) is True
+        assert storage.fatsecret_account_group_id(account_key) == original_group.id
+        assert storage.leave_active_group(11) == original_group
+        assert storage.fatsecret_account_group_id(account_key) == destination.id
+        assert storage.leave_active_group(11) == destination
+        assert storage.fatsecret_account_group_id(account_key) is None
+        assert storage.get_fatsecret_session(account_key) == session
+        assert storage.get_fatsecret_account(account_key).password == "secret"
+        assert [tuple(row) for row in storage._conn.execute("SELECT * FROM diary_copy_runs")] == [history]
+        assert storage._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_diary_copy_runs_group_created",),
+        ).fetchone() is not None
+    finally:
+        storage.close()
+
+
 def test_group_creator_can_rename_active_group(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
@@ -431,38 +506,6 @@ def test_storage_restricts_existing_database_permissions(tmp_path) -> None:
     try:
         assert db_path.stat().st_mode & 0o777 == 0o600
         assert storage._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
-    finally:
-        storage.close()
-
-
-def test_diary_copy_claim_rejects_active_run_and_reclaims_stale_heartbeat(tmp_path) -> None:
-    storage = Storage(tmp_path / "bot.sqlite3")
-    try:
-        run_id = storage.create_diary_copy_run(
-            "group",
-            11,
-            "tg11",
-            dt.date(2026, 7, 14),
-            dt.date(2026, 7, 15),
-            dt.date(2026, 7, 15),
-            {"entries": []},
-        )
-        started_at = dt.datetime(2026, 7, 16, 10, 0, tzinfo=dt.UTC)
-
-        assert storage.claim_diary_copy_run(run_id, now=started_at) is True
-        assert storage.claim_diary_copy_run(run_id, now=started_at + dt.timedelta(minutes=29)) is False
-        assert storage.touch_diary_copy_run(run_id, now=started_at + dt.timedelta(minutes=20)) is True
-        assert storage.claim_diary_copy_run(run_id, now=started_at + dt.timedelta(minutes=49)) is False
-        assert storage.claim_diary_copy_run(run_id, now=started_at + dt.timedelta(minutes=51)) is True
-
-        run = storage.diary_copy_run(run_id)
-        assert run is not None
-        assert run["status"] == "running"
-        assert run["created_at"]
-        assert run["updated_at"] == (started_at + dt.timedelta(minutes=51)).isoformat()
-
-        storage.finish_diary_copy_run(run_id, "completed", {"dates": []})
-        assert storage.claim_diary_copy_run(run_id, now=started_at + dt.timedelta(days=1)) is False
     finally:
         storage.close()
 

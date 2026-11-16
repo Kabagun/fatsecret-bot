@@ -20,10 +20,6 @@ from .models import (
     FatSecretAccountConfig,
     FatSecretDeviceConfig,
     FatSecretSession,
-    FoodDiaryBulkResult,
-    FoodDiaryDay,
-    FoodDiaryEntry,
-    FoodDiaryWriteEntry,
     FoodSearchResult,
     Ingredient,
     MAX_RECIPE_STEPS,
@@ -73,7 +69,6 @@ logger = logging.getLogger(__name__)
 FOOD_SEARCH_DATA_URL = "https://app.ftscrt.com/api/food/v1/search/data"
 BARCODE_SCAN_URL = "https://app.ftscrt.com/api/barcode-verification/v1/scan"
 BARCODE_REMAP_URL = "https://app.ftscrt.com/api/barcode-verification/v1/remap"
-DIARY_BULK_UPDATE_URL = "https://app.ftscrt.com/api/user-data/v1/update-journal-entries"
 FOOD_SEARCH_PAGE_SIZE = 10
 AUTH_RETRY_STATUS_CODES = {401, 403, 500}
 SAFE_ANDROID_CONTEXT_FIELDS = ("action", "prid", "rid", "iid", "entryname", "portionid", "portionamount")
@@ -529,80 +524,6 @@ class FatSecretClient:
     async def cookbook(self) -> list[RecipeSummary]:
         response = await self._post_android("CookBookAndroidPage.aspx", {"fl": "4"}, read_only=True)
         return self._parse_recipe_list(response.text)
-
-    async def get_food_diary_day(self, date: dt.date) -> FoodDiaryDay:
-        """Load one food diary day through the Android journal endpoint."""
-        response = await self._post_android(
-            "RecipeJournalDayAndroidPage.aspx",
-            {
-                "dt": days_since_epoch(date),
-                "fl": "7",
-                "guid": "00000000-0000-0000-0000-000000000000",
-            },
-        )
-        return self._parse_food_diary_day(response.text, date)
-
-    async def bulk_update_food_diary(
-        self,
-        date: dt.date,
-        entries: list[FoodDiaryWriteEntry],
-    ) -> FoodDiaryBulkResult:
-        """Append food rows to one diary date using FatSecret's mobile bulk endpoint."""
-        payload = {
-            "recordedDate": int(days_since_epoch(date)),
-            "recipes": [
-                {
-                    "id": 0,
-                    "reference": entry.reference,
-                    "recipeid": int(entry.recipe_id),
-                    "name": entry.name,
-                    "recipeportionid": int(entry.recipe_portion_id),
-                    "portionamount": float(entry.portion_amount),
-                    "meal": entry.meal,
-                    **(
-                        {"servingDescription": entry.serving_description}
-                        if entry.serving_description
-                        else {}
-                    ),
-                }
-                for entry in entries
-            ],
-            "deletes": [],
-        }
-        logger.info(
-            "Diary bulk update started account=%s date=%s entries=%d",
-            self.account.label,
-            date.isoformat(),
-            len(entries),
-        )
-        response = await self._post_app_json(DIARY_BULK_UPDATE_URL, payload, "diary bulk update")
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise FatSecretError(f"{self.account.label}: invalid diary bulk update JSON") from exc
-        result = self._parse_food_diary_bulk_result(data)
-        logger.info(
-            "Diary bulk update completed account=%s date=%s entries=%d",
-            self.account.label,
-            date.isoformat(),
-            len(entries),
-        )
-        return result
-
-    async def delete_food_diary_entries(self, date: dt.date, entry_ids: list[str]) -> None:
-        """Delete selected journal rows using the official bulk-update delete-id contract."""
-        if not entry_ids:
-            return
-        try:
-            deletes = [int(entry_id) for entry_id in entry_ids]
-        except ValueError as exc:
-            raise FatSecretError(f"{self.account.label}: invalid diary entry id") from exc
-        payload = {
-            "recordedDate": int(days_since_epoch(date)),
-            "recipes": [],
-            "deletes": deletes,
-        }
-        await self._post_app_json(DIARY_BULK_UPDATE_URL, payload, "diary bulk delete")
 
     async def get_custom_food_definition(self, remote_id: str) -> CustomFoodDefinition:
         """Read a portable food definition preserving its gram or serving nutrition basis."""
@@ -1291,72 +1212,6 @@ class FatSecretClient:
                 )
             )
         return recipes
-
-    def _parse_food_diary_day(self, xml_text: str, date: dt.date) -> FoodDiaryDay:
-        try:
-            root = ET.fromstring(xml_text)
-        except ET.ParseError as exc:
-            raise FatSecretError(f"{self.account.label}: invalid food diary XML") from exc
-        entries: list[FoodDiaryEntry] = []
-        for node in root.findall(".//recipejournalentry"):
-            recipe_id = _text(node, "recipeid")
-            entry_id = _text(node, "id")
-            if not recipe_id or not entry_id:
-                continue
-            entries.append(
-                FoodDiaryEntry(
-                    entry_id=entry_id,
-                    recipe_id=recipe_id,
-                    meal=_int(_text(node, "meal")),
-                    name=_text(node, "name"),
-                    recipe_source=_text(node, "recipeSource"),
-                    recipe_portion_id=_text(node, "recipePortionID", "0"),
-                    portion_amount=_decimal(_text(node, "portionAmount"), Decimal("0")) or Decimal("0"),
-                    serving_description=_text(node, "servingDescription"),
-                )
-            )
-        return FoodDiaryDay(date=date, guid=_text(root, "guid"), entries=entries)
-
-    def _parse_food_diary_bulk_result(self, data: Any) -> FoodDiaryBulkResult:
-        if not isinstance(data, dict):
-            raise FatSecretError(f"{self.account.label}: invalid diary bulk update response")
-        inserted_raw = data.get("insertedEntries") or {}
-        inserted: dict[str, str] = {}
-        if isinstance(inserted_raw, dict):
-            inserted = {str(reference): str(entry_id) for reference, entry_id in inserted_raw.items()}
-        elif isinstance(inserted_raw, list):
-            for item in inserted_raw:
-                if not isinstance(item, dict):
-                    continue
-                reference = _first_present(item, "reference", "key")
-                entry_id = _first_present(item, "id", "entryId", "value")
-                if reference is not None and entry_id is not None:
-                    inserted[str(reference)] = str(entry_id)
-
-        failed: dict[str, str] = {}
-        failed_raw = data.get("failedEntries") or []
-        if isinstance(failed_raw, dict):
-            failed_raw = [failed_raw]
-        if isinstance(failed_raw, list):
-            for item in failed_raw:
-                if not isinstance(item, dict):
-                    continue
-                message = str(
-                    _first_present(item, "errorDescription", "error", "errorCode")
-                    or "FatSecret rejected diary entry"
-                )
-                references = item.get("references") or item.get("reference") or []
-                if not isinstance(references, list):
-                    references = [references]
-                for reference in references:
-                    if reference is not None:
-                        failed[str(reference)] = message
-        return FoodDiaryBulkResult(
-            inserted_entries=inserted,
-            failed_entries=failed,
-            previous_guid=str(data.get("previousGuid") or ""),
-            new_guid=str(data.get("newGuid") or ""),
-        )
 
     def _parse_custom_food_definition(self, xml_text: str, remote_id: str) -> CustomFoodDefinition:
         try:

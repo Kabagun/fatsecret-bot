@@ -41,8 +41,6 @@ from .fatsecret_client import user_safe_error_message
 from .models import (
     MAX_RECIPE_STEPS,
     CustomFoodDefinition,
-    DiaryCopyPreview,
-    DiaryCopyResult,
     FatSecretAccountConfig,
     Ingredient,
     Recipe,
@@ -93,8 +91,6 @@ MAIN_ACTION_BY_LABEL = {
     "Группы": "groups",
     "🔗 Аккаунты FatSecret": "accounts",
     "Аккаунты": "accounts",
-    "📅 Копировать дневник": "diary",
-    "Меню / Дневник": "diary",
 }
 MAIN_BUTTONS = set(MAIN_ACTION_BY_LABEL)
 LIST_WIDTH_LINE = "--------------------------------"
@@ -142,17 +138,15 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         ["👥 Моя группа", "🔗 Аккаунты FatSecret"],
     ],
     resize_keyboard=True,
-    is_persistent=True,
 )
 
 ADMIN_MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["🍽️ Все рецепты", "➕ Новый рецепт"],
-        ["🥕 Новый продукт", "📅 Копировать дневник"],
+        ["🥕 Новый продукт"],
         ["👥 Группы", "🔗 Аккаунты FatSecret"],
     ],
     resize_keyboard=True,
-    is_persistent=True,
 )
 
 MODE_KEYBOARD = ReplyKeyboardMarkup(
@@ -161,11 +155,6 @@ MODE_KEYBOARD = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
-DIARY_DATE_TOKEN = r"(?:\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|сегодня|завтра|вчера)"
-DIARY_RANGE_RE = re.compile(
-    rf"^\s*(?P<start>{DIARY_DATE_TOKEN})(?:\s*(?:\.\.|—|–|\s-\s)\s*(?P<end>{DIARY_DATE_TOKEN}))?\s*$",
-    re.IGNORECASE,
-)
 CUSTOM_FOOD_NUMBER_RE = re.compile(r"(?<!\w)[+-]?\d+(?:[,.]\d+)?(?!\w)")
 
 
@@ -176,32 +165,6 @@ class _ParsedRecipeListPayload:
     bad_lines: list[str]
     steps: list[str]
     cooked_weight_grams: Decimal | None
-
-
-def _parse_diary_date(value: str, today: dt.date | None = None) -> dt.date:
-    current = today or dt.date.today()
-    normalized = value.strip().casefold()
-    if normalized == "сегодня":
-        return current
-    if normalized == "завтра":
-        return current + dt.timedelta(days=1)
-    if normalized == "вчера":
-        return current - dt.timedelta(days=1)
-    for date_format in ("%d.%m.%Y", "%Y-%m-%d"):
-        try:
-            return dt.datetime.strptime(normalized, date_format).date()
-        except ValueError:
-            continue
-    raise ValueError("Дата должна быть в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД.")
-
-
-def _parse_diary_range(value: str, today: dt.date | None = None) -> tuple[dt.date, dt.date]:
-    match = DIARY_RANGE_RE.fullmatch(value)
-    if match is None:
-        raise ValueError("Диапазон: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ; для одного дня укажи одну дату.")
-    start = _parse_diary_date(match.group("start"), today=today)
-    end = _parse_diary_date(match.group("end") or match.group("start"), today=today)
-    return start, end
 
 
 def _format_steps_lines(steps: list[str], limit: int = DISPLAY_RECIPE_STEPS_LIMIT) -> list[str]:
@@ -1307,7 +1270,6 @@ class TelegramRecipeBot:
         app.add_handler(CommandHandler("recipes", self.recipes))
         app.add_handler(CommandHandler("refresh", self.refresh))
         app.add_handler(CommandHandler("groups", self.groups))
-        app.add_handler(CommandHandler("diary", self.diary))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
@@ -2140,243 +2102,6 @@ class TelegramRecipeBot:
             return
         await self._send_recipe_list(update, context, page=0)
 
-    async def diary(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Start copying one account's food diary to selected group accounts."""
-        if not await self._require_user(update):
-            return
-        if not self._is_admin(update.effective_user.id):
-            context.user_data.clear()
-            await update.effective_message.reply_text(
-                "Копирование меню / дневника временно доступно только администратору.",
-                reply_markup=self._main_keyboard(update.effective_user.id),
-            )
-            self._mark_reply_keyboard(context, "main")
-            return
-        group = await self._require_active_group(update)
-        if group is None:
-            return
-        accounts = self.storage.list_fatsecret_accounts(group.id)
-        context.user_data.clear()
-        if len(accounts) < 2:
-            await update.effective_message.reply_text(
-                "Для копирования дневника подключи минимум два FatSecret аккаунта группы.",
-                reply_markup=self._main_keyboard(update.effective_user.id),
-            )
-            self._mark_reply_keyboard(context, "main")
-            return
-        await self._ensure_mode_keyboard(update.effective_message, context)
-        buttons = [
-            [InlineKeyboardButton(account.label[:50], callback_data=f"diarysrc:{account.key}")]
-            for account in accounts
-        ]
-        await update.effective_message.reply_text(
-            "<b>Копирование меню / дневника</b>\n\nВыбери FatSecret аккаунт, где уже заполнен исходный день.",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.HTML,
-        )
-
-    async def _select_diary_source(
-        self,
-        query,
-        context: ContextTypes.DEFAULT_TYPE,
-        telegram_id: int,
-        source_account_key: str,
-    ) -> None:
-        group = self.storage.active_group_for_user(telegram_id)
-        accounts = self.storage.list_fatsecret_accounts(group.id) if group is not None else []
-        account = next((item for item in accounts if item.key == source_account_key), None)
-        if group is None or account is None or len(accounts) < 2:
-            context.user_data.clear()
-            await query.edit_message_text("Аккаунты или активная группа изменились. Начни копирование заново.")
-            await self._ensure_main_keyboard(getattr(query, "message", None), context, telegram_id)
-            return
-        context.user_data.clear()
-        context.user_data.update(
-            {
-                "group_id": group.id,
-                "diary_source_account_key": account.key,
-                "diary_target_account_keys": {item.key for item in accounts},
-            }
-        )
-        await self._show_diary_targets(query, context)
-
-    async def _show_diary_targets(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
-        group_id = str(context.user_data.get("group_id") or "")
-        source_key = str(context.user_data.get("diary_source_account_key") or "")
-        selected = context.user_data.get("diary_target_account_keys")
-        selected_keys = selected if isinstance(selected, set) else set()
-        accounts = self.storage.list_fatsecret_accounts(group_id)
-        if not source_key or len(accounts) < 2:
-            context.user_data.clear()
-            await query.edit_message_text("Аккаунты изменились. Начни копирование заново.")
-            await self._ensure_main_keyboard(
-                getattr(query, "message", None),
-                context,
-                getattr(getattr(query, "from_user", None), "id", None),
-            )
-            return
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    f"{'✓' if account.key in selected_keys else '○'} {account.label}"[:60],
-                    callback_data=f"diarytarget:{account.key}",
-                )
-            ]
-            for account in accounts
-        ]
-        buttons.extend(
-            [
-                [InlineKeyboardButton("Дальше ➡️", callback_data="diarytargets_done:0")],
-            ]
-        )
-        error = "Нужно выбрать хотя бы один целевой аккаунт.\n\n" if context.user_data.pop("diary_targets_error", False) else ""
-        await query.edit_message_text(
-            error + "Выбери один или несколько аккаунтов, куда копировать выбранный день. "
-            "Источник тоже можно оставить выбранным для других дат.",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.HTML,
-        )
-
-    async def _finish_diary_targets(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
-        selected = context.user_data.get("diary_target_account_keys")
-        if not isinstance(selected, set) or not selected:
-            context.user_data["diary_targets_error"] = True
-            await self._show_diary_targets(query, context)
-            return
-        source_key = str(context.user_data.get("diary_source_account_key") or "")
-        group_id = str(context.user_data.get("group_id") or "")
-        label = next(
-            (account.label for account in self.storage.list_fatsecret_accounts(group_id) if account.key == source_key),
-            source_key,
-        )
-        context.user_data["mode"] = "diary_source_date"
-        await query.edit_message_text(
-            f"Источник: <b>{html.escape(label)}</b>.\n\n"
-            "Пришли дату заполненного дня: <code>ДД.ММ.ГГГГ</code>, <code>сегодня</code> или <code>вчера</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-        await self._ensure_mode_keyboard(getattr(query, "message", None), context)
-
-    async def _prepare_diary_preview(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        text: str,
-    ) -> None:
-        try:
-            target_start, target_end = _parse_diary_range(
-                text,
-                today=dt.datetime.now(self._refresh_timezone()).date(),
-            )
-        except ValueError as exc:
-            await update.effective_message.reply_text(str(exc))
-            return
-        group_id = str(context.user_data.get("group_id") or "")
-        source_account_key = str(context.user_data.get("diary_source_account_key") or "")
-        source_date_text = str(context.user_data.get("diary_source_date") or "")
-        if not group_id or not source_account_key or not source_date_text:
-            context.user_data.clear()
-            await update.effective_message.reply_text(
-                "Контекст копирования потерян. Нажми «📅 Копировать дневник» заново.",
-                reply_markup=self._main_keyboard(update.effective_user.id),
-            )
-            self._mark_reply_keyboard(context, "main")
-            return
-        status = await update.effective_message.reply_text("Загружаю исходный дневник и готовлю проверку...")
-        try:
-            preview = await self.sync_engine.prepare_diary_copy(
-                group_id=group_id,
-                initiated_by=update.effective_user.id,
-                source_account_key=source_account_key,
-                source_date=dt.date.fromisoformat(source_date_text),
-                target_start=target_start,
-                target_end=target_end,
-                target_account_keys=sorted(context.user_data.get("diary_target_account_keys") or []),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("diary copy preview failed")
-            await status.edit_text(f"Не удалось подготовить копирование: {user_safe_error_message(exc)}")
-            return
-        context.user_data["mode"] = "diary_confirm"
-        context.user_data["diary_run_id"] = preview.run_id
-        await status.edit_text(
-            self._format_diary_preview(preview, group_id),
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("✅ Применить", callback_data=f"diaryrun:{preview.run_id}")],
-                ]
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-
-    def _format_diary_preview(self, preview: DiaryCopyPreview, group_id: str) -> str:
-        labels = self._account_labels_for_group(group_id)
-        meal_counts: dict[int, int] = {}
-        for entry in preview.source_entries:
-            meal_counts[entry.meal] = meal_counts.get(entry.meal, 0) + 1
-        meal_names = {1: "завтрак", 2: "обед", 3: "ужин", 4: "перекусы"}
-        meals = ", ".join(
-            f"{meal_names.get(meal, f'приём {meal}')}: {count}"
-            for meal, count in sorted(meal_counts.items())
-        )
-        skipped = (
-            "\nИсходный аккаунт в исходную дату пропущен, чтобы не создать самодубликат."
-            if preview.skipped_source_day
-            else ""
-        )
-        total_rows = len(preview.source_entries) * preview.target_operations
-        return (
-            "<b>Проверка копирования дневника</b>\n\n"
-            f"Источник: {html.escape(labels.get(preview.source_account_key, preview.source_account_key))}, "
-            f"{preview.source_date:%d.%m.%Y}\n"
-            f"Целевые даты: {preview.target_start:%d.%m.%Y} — {preview.target_end:%d.%m.%Y}\n"
-            f"Записей еды в источнике: {len(preview.source_entries)} ({html.escape(meals)})\n"
-            f"Операций аккаунт/дата: {preview.target_operations}; будет добавлено строк: {total_rows}.\n\n"
-            "Уже существующие записи сохранятся; новые строки добавятся к ним. "
-            "Вода, упражнения, фото и заметки не копируются."
-            f"{skipped}"
-        )
-
-    async def _execute_diary_copy(
-        self,
-        query,
-        context: ContextTypes.DEFAULT_TYPE,
-        telegram_id: int,
-        run_id: str,
-    ) -> None:
-        run = self.storage.diary_copy_run(run_id)
-        active_group = self.storage.active_group_for_user(telegram_id)
-        if run is None or active_group is None or run["group_id"] != active_group.id:
-            context.user_data.clear()
-            await query.edit_message_text("Операция устарела или относится к другой группе.")
-            await self._ensure_main_keyboard(getattr(query, "message", None), context, telegram_id)
-            return
-        await query.edit_message_text("Копирую дневник. Личные рецепты и продукты при необходимости синхронизируются...")
-        try:
-            result = await self.sync_engine.execute_diary_copy(run_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("diary copy execution failed")
-            await query.edit_message_text(f"Копирование не выполнено: {user_safe_error_message(exc)}")
-            await self._ensure_main_keyboard(getattr(query, "message", None), context, telegram_id)
-            return
-        context.user_data.clear()
-        await query.edit_message_text(self._format_diary_result(result, active_group.id))
-        await self._ensure_main_keyboard(getattr(query, "message", None), context, telegram_id)
-
-    def _format_diary_result(self, result: DiaryCopyResult, group_id: str) -> str:
-        labels = self._account_labels_for_group(group_id)
-        inserted = sum(item.inserted for item in result.dates)
-        failed = sum(item.failed for item in result.dates)
-        heading = "Копирование завершено" if failed == 0 else "Копирование завершено частично"
-        lines = [f"{heading}. Добавлено: {inserted}; ошибок: {failed}.", ""]
-        for item in result.dates:
-            label = labels.get(item.account_key, item.account_key)
-            lines.append(
-                f"- {label}, {item.date:%d.%m.%Y}: +{item.inserted}, ошибок {item.failed}"
-                + (f" — {item.message}" if item.message and item.failed else "")
-            )
-        return "\n".join(lines)
-
     def _recipe_page(self, recipes: list[Recipe], page: int) -> tuple[list[Recipe], int, int]:
         total_count = len(recipes)
         total_pages = max(1, (total_count + RECIPES_PAGE_SIZE - 1) // RECIPES_PAGE_SIZE)
@@ -2540,13 +2265,6 @@ class TelegramRecipeBot:
         await query.answer()
         action, _, value = query.data.partition(":")
         self._cancel_recipe_warning_render(context)
-
-        if action.startswith("diary") and not self._is_admin(update.effective_user.id):
-            context.user_data.clear()
-            await query.edit_message_text(
-                "Копирование меню / дневника временно доступно только администратору."
-            )
-            return
 
         if self._recipe_edit_is_active(context) and action in {
             "recipe_list_create",
@@ -2782,35 +2500,6 @@ class TelegramRecipeBot:
                 if removed
                 else "Аккаунт уже удален или принадлежит другому пользователю.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Аккаунты FatSecret", callback_data="accounts:0")]]),
-            )
-        elif action == "diarysrc":
-            await self._select_diary_source(query, context, update.effective_user.id, value)
-        elif action == "diarytarget":
-            selected = context.user_data.get("diary_target_account_keys")
-            if not isinstance(selected, set):
-                await query.edit_message_text("Выбор целей устарел. Начни копирование заново.")
-                await self._ensure_main_keyboard(
-                    getattr(query, "message", None),
-                    context,
-                    update.effective_user.id,
-                )
-                return
-            if value in selected:
-                selected.remove(value)
-            else:
-                selected.add(value)
-            await self._show_diary_targets(query, context)
-        elif action == "diarytargets_done":
-            await self._finish_diary_targets(query, context)
-        elif action == "diaryrun":
-            await self._execute_diary_copy(query, context, update.effective_user.id, value)
-        elif action == "diarycancel":
-            context.user_data.clear()
-            await query.edit_message_text("Копирование дневника отменено.")
-            await self._ensure_main_keyboard(
-                getattr(query, "message", None),
-                context,
-                update.effective_user.id,
             )
         elif action == "list":
             context.user_data.pop("current_recipe_id", None)
@@ -4760,16 +4449,6 @@ class TelegramRecipeBot:
         mode = context.user_data.get("mode")
         text = update.effective_message.text.strip()
         main_action = MAIN_ACTION_BY_LABEL.get(text)
-        if (main_action == "diary" or str(mode).startswith("diary_")) and not self._is_admin(
-            update.effective_user.id
-        ):
-            context.user_data.clear()
-            await update.effective_message.reply_text(
-                "Копирование меню / дневника временно доступно только администратору.",
-                reply_markup=self._main_keyboard(update.effective_user.id),
-            )
-            self._mark_reply_keyboard(context, "main")
-            return
         if text == "В меню":
             context.user_data.clear()
             await update.effective_message.reply_text(
@@ -4843,9 +4522,6 @@ class TelegramRecipeBot:
             page = int(context.user_data.get("recipe_list_page") or 0)
             await self._send_batch_delete(update, context, page)
             return
-        if mode is None and main_action == "diary":
-            await self.diary(update, context)
-            return
         if mode is None and main_action == "accounts":
             await self.accounts(update, context)
             return
@@ -4903,25 +4579,6 @@ class TelegramRecipeBot:
             await self._handle_fatsecret_label(update, context, text)
         elif mode == "account_label":
             await self._handle_account_label(update, context, text)
-        elif mode == "diary_source_date":
-            try:
-                source_date = _parse_diary_date(
-                    text,
-                    today=dt.datetime.now(self._refresh_timezone()).date(),
-                )
-            except ValueError as exc:
-                await update.effective_message.reply_text(str(exc))
-                return
-            context.user_data["diary_source_date"] = source_date.isoformat()
-            context.user_data["mode"] = "diary_target_range"
-            await update.effective_message.reply_text(
-                "Теперь пришли целевой диапазон до 7 дней:\n"
-                "<code>15.07.2026 - 17.07.2026</code>\n"
-                "или одну дату для одного дня. Можно использовать <code>сегодня</code>/<code>завтра</code>.",
-                parse_mode=ParseMode.HTML,
-            )
-        elif mode == "diary_target_range":
-            await self._prepare_diary_preview(update, context, text)
         else:
             reply_markup = (
                 MODE_KEYBOARD

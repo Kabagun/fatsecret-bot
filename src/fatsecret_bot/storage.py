@@ -28,7 +28,6 @@ from .portions import grams_from_portion, is_bare_weight_portion
 
 INVITE_ALPHABET = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
 STORAGE_SCHEMA_VERSION = 4
-DIARY_COPY_STALE_AFTER = dt.timedelta(minutes=30)
 MAX_GROUP_MEMBERS = 2
 
 
@@ -380,21 +379,6 @@ class Storage:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (run_id, account_key)
             );
-
-            CREATE TABLE IF NOT EXISTS diary_copy_runs (
-                id TEXT PRIMARY KEY,
-                group_id TEXT NOT NULL,
-                initiated_by INTEGER NOT NULL,
-                source_account_key TEXT NOT NULL,
-                source_date TEXT NOT NULL,
-                target_start TEXT NOT NULL,
-                target_end TEXT NOT NULL,
-                request_json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                result_json TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
             """
         )
         self._ensure_column("telegram_users", "active_group_id", "TEXT")
@@ -413,10 +397,6 @@ class Storage:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_food_usage_cache_group_count "
             "ON food_usage_cache(group_id, use_count DESC, normalized_title ASC)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_diary_copy_runs_group_created "
-            "ON diary_copy_runs(group_id, created_at DESC)"
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_remote_recipe_snapshots_title "
@@ -1080,14 +1060,6 @@ class Storage:
               AND status NOT IN ('completed', 'rolled_back', 'failed')
             """,
             ("FatSecret account moved to another group", now, *account_keys),
-        )
-        self._conn.execute(
-            """
-            UPDATE diary_copy_runs
-            SET status = 'failed', result_json = ?, updated_at = ?
-            WHERE group_id = ? AND status IN ('pending', 'running')
-            """,
-            (json.dumps({"error": "FatSecret account configuration changed"}), now, source_group_id),
         )
         self._conn.execute(
             f"DELETE FROM group_accounts WHERE account_key IN ({placeholders})",
@@ -2571,14 +2543,6 @@ class Storage:
             self._conn.rollback()
             raise
 
-    def local_recipe_id_for_remote(self, account_key: str, remote_recipe_id: str) -> str | None:
-        """Return the local recipe id mapped to one account-specific FatSecret id."""
-        row = self._conn.execute(
-            "SELECT recipe_id FROM account_recipes WHERE account_key = ? AND remote_recipe_id = ? LIMIT 1",
-            (account_key, remote_recipe_id),
-        ).fetchone()
-        return str(row["recipe_id"]) if row is not None else None
-
     def custom_food_mapping(
         self,
         source_account_key: str,
@@ -2793,122 +2757,6 @@ class Storage:
         )
         self._conn.commit()
         return cursor.rowcount > 0
-
-    def create_diary_copy_run(
-        self,
-        group_id: str,
-        initiated_by: int,
-        source_account_key: str,
-        source_date: dt.date,
-        target_start: dt.date,
-        target_end: dt.date,
-        request: dict[str, object],
-    ) -> str:
-        """Create a pending, persistent diary copy operation and return its id."""
-        run_id = uuid.uuid4().hex
-        now = _now()
-        self._conn.execute(
-            """
-            INSERT INTO diary_copy_runs(
-                id, group_id, initiated_by, source_account_key, source_date,
-                target_start, target_end, request_json, status, result_json,
-                created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
-            """,
-            (
-                run_id,
-                group_id,
-                initiated_by,
-                source_account_key,
-                source_date.isoformat(),
-                target_start.isoformat(),
-                target_end.isoformat(),
-                json.dumps(request, ensure_ascii=False, separators=(",", ":")),
-                now,
-                now,
-            ),
-        )
-        self._conn.commit()
-        return run_id
-
-    def diary_copy_run(self, run_id: str) -> dict[str, object] | None:
-        """Load one diary copy run including its immutable request and stored result."""
-        row = self._conn.execute("SELECT * FROM diary_copy_runs WHERE id = ?", (run_id,)).fetchone()
-        if row is None:
-            return None
-        return {
-            "id": str(row["id"]),
-            "group_id": str(row["group_id"]),
-            "initiated_by": int(row["initiated_by"]),
-            "source_account_key": str(row["source_account_key"]),
-            "source_date": str(row["source_date"]),
-            "target_start": str(row["target_start"]),
-            "target_end": str(row["target_end"]),
-            "request": json.loads(row["request_json"]),
-            "status": str(row["status"]),
-            "result": json.loads(row["result_json"]) if row["result_json"] else None,
-            "created_at": str(row["created_at"]),
-            "updated_at": str(row["updated_at"]),
-        }
-
-    def claim_diary_copy_run(
-        self,
-        run_id: str,
-        *,
-        stale_after: dt.timedelta = DIARY_COPY_STALE_AFTER,
-        now: dt.datetime | None = None,
-    ) -> bool:
-        """Claim a pending run or atomically reclaim a stale running operation."""
-        if stale_after <= dt.timedelta(0):
-            raise ValueError("stale_after must be positive")
-        current = now or dt.datetime.now(dt.UTC)
-        if current.tzinfo is None:
-            current = current.replace(tzinfo=dt.UTC)
-        current = current.astimezone(dt.UTC)
-        stale_before = current - stale_after
-        cursor = self._conn.execute(
-            """
-            UPDATE diary_copy_runs
-            SET status = 'running', updated_at = ?
-            WHERE id = ?
-                AND (
-                    status = 'pending'
-                    OR (status = 'running' AND updated_at <= ?)
-                )
-            """,
-            (_timestamp(current), run_id, _timestamp(stale_before)),
-        )
-        self._conn.commit()
-        return cursor.rowcount == 1
-
-    def touch_diary_copy_run(self, run_id: str, *, now: dt.datetime | None = None) -> bool:
-        """Refresh the heartbeat of a currently running diary copy operation."""
-        cursor = self._conn.execute(
-            "UPDATE diary_copy_runs SET updated_at = ? WHERE id = ? AND status = 'running'",
-            (_timestamp(now), run_id),
-        )
-        self._conn.commit()
-        return cursor.rowcount == 1
-
-    def finish_diary_copy_run(self, run_id: str, status: str, result: dict[str, object]) -> None:
-        """Persist the terminal result of a diary copy operation."""
-        if status not in {"completed", "partial", "failed"}:
-            raise ValueError(f"Unsupported diary copy status: {status}")
-        self._conn.execute(
-            """
-            UPDATE diary_copy_runs
-            SET status = ?, result_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                status,
-                json.dumps(result, ensure_ascii=False, separators=(",", ":")),
-                _now(),
-                run_id,
-            ),
-        )
-        self._conn.commit()
 
     def mark_synced(self, recipe_id: str, account_key: str, remote_recipe_id: str, version: int) -> None:
         self.set_remote_recipe_id(recipe_id, account_key, remote_recipe_id, version)

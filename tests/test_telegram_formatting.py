@@ -11,9 +11,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from telegram.error import BadRequest
+from telegram.ext import CommandHandler
 
 from fatsecret_bot.models import (
-    DiaryCopyPreview,
     Ingredient,
     Recipe,
     RemoteRecipeVariant,
@@ -112,7 +112,7 @@ def test_start_uses_welcome_greeting_and_expected_keyboard(tmp_path, with_group:
         storage.close()
 
 
-def test_main_keyboard_shows_diary_only_to_admin() -> None:
+def test_main_keyboards_offer_recipe_product_group_and_account_actions() -> None:
     bot = object.__new__(TelegramRecipeBot)
     bot.admin_user_id = 11
 
@@ -127,15 +127,15 @@ def test_main_keyboard_shows_diary_only_to_admin() -> None:
     ]
     assert [[button.text for button in row] for row in admin_keyboard.keyboard] == [
         ["🍽️ Все рецепты", "➕ Новый рецепт"],
-        ["🥕 Новый продукт", "📅 Копировать дневник"],
+        ["🥕 Новый продукт"],
         ["👥 Группы", "🔗 Аккаунты FatSecret"],
     ]
     assert sum(len(row) for row in ordinary_keyboard.keyboard) == 5
-    assert sum(len(row) for row in admin_keyboard.keyboard) == 6
+    assert sum(len(row) for row in admin_keyboard.keyboard) == 5
     assert ordinary_keyboard.resize_keyboard is True
-    assert ordinary_keyboard.is_persistent is True
+    assert ordinary_keyboard.is_persistent is not True
     assert admin_keyboard.resize_keyboard is True
-    assert admin_keyboard.is_persistent is True
+    assert admin_keyboard.is_persistent is not True
 
 
 def test_mode_keyboard_is_persistent_cancel_only() -> None:
@@ -151,7 +151,6 @@ def test_main_keyboard_keeps_cached_reply_labels_as_aliases() -> None:
     assert MAIN_ACTION_BY_LABEL["Создать продукт"] == "food_create"
     assert MAIN_ACTION_BY_LABEL["Группы"] == "groups"
     assert MAIN_ACTION_BY_LABEL["Аккаунты"] == "accounts"
-    assert MAIN_ACTION_BY_LABEL["Меню / Дневник"] == "diary"
 
 
 @pytest.mark.parametrize(
@@ -205,235 +204,61 @@ def test_unknown_text_does_not_replace_active_mode_keyboard() -> None:
     assert context.chat_data["reply_keyboard"] == "mode"
 
 
-def test_diary_command_is_rejected_for_ordinary_user(tmp_path) -> None:
-    storage = Storage(tmp_path / "bot.sqlite3")
-    try:
-        bot = object.__new__(TelegramRecipeBot)
-        bot.storage = storage
-        bot.admin_user_id = 11
-        reply_text = AsyncMock()
-        update = SimpleNamespace(
-            effective_user=SimpleNamespace(id=22, full_name="Ordinary"),
-            effective_message=SimpleNamespace(reply_text=reply_text),
-        )
-        context = SimpleNamespace(
-            user_data={"mode": "diary_target_range"},
-            chat_data={"reply_keyboard": "mode"},
-        )
-
-        asyncio.run(bot.diary(update, context))
-
-        assert context.user_data == {}
-        assert "только администратору" in reply_text.await_args.args[0]
-        keyboard = reply_text.await_args.kwargs["reply_markup"]
-        assert "Меню / Дневник" not in [button.text for row in keyboard.keyboard for button in row]
-        assert context.chat_data["reply_keyboard"] == "main"
-    finally:
-        storage.close()
-
-
-def test_diary_command_remains_available_to_admin(tmp_path) -> None:
-    storage = Storage(tmp_path / "bot.sqlite3")
-    try:
-        storage.register_user(11, "Admin")
-        group = storage.create_group(11, "QA")
-        storage.create_fatsecret_account(11, "One", "one@example.com", "secret", "BY", "ru", group_id=group.id)
-        storage.create_fatsecret_account(11, "Two", "two@example.com", "secret", "BY", "ru", group_id=group.id)
-        bot = object.__new__(TelegramRecipeBot)
-        bot.storage = storage
-        bot.admin_user_id = 11
-        reply_text = AsyncMock()
-        update = SimpleNamespace(
-            effective_user=SimpleNamespace(id=11, full_name="Admin"),
-            effective_message=SimpleNamespace(reply_text=reply_text),
-        )
-        context = SimpleNamespace(user_data={}, chat_data={})
-
-        asyncio.run(bot.diary(update, context))
-
-        keyboard = reply_text.await_args.kwargs["reply_markup"]
-        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
-        assert sum(callback.startswith("diarysrc:") for callback in callbacks) == 2
-        assert "diarycancel:0" not in callbacks
-        assert reply_text.await_count == 2
-        mode_call = reply_text.await_args_list[0]
-        assert mode_call.kwargs["reply_markup"] is MODE_KEYBOARD
-        assert context.chat_data["reply_keyboard"] == "mode"
-
-        asyncio.run(bot._ensure_mode_keyboard(update.effective_message, context))
-        assert reply_text.await_count == 2
-    finally:
-        storage.close()
-
-
-def test_diary_precheck_restores_main_keyboard_for_admin(tmp_path) -> None:
-    storage = Storage(tmp_path / "bot.sqlite3")
-    try:
-        storage.register_user(11, "Admin")
-        storage.create_group(11, "QA")
-        bot = object.__new__(TelegramRecipeBot)
-        bot.storage = storage
-        bot.admin_user_id = 11
-        message = SimpleNamespace(reply_text=AsyncMock())
-        update = SimpleNamespace(
-            effective_user=SimpleNamespace(id=11, full_name="Admin"),
-            effective_message=message,
-        )
-        context = SimpleNamespace(
-            user_data={"mode": "diary_target_range"},
-            chat_data={"reply_keyboard": "mode"},
-        )
-
-        asyncio.run(bot.diary(update, context))
-
-        assert message.reply_text.await_args.kwargs["reply_markup"] is ADMIN_MAIN_KEYBOARD
-        assert context.chat_data["reply_keyboard"] == "main"
-    finally:
-        storage.close()
-
-
-def test_diary_callback_activates_mode_companion_once(tmp_path) -> None:
-    storage = Storage(tmp_path / "bot.sqlite3")
-    try:
-        storage.register_user(11, "Admin")
-        group = storage.create_group(11, "QA")
-        account_key = storage.create_fatsecret_account(
-            11,
-            "Source",
-            "source@example.com",
-            "secret",
-            "BY",
-            "ru",
-            group_id=group.id,
-        )
-        message = SimpleNamespace(reply_text=AsyncMock())
-        query = SimpleNamespace(
-            from_user=SimpleNamespace(id=11),
-            message=message,
-            edit_message_text=AsyncMock(),
-        )
-        context = SimpleNamespace(
-            user_data={
-                "group_id": group.id,
-                "diary_source_account_key": account_key,
-                "diary_target_account_keys": {account_key},
-            },
-            chat_data={"reply_keyboard": "main"},
-        )
-        bot = object.__new__(TelegramRecipeBot)
-        bot.storage = storage
-
-        asyncio.run(bot._finish_diary_targets(query, context))
-        asyncio.run(bot._ensure_mode_keyboard(message, context))
-
-        assert context.user_data["mode"] == "diary_source_date"
-        assert context.chat_data["reply_keyboard"] == "mode"
-        assert message.reply_text.await_count == 1
-        assert message.reply_text.await_args.kwargs["reply_markup"] is MODE_KEYBOARD
-        assert "reply_markup" not in query.edit_message_text.await_args.kwargs
-    finally:
-        storage.close()
-
-
-def test_diary_preview_uses_exact_apply_cta_without_inline_cancel() -> None:
-    preview = DiaryCopyPreview(
-        run_id="run-1",
-        source_account_key="source",
-        source_date=dt.date(2026, 7, 14),
-        target_start=dt.date(2026, 7, 15),
-        target_end=dt.date(2026, 7, 15),
-        source_entries=[],
-        target_operations=1,
-        skipped_source_day=False,
+def test_bot_registers_only_supported_commands() -> None:
+    bot = TelegramRecipeBot(
+        token="123456:local-test-token",
+        default_market="BY",
+        default_language="ru",
+        admin_user_id=11,
+        storage=SimpleNamespace(),
+        sync_engine=SimpleNamespace(),
     )
-    status = SimpleNamespace(edit_text=AsyncMock())
-    message = SimpleNamespace(reply_text=AsyncMock(return_value=status))
-    update = SimpleNamespace(effective_user=SimpleNamespace(id=11), effective_message=message)
-    context = SimpleNamespace(
-        user_data={
-            "group_id": "group",
-            "diary_source_account_key": "source",
-            "diary_source_date": "2026-07-14",
-            "diary_target_account_keys": {"target"},
-        },
-        chat_data={"reply_keyboard": "mode"},
-    )
-    bot = object.__new__(TelegramRecipeBot)
-    bot.sync_engine = SimpleNamespace(
-        timezone="Europe/Minsk",
-        prepare_diary_copy=AsyncMock(return_value=preview),
-    )
-    bot._format_diary_preview = lambda value, group_id: "preview"
+    application = bot.build()
+    commands = {
+        command
+        for handlers in application.handlers.values()
+        for handler in handlers
+        if isinstance(handler, CommandHandler)
+        for command in handler.commands
+    }
 
-    asyncio.run(bot._prepare_diary_preview(update, context, "15.07.2026"))
-
-    rows = status.edit_text.await_args.kwargs["reply_markup"].inline_keyboard
-    assert [[(button.text, button.callback_data) for button in row] for row in rows] == [
-        [("✅ Применить", "diaryrun:run-1")]
-    ]
-    assert context.user_data["mode"] == "diary_confirm"
+    assert commands == {"start", "accounts", "recipes", "refresh", "groups"}
 
 
-def test_stale_diary_callback_is_rejected_for_ordinary_user(tmp_path) -> None:
-    class FakeQuery:
-        data = "diaryrun:stale-run"
-        message = None
-
-        def __init__(self) -> None:
-            self.messages: list[str] = []
-
-        async def answer(self) -> None:
-            return None
-
-        async def edit_message_text(self, text: str, **kwargs) -> None:  # noqa: ANN003
-            self.messages.append(text)
-
-    storage = Storage(tmp_path / "bot.sqlite3")
-    try:
-        bot = object.__new__(TelegramRecipeBot)
-        bot.storage = storage
-        bot.admin_user_id = 11
-        query = FakeQuery()
-        update = SimpleNamespace(
-            effective_user=SimpleNamespace(id=22, full_name="Ordinary"),
-            effective_message=SimpleNamespace(),
-            callback_query=query,
-        )
-        context = SimpleNamespace(user_data={"mode": "diary_confirm"}, chat_data={})
-
-        asyncio.run(bot.on_callback(update, context))
-
-        assert context.user_data == {}
-        assert "только администратору" in query.messages[-1]
-    finally:
-        storage.close()
-
-
+@pytest.mark.parametrize("telegram_id", [11, 22])
 @pytest.mark.parametrize(
-    ("mode", "text"),
-    [(None, "Меню / Дневник"), ("diary_target_range", "20.08.2026")],
+    "action",
+    ["diarysrc:source", "diarytarget:target", "diarytargets_done:0", "diaryrun:old-run", "diarycancel:0"],
 )
-def test_typed_or_stale_diary_flow_is_rejected_for_ordinary_user(tmp_path, mode: str | None, text: str) -> None:
-    storage = Storage(tmp_path / "bot.sqlite3")
-    try:
-        bot = object.__new__(TelegramRecipeBot)
-        bot.storage = storage
-        bot.admin_user_id = 11
-        reply_text = AsyncMock()
-        update = SimpleNamespace(
-            effective_user=SimpleNamespace(id=22, full_name="Ordinary"),
-            effective_message=SimpleNamespace(text=text, reply_text=reply_text),
-        )
-        context = SimpleNamespace(user_data={"mode": mode} if mode else {}, chat_data={})
+def test_removed_diary_callbacks_use_expired_action_fallback(telegram_id: int, action: str) -> None:
+    bot = object.__new__(TelegramRecipeBot)
+    bot.admin_user_id = 11
+    bot._require_user = AsyncMock(return_value=True)
+    query = SimpleNamespace(data=action, answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=telegram_id), callback_query=query)
+    context = SimpleNamespace(user_data={}, chat_data={})
 
-        asyncio.run(bot.on_text(update, context))
+    asyncio.run(bot.on_callback(update, context))
 
-        assert context.user_data == {}
-        assert "только администратору" in reply_text.await_args.args[0]
-        keyboard = reply_text.await_args.kwargs["reply_markup"]
-        assert "Меню / Дневник" not in [button.text for row in keyboard.keyboard for button in row]
-    finally:
-        storage.close()
+    assert context.user_data == {}
+    assert query.edit_message_text.await_args.args[0] == "Это действие устарело. Открой список рецептов заново."
+
+
+@pytest.mark.parametrize("telegram_id", [11, 22])
+@pytest.mark.parametrize("label", ["📅 Копировать дневник", "Меню / Дневник"])
+def test_removed_diary_labels_use_normal_navigation(telegram_id: int, label: str) -> None:
+    assert label not in MAIN_ACTION_BY_LABEL
+    bot = object.__new__(TelegramRecipeBot)
+    bot.admin_user_id = 11
+    bot._require_user = AsyncMock(return_value=True)
+    message = SimpleNamespace(text=label, reply_text=AsyncMock())
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=telegram_id), effective_message=message)
+    context = SimpleNamespace(user_data={}, chat_data={})
+
+    asyncio.run(bot.on_text(update, context))
+
+    assert context.user_data == {}
+    assert message.reply_text.await_args.kwargs["reply_markup"] is bot._main_keyboard(telegram_id)
 
 
 def test_format_recipe_hides_remote_ids_and_pretty_prints_amounts() -> None:

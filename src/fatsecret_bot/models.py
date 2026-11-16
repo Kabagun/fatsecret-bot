@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -158,52 +157,6 @@ class FoodSearchResult:
 
 
 @dataclass(frozen=True)
-class FoodDiaryEntry:
-    """One food row recorded in a FatSecret diary."""
-
-    entry_id: str
-    recipe_id: str
-    meal: int
-    name: str
-    recipe_source: str
-    recipe_portion_id: str
-    portion_amount: Decimal
-    serving_description: str = ""
-
-
-@dataclass(frozen=True)
-class FoodDiaryDay:
-    """Authoritative FatSecret diary snapshot for one calendar date."""
-
-    date: dt.date
-    guid: str
-    entries: list[FoodDiaryEntry]
-
-
-@dataclass(frozen=True)
-class FoodDiaryWriteEntry:
-    """Food row prepared for the mobile bulk diary endpoint."""
-
-    reference: str
-    recipe_id: str
-    name: str
-    recipe_portion_id: str
-    portion_amount: Decimal
-    meal: int
-    serving_description: str = ""
-
-
-@dataclass(frozen=True)
-class FoodDiaryBulkResult:
-    """Result returned by one FatSecret bulk diary update."""
-
-    inserted_entries: dict[str, str]
-    failed_entries: dict[str, str]
-    previous_guid: str = ""
-    new_guid: str = ""
-
-
-@dataclass(frozen=True)
 class CustomFoodDefinition:
     """Portable definition of a user-created FatSecret food."""
 
@@ -247,37 +200,3 @@ class BarcodeLookupResult:
     def found(self) -> bool:
         """Return whether FatSecret mapped this barcode to an existing food."""
         return bool(self.food_id)
-
-
-@dataclass(frozen=True)
-class DiaryCopyPreview:
-    """Preview of a diary copy run before the user confirms writes."""
-
-    run_id: str
-    source_account_key: str
-    source_date: dt.date
-    target_start: dt.date
-    target_end: dt.date
-    source_entries: list[FoodDiaryEntry]
-    target_operations: int
-    skipped_source_day: bool
-
-
-@dataclass(frozen=True)
-class DiaryCopyDateResult:
-    """Outcome for one target account and one target date."""
-
-    account_key: str
-    date: dt.date
-    inserted: int
-    failed: int
-    message: str
-
-
-@dataclass(frozen=True)
-class DiaryCopyResult:
-    """Persisted result of a confirmed diary copy run."""
-
-    run_id: str
-    status: str
-    dates: list[DiaryCopyDateResult]
